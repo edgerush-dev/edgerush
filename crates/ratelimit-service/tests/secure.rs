@@ -17,33 +17,52 @@ use edgerush_control_service::TlsError;
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer, ask, decide_stream};
 use edgerush_ratelimit_service::grpc::{Client, Error};
-use edgerush_ratelimit_service::secure::{self, Caller, PodCredentials, PodTls};
+use edgerush_ratelimit_service::secure::{self, Caller, PodCredentials, PodTls, role};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tonic::Code;
 
-/// The SPIFFE ID the pods share, that of the data plane they serve, and another
-/// workload's, each issued by the one authority.
-const PODS: &str = "spiffe://cluster.test/ns/edge/sa/ratelimit";
-const PLANE: &str = "spiffe://cluster.test/ns/edge/sa/plane";
-const OTHER: &str = "spiffe://cluster.test/ns/edge/sa/other";
+/// The pods' trust domain, their ControlPlane's.
+const TRUST: &str = "edge.cluster.test";
+/// The SPIFFE ID the pods share; a data plane's, another DataPlane's in another namespace,
+/// and the controller's, all of the trust domain; another workload's of it; and a data
+/// plane's of another ControlPlane: each issued by the one authority.
+const PODS: &str = "spiffe://edge.cluster.test/ns/edge/sa/edgerush-ratelimit-edge";
+const PLANE: &str = "spiffe://edge.cluster.test/ns/edge/sa/edgerush-proxy-api";
+const PLANE_ELSEWHERE: &str = "spiffe://edge.cluster.test/ns/shop/sa/edgerush-proxy-front";
+const CONTROLLER: &str = "spiffe://edge.cluster.test/ns/edge/sa/edgerush-controller-edge";
+const OTHER: &str = "spiffe://edge.cluster.test/ns/edge/sa/other";
+const FOREIGN_PLANE: &str = "spiffe://shop.cluster.test/ns/edge/sa/edgerush-proxy-api";
 
-/// A pod's TLS, presenting `certificate`, trusting `authority` and serving the data plane
-/// `data_plane`.
-fn pod(authority: &Authority, certificate: Certificate, data_plane: &str) -> PodTls {
+/// A pod's TLS, presenting `certificate`, trusting `authority` and serving the callers of
+/// trust domain `domain`.
+fn pod_of(authority: &Authority, certificate: Certificate, domain: &str) -> PodTls {
     PodTls::new(&PodCredentials {
         certificate,
         authorities: authority.pem(),
-        data_plane: data_plane.to_owned(),
+        trust_domain: domain.to_owned(),
     })
     .unwrap()
+}
+
+/// A pod's TLS of [`TRUST`], presenting `certificate` and trusting `authority`.
+fn pod(authority: &Authority, certificate: Certificate) -> PodTls {
+    pod_of(authority, certificate, TRUST)
 }
 
 /// A pod of the store, alone, served with the latest of `tls` on a port of its own: its
 /// address, and where the connections it refuses are said.
 async fn serve(tls: watch::Receiver<Arc<PodTls>>) -> (String, mpsc::UnboundedReceiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_at("127.0.0.1:0".parse().unwrap(), tls).await
+}
+
+/// The same, listening at `at`.
+async fn serve_at(
+    at: std::net::SocketAddr,
+    tls: watch::Receiver<Arc<PodTls>>,
+) -> (String, mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind(at).await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let pod = StorePod::spawn(
         1,
@@ -72,12 +91,18 @@ fn plane(certificate: Certificate, authority: &Authority) -> Dial {
     Dial::Secured(watch::channel(tls).1)
 }
 
+/// How the controller dials the pods, as `plane`.
+fn controller(certificate: Certificate, authority: &Authority) -> Dial {
+    let tls = secure::controller(&certificate, &[authority.pem()], PODS).unwrap();
+    Dial::Secured(watch::channel(tls).1)
+}
+
 /// A data plane's call: it opens its stream to the pod at `address`, dialling as `dial` does.
 async fn decide(address: &str, dial: &Dial) -> Result<(), Error> {
     decide_stream(address, dial).await.map(|_stream| ())
 }
 
-/// A pod's call: it asks the pod `client` reaches the control plane's probe, as the one
+/// The controller's call: it asks the pod `client` reaches what it has applied, as the one
 /// forming the cluster does.
 async fn probe(client: &Client) -> Result<(), Error> {
     let asked = Message::<Value>::Probe { life: 0, round: 0 };
@@ -112,23 +137,43 @@ fn unavailable<T: std::fmt::Debug>(result: Result<T, Error>) -> bool {
     matches!(result, Err(Error::Status(status)) if status.code() == Code::Unavailable)
 }
 
-/// A data plane may only open its stream, and a pod only make the pods' calls: each refused
-/// the other's, as not permitted.
+/// A data plane may only open its stream, the controller only ask and name, and a pod only
+/// make the pods' calls: each refused the others', as not permitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_data_plane_may_only_decide_and_a_pod_only_make_the_pods_calls() {
+async fn each_caller_may_make_only_its_own_calls_on_sockets() {
     let authority = Authority::new("workloads");
-    let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]), PLANE);
+    let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]));
     let (address, _refused) = serve(watch::channel(Arc::new(tls)).1).await;
     let data_plane = plane(authority.issue(&["data-plane", PLANE]), &authority);
     decide(&address, &data_plane).await.unwrap();
     assert!(denied(probe(&client(&address, &data_plane)).await));
-    let other = pod(&authority, authority.issue(&["127.0.0.2", PODS]), PLANE);
-    probe(&dialled_by(&address, &other)).await.unwrap();
+    let forming = controller(authority.issue(&["controller", CONTROLLER]), &authority);
+    probe(&client(&address, &forming)).await.unwrap();
+    assert!(denied(decide(&address, &forming).await));
+    let other = pod(&authority, authority.issue(&["127.0.0.2", PODS]));
+    assert!(denied(probe(&dialled_by(&address, &other)).await));
     let pod = Dial::Secured(watch::channel(other.connector().clone()).1);
     assert!(denied(decide(&address, &pod).await));
 }
 
-/// Served plain, a pod takes every call from anyone: the data plane's and the pods' alike.
+/// A pod serves every DataPlane of its ControlPlane, whatever its namespace, by its ID's shape
+/// in the trust domain, and none of another's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn any_data_plane_of_the_trust_domain_is_served_and_none_of_another() {
+    let authority = Authority::new("workloads");
+    let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]));
+    let (address, mut refused) = serve(watch::channel(Arc::new(tls)).1).await;
+    for id in [PLANE, PLANE_ELSEWHERE] {
+        let data_plane = plane(authority.issue(&["data-plane", id]), &authority);
+        decide(&address, &data_plane).await.unwrap();
+    }
+    let foreign = plane(authority.issue(&["data-plane", FOREIGN_PLANE]), &authority);
+    assert!(failed(decide(&address, &foreign).await));
+    assert!(refused.recv().await.is_some());
+}
+
+/// Served plain, a pod takes every call from anyone: the data plane's and the controller's
+/// alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pod_served_plain_takes_any_call() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -154,9 +199,9 @@ async fn a_pod_served_plain_takes_any_call() {
 /// it would call; one the authority does not vouch for, or without a certificate, in the
 /// handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_caller_neither_the_pods_nor_the_data_plane_is_refused() {
+async fn a_caller_neither_a_pod_a_data_plane_nor_the_controller_is_refused() {
     let authority = Authority::new("workloads");
-    let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]), PLANE);
+    let tls = pod(&authority, authority.issue(&["127.0.0.1", PODS]));
     let (address, mut refused) = serve(watch::channel(Arc::new(tls)).1).await;
     for names in [
         &["data-plane", OTHER][..],
@@ -175,7 +220,7 @@ async fn a_caller_neither_the_pods_nor_the_data_plane_is_refused() {
         assert!(refused.recv().await.is_some());
     }
     let stranger = Authority::new("stranger");
-    let unknown = plane(stranger.issue(&["data-plane", PODS]), &authority);
+    let unknown = controller(stranger.issue(&["controller", CONTROLLER]), &authority);
     assert!(failed(probe(&client(&address, &unknown)).await));
     assert!(refused.recv().await.is_some());
 
@@ -191,20 +236,20 @@ async fn a_caller_neither_the_pods_nor_the_data_plane_is_refused() {
     assert!(refused.recv().await.is_some());
 }
 
-/// A data plane, and a pod, reach only a pod that the authority vouches for, for the name
-/// dialled, with the pods' ID.
+/// A data plane, and the controller, reach only a pod that the authority vouches for, with
+/// the pods' ID; dialled at its IP, as each pod is at its own address, whatever names its
+/// certificate carries, as the pods share one made before any has an address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pod_is_reached_only_with_the_pods_id_and_the_name_dialled() {
+async fn a_pod_dialled_at_an_ip_is_reached_only_with_the_pods_id() {
     let authority = Authority::new("workloads");
     let stranger = Authority::new("stranger");
-    let dialling = pod(&authority, authority.issue(&["127.0.0.2", PODS]), PLANE);
     for (certificate, reached) in [
         (authority.issue(&["127.0.0.1", PODS]), true),
+        (authority.issue(&["ratelimit.edge.svc", PODS]), true),
         (authority.issue(&["127.0.0.1", OTHER]), false),
-        (authority.issue(&["elsewhere.test", PODS]), false),
         (stranger.issue(&["127.0.0.1", PODS]), false),
     ] {
-        let tls = pod(&authority, certificate, PLANE);
+        let tls = pod(&authority, certificate);
         let (address, _refused) = serve(watch::channel(Arc::new(tls)).1).await;
         let data_plane = plane(authority.issue(&["data-plane", PLANE]), &authority);
         let result = decide(&address, &data_plane).await;
@@ -212,71 +257,186 @@ async fn a_pod_is_reached_only_with_the_pods_id_and_the_name_dialled() {
         if !reached {
             assert!(unavailable(result));
         }
-        let result = probe(&dialled_by(&address, &dialling)).await;
+        let forming = controller(authority.issue(&["controller", CONTROLLER]), &authority);
+        let result = probe(&client(&address, &forming)).await;
         assert_eq!(result.is_ok(), reached, "{result:?}");
     }
 }
 
-/// A pod dialling another checks it for the pods' own ID, apart from what the pod dialled
-/// would accept: an impostor carrying another ID, which takes the dialling pod for its data
-/// plane and so would answer it, is refused by the dialling pod in its handshake.
+/// Dialled by name, as data planes first ask the service's Service, a pod is reached only
+/// where its certificate carries the name too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pod_refuses_to_dial_a_pod_with_another_id_even_one_that_would_answer() {
+async fn a_pod_dialled_by_name_is_reached_only_for_the_name_dialled() {
+    use std::net::ToSocketAddrs;
     let authority = Authority::new("workloads");
-    // The impostor's own ID is OTHER, and it serves PODS as its data plane: a pod dialling it
-    // passes its caller check as a data plane, allowed to open its stream.
-    let impostor = pod(&authority, authority.issue(&["127.0.0.1", OTHER]), PODS);
+    // Where `localhost` is dialled first, `::1` on some systems and `127.0.0.1` on others:
+    // a connection refused there would take the dial's whole time on Windows.
+    let first = ("localhost", 0).to_socket_addrs().unwrap().next().unwrap();
+    for (certificate, reached) in [
+        (authority.issue(&["localhost", PODS]), true),
+        (authority.issue(&["127.0.0.1", PODS]), false),
+    ] {
+        let tls = pod(&authority, certificate);
+        let (address, _refused) = serve_at(first, watch::channel(Arc::new(tls)).1).await;
+        let port = address.rsplit(':').next().unwrap();
+        let named = format!("localhost:{port}");
+        let data_plane = plane(authority.issue(&["data-plane", PLANE]), &authority);
+        let result = decide(&named, &data_plane).await;
+        assert_eq!(result.is_ok(), reached, "{result:?}");
+        if !reached {
+            assert!(unavailable(result));
+        }
+    }
+}
+
+/// A data plane dialling a pod checks it for the pods' own ID, apart from what the pod dialled
+/// would accept: an impostor carrying another ID, which takes the data plane for one of its
+/// own and so would answer it, is refused by the data plane in its handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pod_with_another_id_is_refused_even_one_that_would_answer() {
+    let authority = Authority::new("workloads");
+    let impostor = pod(&authority, authority.issue(&["127.0.0.1", OTHER]));
     let (address, _refused) = serve(watch::channel(Arc::new(impostor)).1).await;
-    let dialling = pod(&authority, authority.issue(&["127.0.0.2", PODS]), PLANE);
-    let dial = Dial::Secured(watch::channel(dialling.connector().clone()).1);
-    let result = decide(&address, &dial).await;
+    let data_plane = plane(authority.issue(&["data-plane", PLANE]), &authority);
+    let result = decide(&address, &data_plane).await;
     assert!(unavailable(result), "the impostor was reached");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credentials_that_cannot_tell_callers_apart_are_refused() {
     let authority = Authority::new("workloads");
-    let with = |names: &[&str], data_plane: &str| {
+    let with = |names: &[&str], domain: &str| {
         PodTls::new(&PodCredentials {
             certificate: authority.issue(names),
             authorities: authority.pem(),
-            data_plane: data_plane.to_owned(),
+            trust_domain: domain.to_owned(),
         })
     };
-    assert!(with(&["127.0.0.1", PODS], PLANE).is_ok());
-    assert!(matches!(
-        with(&["127.0.0.1"], PLANE),
-        Err(TlsError::Identity(_))
-    ));
-    assert!(matches!(
-        with(&["127.0.0.1", PODS, OTHER], PLANE),
-        Err(TlsError::Identity(_))
-    ));
-    assert!(matches!(
-        with(&["127.0.0.1", PODS], PODS),
-        Err(TlsError::Identity(_))
-    ));
-    assert!(matches!(
-        with(&["127.0.0.1", PODS], "plane.test"),
-        Err(TlsError::Identity(_))
-    ));
+    assert!(with(&["127.0.0.1", PODS], TRUST).is_ok());
+    for (names, domain) in [
+        // No one ID of its own.
+        (&["127.0.0.1"][..], TRUST),
+        (&["127.0.0.1", PODS, OTHER], TRUST),
+        // Its own ID of another domain, or a domain that is none.
+        (&["127.0.0.1", PODS], "shop.cluster.test"),
+        (&["127.0.0.1", PODS], ""),
+        (&["127.0.0.1", PODS], "edge.cluster.test/ns"),
+        // Its own ID a data plane's or the controller's, which would then be served as a pod.
+        (&["127.0.0.1", PLANE], TRUST),
+        (&["127.0.0.1", CONTROLLER], TRUST),
+    ] {
+        assert!(
+            matches!(with(names, domain), Err(TlsError::Identity(_))),
+            "{names:?} of {domain}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credentials_replaced_serve_the_next_connection() {
     let authority = Authority::new("workloads");
     let served = authority.issue(&["127.0.0.1", PODS]);
-    let (replace, tls) = watch::channel(Arc::new(pod(&authority, served.clone(), PLANE)));
+    let (replace, tls) = watch::channel(Arc::new(pod(&authority, served)));
     let (address, mut refused) = serve(tls).await;
     let before = plane(authority.issue(&["data-plane", PLANE]), &authority);
     decide(&address, &before).await.unwrap();
 
-    replace.send_replace(Arc::new(pod(&authority, served, OTHER)));
-    let after = plane(authority.issue(&["data-plane", OTHER]), &authority);
+    // The pods' ID and trust domain both another's from here on.
+    const SHOP_PODS: &str = "spiffe://shop.cluster.test/ns/shop/sa/edgerush-ratelimit-shop";
+    let shop = authority.issue(&["127.0.0.1", SHOP_PODS]);
+    replace.send_replace(Arc::new(pod_of(&authority, shop, "shop.cluster.test")));
+    let after = Dial::Secured(
+        watch::channel(
+            secure::data_plane(
+                &authority.issue(&["data-plane", FOREIGN_PLANE]),
+                &[authority.pem()],
+                SHOP_PODS,
+            )
+            .unwrap(),
+        )
+        .1,
+    );
     decide(&address, &after).await.unwrap();
-    let left = plane(authority.issue(&["data-plane", PLANE]), &authority);
+    let left = Dial::Secured(
+        watch::channel(
+            secure::data_plane(
+                &authority.issue(&["data-plane", PLANE]),
+                &[authority.pem()],
+                SHOP_PODS,
+            )
+            .unwrap(),
+        )
+        .1,
+    );
     assert!(failed(decide(&address, &left).await));
     assert!(refused.recv().await.is_some());
+}
+
+/// Whose an ID is goes by its shape in the trust domain alone: `ns`, a namespace, `sa`, and a
+/// ServiceAccount named as the operator names a data plane's or a controller's, nothing more.
+#[test]
+fn whose_an_id_is_goes_by_its_shape_in_the_trust_domain() {
+    for (id, whose) in [
+        (PLANE, Some(Caller::DataPlane)),
+        (PLANE_ELSEWHERE, Some(Caller::DataPlane)),
+        (CONTROLLER, Some(Caller::Controller)),
+        (PODS, None),
+        (OTHER, None),
+        (FOREIGN_PLANE, None),
+        // Another domain that starts as this one does.
+        (
+            "spiffe://edge.cluster.test.evil/ns/edge/sa/edgerush-proxy-api",
+            None,
+        ),
+        // A ServiceAccount named with the prefix and nothing after it.
+        (
+            "spiffe://edge.cluster.test/ns/edge/sa/edgerush-proxy-",
+            None,
+        ),
+        (
+            "spiffe://edge.cluster.test/ns/edge/sa/edgerush-controller-",
+            None,
+        ),
+        // No namespace, a part more or less, or the parts' names wrong.
+        ("spiffe://edge.cluster.test/ns//sa/edgerush-proxy-api", None),
+        (
+            "spiffe://edge.cluster.test/ns/edge/sa/edgerush-proxy-api/more",
+            None,
+        ),
+        (
+            "spiffe://edge.cluster.test/ns/edge/edgerush-proxy-api",
+            None,
+        ),
+        (
+            "spiffe://edge.cluster.test/sa/edge/ns/edgerush-proxy-api",
+            None,
+        ),
+        ("edge.cluster.test/ns/edge/sa/edgerush-proxy-api", None),
+    ] {
+        assert_eq!(role(id, TRUST), whose, "{id}");
+    }
+}
+
+/// The IDs the control plane issues are told apart as the service tells them: a test holds
+/// the operator's naming and the service's shapes to one.
+#[test]
+fn the_ids_the_control_plane_issues_are_told_apart_as_issued() {
+    use edgerush_planes::objects::{controller_name, data_plane_id, spiffe_id};
+    let domain = "edge.cluster.local";
+    assert_eq!(
+        role(
+            &data_plane_id("edge", "cluster.local", "shop", "front"),
+            domain
+        ),
+        Some(Caller::DataPlane)
+    );
+    assert_eq!(
+        role(
+            &spiffe_id("edge", "cluster.local", "edge", &controller_name("edge")),
+            domain
+        ),
+        Some(Caller::Controller)
+    );
 }
 
 /// The code a server's answer to a request on `path`, from `caller` if any, carries in its
@@ -311,7 +471,8 @@ const STORE_CONTROL: &str = "/edgerush.cluster.v1.Cluster/Control";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_caller_may_call_only_its_own_methods() {
     let denied = Some(Code::PermissionDenied);
-    // The data planes' stream theirs, every other method the pods'.
+    // The data planes' stream theirs, asking and naming the controller's, every other method
+    // the pods'.
     let store = StorePod::spawn(
         1,
         "127.0.0.1:7000".to_owned(),
@@ -325,9 +486,9 @@ async fn each_caller_may_call_only_its_own_methods() {
         (STORE_PEER, Caller::Pod),
         (STORE_COPY, Caller::Pod),
         (STORE_HELLO, Caller::Pod),
-        (STORE_CONTROL, Caller::Pod),
+        (STORE_CONTROL, Caller::Controller),
     ] {
-        for caller in [Caller::DataPlane, Caller::Pod] {
+        for caller in [Caller::DataPlane, Caller::Pod, Caller::Controller] {
             let refused = refusal(&mut store_server, path, Some(caller)).await;
             assert_eq!(
                 refused == denied,

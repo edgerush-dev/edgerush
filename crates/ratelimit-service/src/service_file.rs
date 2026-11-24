@@ -9,7 +9,7 @@
 use crate::cluster::settings::{Settings, SettingsError, settings};
 use crate::secure::PodFiles;
 use edgerush_config::ServiceFile;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 /// What `keys.max_bytes` is when left out: 256 MiB.
@@ -39,7 +39,7 @@ pub enum FileError {
     #[error("`keys.max_bytes`: a number of bytes, at least 1")]
     KeyBytes,
     /// No store to run the modes on.
-    #[error("a pod runs on the store: it needs `store` and `pod.address`")]
+    #[error("a pod runs on the store: it needs `store`, and `pod.address` or `POD_IP`")]
     NoStore,
     /// A store the pod could not run on.
     #[error("{0}")]
@@ -47,32 +47,41 @@ pub enum FileError {
 }
 
 /// What a pod runs as, from the file `yaml` states, its TLS files relative to `directory`
-/// unless absolute.
+/// unless absolute, and reached at `own`, the address it was given, where the file says no
+/// `pod.address`.
 ///
 /// # Errors
 ///
 /// The first [`FileError`] the file has.
-pub fn parsed(yaml: &[u8], directory: &Path) -> Result<PodSettings, FileError> {
+pub fn parsed(
+    yaml: &[u8],
+    directory: &Path,
+    own: Option<IpAddr>,
+) -> Result<PodSettings, FileError> {
     // Without the lines around a mistake, which the parser quotes by default: what is said
     // of a file refused goes to the log, as the data plane's does.
     let options = serde_saphyr::options! { with_snippet: false };
     let file: ServiceFile = serde_saphyr::from_slice_with_options(yaml, options)
         .map_err(|error| FileError::Parse(Box::new(error)))?;
-    checked(file, directory)
+    checked(file, directory, own)
 }
 
 /// What the types cannot check of `file`, and the values of what it leaves out.
-fn checked(file: ServiceFile, directory: &Path) -> Result<PodSettings, FileError> {
+fn checked(
+    file: ServiceFile,
+    directory: &Path,
+    own: Option<IpAddr>,
+) -> Result<PodSettings, FileError> {
     let max_key_bytes = file.keys.max_bytes.unwrap_or(MAX_KEY_BYTES);
     if max_key_bytes == 0 {
         return Err(FileError::KeyBytes);
     }
-    let store = settings(&file, max_key_bytes)?.ok_or(FileError::NoStore)?;
+    let store = settings(&file, max_key_bytes, own)?.ok_or(FileError::NoStore)?;
     let tls = file.tls.map(|tls| PodFiles {
         certificate: directory.join(tls.certificate),
         key: directory.join(tls.key),
         authorities: directory.join(tls.authorities),
-        data_plane: tls.data_plane_id,
+        trust_domain: tls.trust_domain,
     });
     Ok(PodSettings {
         listen: file.pod.listen,
@@ -89,7 +98,7 @@ mod tests {
     /// The settings from `yaml`, its TLS files relative to `/etc/edgerush`, a refusal as it
     /// is told.
     fn parsed_from(yaml: &str) -> Result<PodSettings, String> {
-        parsed(yaml.as_bytes(), Path::new("/etc/edgerush")).map_err(|error| error.to_string())
+        parsed(yaml.as_bytes(), Path::new("/etc/edgerush"), None).map_err(|error| error.to_string())
     }
 
     /// A pod's file, on the store, with `more` after its sections.
@@ -111,8 +120,23 @@ mod tests {
         );
         assert_eq!(
             parsed_from("pod: { listen: 0.0.0.0:7000 }\n").err(),
-            Some("a pod runs on the store: it needs `store` and `pod.address`".to_owned())
+            Some(
+                "a pod runs on the store: it needs `store`, and `pod.address` or `POD_IP`"
+                    .to_owned()
+            )
         );
+    }
+
+    /// A pod in Kubernetes reads the one file every pod does, and is reached at the address
+    /// it was given.
+    #[test]
+    fn a_file_without_the_pods_address_takes_the_one_it_was_given() {
+        let yaml = b"pod: { listen: 0.0.0.0:7000 }
+store: {}
+";
+        let own = Some("10.1.2.3".parse().unwrap());
+        let settings = parsed(yaml, Path::new("/etc/edgerush"), own).unwrap();
+        assert_eq!(settings.store.address, "10.1.2.3:7000");
     }
 
     #[test]
@@ -176,7 +200,10 @@ mod tests {
         );
         assert_eq!(
             parsed_from("pod: { listen: 0.0.0.0:7000 }\nstore: {}\n").err(),
-            Some("`pod.address` is needed with a `store` section".to_owned())
+            Some(
+                "`pod.address`, or an address in `POD_IP`, is needed with a `store` section"
+                    .to_owned()
+            )
         );
         assert_eq!(
             parsed_from(&with("")).map(|_| ()).err(),
@@ -200,7 +227,7 @@ mod tests {
             "certificate: pod.pem",
             "key: pod.key",
             "authorities: ca.pem",
-            "data_plane_id: spiffe://cluster.local/ns/edge/sa/edge",
+            "trust_domain: edge.cluster.local",
         ];
         let tls =
             |given: &[&str]| parsed_from(&with(&format!("tls: {{ {} }}\n", given.join(", "))));
@@ -210,7 +237,7 @@ mod tests {
                 certificate: "/etc/edgerush/pod.pem".into(),
                 key: "/etc/edgerush/pod.key".into(),
                 authorities: "/etc/edgerush/ca.pem".into(),
-                data_plane: "spiffe://cluster.local/ns/edge/sa/edge".to_owned(),
+                trust_domain: "edge.cluster.local".to_owned(),
             })
         );
         for left_out in 0..files.len() {

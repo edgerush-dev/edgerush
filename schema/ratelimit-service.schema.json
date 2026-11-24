@@ -62,7 +62,7 @@
       "type": "object",
       "properties": {
         "address": {
-          "description": "Where the other pods and data planes reach it, `host:port`, as it tells them in its\nhellos and as it asks to join the store. Needed.",
+          "description": "Where the other pods and data planes reach it, `host:port`, as it tells them in its\nhellos and as it asks to join the store. Needed with a store; left out, the pod takes\nthe address in its `POD_IP` environment variable, with `listen`'s port, as a pod in\nKubernetes is given its own, every pod reading one file.",
           "type": [
             "string",
             "null"
@@ -99,12 +99,12 @@
           "description": "The certificate the pod presents to data planes and to the other pods, then the\nintermediates.",
           "type": "string"
         },
-        "data_plane_id": {
-          "description": "The SPIFFE ID of the data plane the pod serves. A caller is told apart by the ID its\ncertificate carries: the pod's own is the pods', this one the data plane's, and any\nother is refused.",
-          "type": "string"
-        },
         "key": {
           "description": "Its private key.",
+          "type": "string"
+        },
+        "trust_domain": {
+          "description": "The trust domain of the ControlPlane whose workloads call the pod, by which a caller\nis told apart by the SPIFFE ID its certificate carries: the pod's own is the pods',\nwhich must be of this domain; any\n`spiffe://<trust domain>/ns/<namespace>/sa/edgerush-proxy-<dataplane>` a data plane's;\nany `spiffe://<trust domain>/ns/<namespace>/sa/edgerush-controller-<controlplane>`\nthe controller's; and any other is refused.",
           "type": "string"
         }
       },
@@ -113,7 +113,7 @@
         "certificate",
         "key",
         "authorities",
-        "data_plane_id"
+        "trust_domain"
       ]
     },
     "ServiceStore": {

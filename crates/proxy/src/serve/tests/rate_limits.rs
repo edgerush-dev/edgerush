@@ -11,7 +11,7 @@ use edgerush_config::KeySecret;
 use edgerush_ratelimit_service::cluster::forming::Forming;
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer};
-use edgerush_ratelimit_service::secure::{self, PodCredentials, PodTls};
+use edgerush_ratelimit_service::secure;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use tonic::transport::server::TcpIncoming;
@@ -58,18 +58,14 @@ async fn held_pods(
         let address = listener.local_addr().unwrap().to_string();
         listeners.push((listener, address));
     }
-    let secured = tls.map(|authority| {
-        PodTls::new(&PodCredentials {
-            certificate: authority.issue(&["127.0.0.1", POD_ID]),
-            authorities: authority.pem(),
-            data_plane: PLANE_ID.to_owned(),
-        })
-        .unwrap()
+    let secured = tls.map(secured_pods);
+    let dial = secured.as_ref().map_or(Dial::Plain, |secured| {
+        Dial::Secured(tokio::sync::watch::channel(secured.tls.connector().clone()).1)
     });
-    let dial = secured.as_ref().map_or(Dial::Plain, |tls| {
-        Dial::Secured(tokio::sync::watch::channel(tls.connector().clone()).1)
-    });
-    let serving = secured.map(|tls| tokio::sync::watch::channel(Arc::new(tls)).1);
+    let forming_dial = secured
+        .as_ref()
+        .map_or(Dial::Plain, |secured| secured.forming.clone());
+    let serving = secured.map(|secured| tokio::sync::watch::channel(Arc::new(secured.tls)).1);
     let config = StoreConfig {
         shards: 16,
         ..StoreConfig::defaults()
@@ -106,7 +102,9 @@ async fn held_pods(
         pods.push(pod);
         addresses.push(address);
     }
-    let forming = Forming::new(&config, naming_file()).unwrap().dialling(dial);
+    let forming = Forming::new(&config, naming_file())
+        .unwrap()
+        .dialling(forming_dial);
     let forming_at = addresses.clone();
     tokio::spawn(async move {
         let _stopped = forming.run(forming_at).await;

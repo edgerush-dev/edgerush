@@ -43,6 +43,9 @@ tower-service.workspace = true
 
 [dev-dependencies]
 edgerush-certificates = { workspace = true, features = ["testing"] }
+# The SPIFFE IDs the control plane issues its data planes and controller, told apart here by
+# their shape: a test holds the two to one naming.
+edgerush-planes.workspace = true
 proptest.workspace = true
 # "io-util": the socket tests' relays, copying both ways. "rt-multi-thread": tests that
 # run pods and their clients on threads of their own.
