@@ -11,9 +11,12 @@
 # Then:
 #   - a ControlPlane and DataPlanes of each kind (Ingress, Gateway API, both) are admitted,
 #     and so is every golden case's resource of crates/planes, and DataPlanes limiting
-#     locally under a limit of each model, and with rate limiting disabled; and
-#     RateLimitPolicies on each level, whole and by section, of limits, of ignore alone, of
-#     both, of either beside the other empty, and of ["*"];
+#     locally under a limit of each model, with rate limiting disabled, synchronously, and
+#     asynchronously of every default and of each setting; a ControlPlane's rate-limiting
+#     service of every default, which are three pods, 256 shards and two copies, of every
+#     field, and, dropped, declared again of other shards; and RateLimitPolicies on each
+#     level, whole and by section, of limits, of ignore alone, of both, of either beside
+#     the other empty, and of ["*"];
 #   - each resource the CRDs' schema and CEL rules are to refuse is refused, and says why:
 #     a name that is no DNS label or too long for its Service's, a watch scope's selector
 #     without Selector or Selector without one, no replicas, a DataPlane with neither
@@ -21,19 +24,28 @@
 #     Ingress short of a port or with one port twice, max below min, one port's settings
 #     given twice, an enumerated value written in another case, a file access log of no
 #     path, a LoadBalancer's fields on another type, and, on an update, a LoadBalancer's
-#     class changed; a PlatformDefaults not named default, an allowance of a selector of
-#     no requirement, for ControlPlanes or for what they watch, with a selector where it
-#     takes none or none where it takes one, of a scope it cannot allow, or of an operator
-#     Kubernetes does not have; a DataPlane naming a Gateway beside a gateway or ingress of
-#     its own; a Gateway-first entry holding ingress, or two entries of one class; rate
-#     limiting of a mode the DataPlane does not take or of none, a bound on keys with it
-#     disabled, a limit of no model or of two, keyed by what it does not know, a rate or a
+#     class changed; a rate-limiting service of no pods, of no shards or more than a pod
+#     takes, of fewer than no copies, or whose keys may take nothing, and, on an update,
+#     its shards changed or left to their default; a PlatformDefaults not named default,
+#     an allowance of a selector of no requirement, for ControlPlanes or for what they
+#     watch, with a selector where it takes none or none where it takes one, of a scope it
+#     cannot allow, or of an operator Kubernetes does not have; a DataPlane naming a
+#     Gateway beside a gateway or ingress of its own; a Gateway-first entry holding
+#     ingress, or two entries of one class; rate limiting of a mode the DataPlane does not
+#     take or of none, a bound on keys with it disabled, the synchronous mode without how
+#     a request waits or that given in another mode, a wait without what decides an owner
+#     unheard, that in lower case, or of no time, a breaker opened by no failure or never
+#     tried again, the asynchronous mode's settings in another or a cycle of no time, a
+#     limit of no model or of two, keyed by what it does not know, a rate or a
 #     window of no unit, a rolling window of one slot, a method in lower case, a path
 #     prefix that is no path, and two limits of one name; a RateLimitPolicy of no target or
 #     of more than 16, of a kind it does not take or one of another group, of targets of
 #     two levels, of a section on some alone, or naming one twice, naming an Ingress's
 #     section, of neither a limit nor a name to ignore (either list may be empty), of "*"
 #     beside a name, ignoring a name twice, or of a limit a DataPlane's rules would refuse;
+#   - a naming of the rate-limiting service's pods in a ControlPlane's status is read back
+#     as it was written, a member id of 64 bits among it, and is refused of no generation,
+#     of a member id that is no number or begins with a zero, or of no table;
 #   - a Service holding externalIPs is refused written as a control plane's ServiceAccount,
 #     and admitted written by another; one without them is admitted from either;
 #   - beyond its own namespace, under the role bound there for a generated DataPlane, a
@@ -167,6 +179,20 @@ refused "a ControlPlane of its own namespace with a selector" "selector must be 
 refused "a ControlPlane of no replicas" "spec.replicas" "$(control_plane payments 'spec: { replicas: 0 }')"
 refused "a ControlPlane's authority naming no Secret" "spec.authority.secretRef" "$(control_plane payments 'spec: { authority: {} }')"
 
+# A ControlPlane's rate-limiting service: `serving <service>`, a ControlPlane declaring it.
+serving() { control_plane payments "spec: { rateLimiting: { service: $1 } }"; }
+admitted "a rate-limiting service of every default" "$(serving '{}')"
+defaults=$(k apply --dry-run=server -o jsonpath='{.spec.rateLimiting.service}' -f - <<<"$(serving '{}')")
+[ "$defaults" = '{"copies":2,"forwarderDecides":true,"replicas":3,"shards":256}' ] \
+    || fail "a rate-limiting service left to its defaults is $defaults"
+pass "a rate-limiting service left to its defaults has three pods, 256 shards and two copies"
+admitted "a rate-limiting service of every field" "$(serving '{ replicas: 5, resources: { requests: { cpu: "2" }, limits: { memory: 16Gi } }, shards: 1024, copies: 1, forwarderDecides: false, maxKeyBytes: 12884901888 }')"
+refused "a rate-limiting service of no pods" "spec.rateLimiting.service.replicas" "$(serving '{ replicas: 0 }')"
+refused "a rate-limiting service of no shards" "spec.rateLimiting.service.shards" "$(serving '{ shards: 0 }')"
+refused "a rate-limiting service of more shards than a pod takes" "spec.rateLimiting.service.shards" "$(serving '{ shards: 65536 }')"
+refused "a rate-limiting service of fewer than no copies" "spec.rateLimiting.service.copies" "$(serving '{ copies: -1 }')"
+refused "a rate-limiting service whose keys may take nothing" "spec.rateLimiting.service.maxKeyBytes" "$(serving '{ maxKeyBytes: 0 }')"
+
 # What the PlatformDefaults' rules admit and refuse.
 platform_defaults() {
     printf 'apiVersion: gateway.edgerush.dev/v1alpha1\nkind: PlatformDefaults\nmetadata: { name: %s }\n%s\n' "$1" "${2:-}"
@@ -250,9 +276,26 @@ admitted "a DataPlane limiting locally under a limit of each model" "$(limiting 
       - { name: writes, match: { methods: [POST], pathPrefix: /v1/ }, key: Client, model: { fixedWindow: { limit: 10, window: 1m } }, dryRun: true }
       - { name: hourly, key: Client, model: { rollingWindow: { limit: 100, window: 1h, slots: 60 } } }')"
 admitted "a DataPlane whose rate limiting is disabled" "$(limiting '{ mode: Disabled }')"
-refused "a rate-limiting mode the DataPlane does not take" "spec.rateLimiting.mode" "$(limiting '{ mode: Asynchronous }')"
+waits='{ timeoutMs: 20, whenUnreachable: Local, breaker: { failures: 5, probeAfterMs: 1000 } }'
+admitted "a DataPlane limiting synchronously" "$(limiting "
+    mode: Synchronous
+    maxKeyBytes: 1048576
+    synchronous: $waits
+    global: [{ name: per-client, key: Client, model: { bucket: { rate: 100/s, burst: 200 } } }]")"
+admitted "a DataPlane limiting asynchronously, of every default" "$(limiting '{ mode: Asynchronous }')"
+admitted "a DataPlane limiting asynchronously, of each setting" "$(limiting '{ mode: Asynchronous, asynchronous: { cycleMs: 20, pollQuietKeys: true, scheduleKeys: false } }')"
+refused "a rate-limiting mode the DataPlane does not take" "spec.rateLimiting.mode" "$(limiting '{ mode: Off }')"
 refused "rate limiting of no mode" "spec.rateLimiting.mode" "$(limiting '{ global: [] }')"
 refused "a bound on keys with rate limiting disabled" "not Disabled" "$(limiting '{ mode: Disabled, maxKeyBytes: 1048576 }')"
+refused "the synchronous mode without how a request waits" "synchronous must be given" "$(limiting '{ mode: Synchronous }')"
+refused "how a request waits for its owner, in another mode" "synchronous must be given" "$(limiting "{ mode: Asynchronous, synchronous: $waits }")"
+refused "a synchronous wait without what decides an owner unheard" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
+refused "what decides an owner unheard, in lower case" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: allow, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
+refused "a wait for the owner of no time" "spec.rateLimiting.synchronous.timeoutMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 0, whenUnreachable: Allow, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
+refused "a breaker opened by no failure" "spec.rateLimiting.synchronous.breaker.failures" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, breaker: { failures: 0, probeAfterMs: 1000 } } }')"
+refused "a breaker never tried again" "spec.rateLimiting.synchronous.breaker.probeAfterMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, breaker: { failures: 5 } } }')"
+refused "the asynchronous mode's settings in another" "asynchronous is for the Asynchronous mode alone" "$(limiting "{ mode: Synchronous, synchronous: $waits, asynchronous: { cycleMs: 20 } }")"
+refused "a cycle of no time" "spec.rateLimiting.asynchronous.cycleMs" "$(limiting '{ mode: Asynchronous, asynchronous: { cycleMs: 0 } }')"
 refused "a limit of no model" "one of bucket, fixedWindow and rollingWindow" "$(limit 'key: Client, model: {}')"
 refused "a limit of two models" "one of bucket, fixedWindow and rollingWindow" "$(limit 'key: Client, model: { bucket: { rate: 1/s, burst: 1 }, fixedWindow: { limit: 1, window: 1s } }')"
 refused "a limit keyed by what it does not know" "spec.rateLimiting.global[0].key" "$(limit 'key: Header, model: { bucket: { rate: 1/s, burst: 1 } }')"
@@ -367,6 +410,39 @@ refused "a LoadBalancer's class changed" "loadBalancerClass is fixed" "$(data_pl
 admitted "a LoadBalancer's other fields changed" "$(data_plane public '  ingress: { httpPort: 80, httpsPort: 443 }
   service: { loadBalancerClass: example.com/lb, annotations: { a: b } }')"
 k delete dataplane -n edge public >/dev/null
+k apply -f - <<<"$(serving '{ shards: 64 }')" >/dev/null
+refused "a rate-limiting service's shards changed" "shards is fixed" "$(serving '{ shards: 128 }')"
+refused "a rate-limiting service's shards left to their default" "shards is fixed" "$(serving '{}')"
+admitted "a rate-limiting service's other fields changed" "$(serving '{ shards: 64, replicas: 5, copies: 1 }')"
+k apply -f - <<<"$(control_plane payments)" >/dev/null
+[ -z "$(k get controlplane -n edge payments -o jsonpath='{.spec.rateLimiting}')" ] \
+    || fail "a rate-limiting service is not dropped"
+admitted "a rate-limiting service declared again, of other shards" "$(serving '{ shards: 128 }')"
+
+# The control plane's naming of the service's pods, in the ControlPlane's status: a member
+# id of 64 bits read back as it was written. Each naming after the first replaces the one
+# there whole, as the control plane writes it.
+naming() {
+    k patch controlplane -n edge payments --subresource=status --type json \
+        -p "[{\"op\":\"add\",\"path\":\"/status/rateLimiting/naming\",\"value\":$1}]" 2>&1
+}
+named='{"generation":3,"latest":{"term":12884901888,"version":7},"named":[{"address":"10.0.0.7:7000","member":"9223372036854775807"},{"address":"[2001:db8::7]:7000","member":"0"}]}'
+out=$(k patch controlplane -n edge payments --subresource=status --type merge \
+    -p "{\"status\":{\"rateLimiting\":{\"naming\":$named}}}" 2>&1) || fail "a naming is refused: $out"
+kept=$(k get controlplane -n edge payments -o jsonpath='{.status.rateLimiting.naming}')
+[ "$kept" = "$named" ] || fail "a naming written as $named is read back as $kept"
+pass "a naming is kept in status as it was written"
+for case in \
+    'of no generation|{"generation":0,"latest":{"term":0,"version":0},"named":[]}|status.rateLimiting.naming.generation' \
+    'of a member id that is no number|{"generation":1,"latest":{"term":0,"version":0},"named":[{"member":"7a","address":"10.0.0.7:7000"}]}|status.rateLimiting.naming.named[0].member' \
+    'of a member id with a leading zero|{"generation":1,"latest":{"term":0,"version":0},"named":[{"member":"07","address":"10.0.0.7:7000"}]}|status.rateLimiting.naming.named[0].member' \
+    'of no table|{"generation":1,"named":[]}|status.rateLimiting.naming.latest'; do
+    IFS='|' read -r what written why <<<"$case"
+    out=$(naming "$written") && fail "a naming $what is admitted"
+    [[ $out == *"$why"* ]] || fail "a naming $what is refused, but not for \"$why\": $out"
+    pass "a naming $what is refused: $why"
+done
+k delete controlplane -n edge payments >/dev/null
 
 # The admission policy. The control plane's ServiceAccount, as the operator names it, holds
 # the Service writes of its own namespace, as the operator binds them.
