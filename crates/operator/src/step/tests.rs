@@ -424,6 +424,7 @@ fn after_first_of(
     cp.status = Some(edgerush_planes::control_plane::ControlPlaneStatus {
         conditions: Some(wanted("edgerush-controller-edge")),
         authority: None,
+        rate_limiting: None,
     });
     let cp = published(cp, BUNDLE);
     dp.status = Some(edgerush_planes::data_plane::DataPlaneStatus {

@@ -333,6 +333,18 @@ fn a_rate_limiting_value_the_data_plane_cannot_take_is_said_by_its_field() {
         unusable("{ mode: Off }"),
         "DataPlane edge/web: rateLimiting.mode: `Off` is not Disabled or Local"
     );
+    // The schema takes the modes that share counts before the control plane serves them.
+    assert_eq!(
+        unusable(
+            "{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, \
+             breaker: { failures: 5, probeAfterMs: 1000 } } }"
+        ),
+        "DataPlane edge/web: rateLimiting.mode: `Synchronous` is not served yet"
+    );
+    assert_eq!(
+        unusable("{ mode: Asynchronous }"),
+        "DataPlane edge/web: rateLimiting.mode: `Asynchronous` is not served yet"
+    );
     assert_eq!(
         unusable("{ mode: Local, maxKeyBytes: 0 }"),
         "DataPlane edge/web: rateLimiting.maxKeyBytes: 0 is out of range"

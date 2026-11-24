@@ -82,6 +82,87 @@ spec:
                 required:
                 - secretRef
                 type: object
+              rateLimiting:
+                description: |-
+                  RateLimiting is the control plane's part in its DataPlanes' rate limiting.
+                properties:
+                  service:
+                    description: |-
+                      Service is the rate-limiting service the DataPlanes of the control plane
+                      share counts through, in either of the modes that share them: present,
+                      the operator deploys it in the ControlPlane's namespace; left out, there
+                      is none.
+                    properties:
+                      copies:
+                        default: 2
+                        description: |-
+                          Copies is how many pods keep a copy of each shard beside its owner, as
+                          far as there are pods for them: one of them takes the shard over when its
+                          owner goes.
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      forwarderDecides:
+                        default: true
+                        description: |-
+                          ForwarderDecides is whether a pod a Synchronous data plane asks about a
+                          key whose owner it has not heard from for a while decides the key
+                          itself, from its copy, rather than forward the ask to an owner it cannot
+                          reach: so that an owner gone has its keys held to their limits while a
+                          copy takes over, the charges lost if another copy takes them.
+                        type: boolean
+                      maxKeyBytes:
+                        description: |-
+                          MaxKeyBytes is what the keys may take in each pod's memory: past it,
+                          keys are evicted, and start again full. Three quarters of the pods'
+                          memory limit unless said, and with no memory limit 268,435,456 (256 MiB).
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      replicas:
+                        default: 3
+                        description: |-
+                          Replicas is how many pods run. Three is the fewest that go on serving
+                          with one of them lost.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      resources:
+                        description: Resources is each pod's compute resources.
+                        properties:
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Limits is the most of each resource a pod may use.
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: Requests is how much of each resource a pod is given.
+                            type: object
+                        type: object
+                      shards:
+                        default: 256
+                        description: |-
+                          Shards is how many shards the keys are split into, fixed while the
+                          service is declared: a pod of another number would not join the others.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                        x-kubernetes-validations:
+                        - message: shards is fixed while the service is declared
+                          rule: self == oldSelf
+                    type: object
+                type: object
               replicas:
                 default: 1
                 description: |-
@@ -265,6 +346,70 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              rateLimiting:
+                description: RateLimiting is what the control plane keeps of its rate-limiting service.
+                properties:
+                  naming:
+                    description: |-
+                      Naming is the control plane's last naming of the service's pods to form
+                      its cluster, which its leader writes before it tells any pod, in place of
+                      the one before: kept across the controller's restarts, so that a new
+                      leader goes on from it, and dropped with the service.
+                    properties:
+                      generation:
+                        description: Generation is the cluster's generation named.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      latest:
+                        description: |-
+                          Latest is the latest table any of the pods named held then, by its term
+                          and version: the one the cluster forms from.
+                        properties:
+                          term:
+                            description: Term is the table's term.
+                            format: int64
+                            minimum: 0
+                            type: integer
+                          version:
+                            description: Version is the table's version in its term.
+                            format: int64
+                            minimum: 0
+                            type: integer
+                        required:
+                        - term
+                        - version
+                        type: object
+                      named:
+                        description: Named is the pods named to form it.
+                        items:
+                          description: A pod named, as it answered the control plane.
+                          properties:
+                            address:
+                              description: Address is where the other pods reach it, host:port.
+                              minLength: 1
+                              type: string
+                            member:
+                              description: |-
+                                Member is its member id, a new one each time the pod starts, in
+                                decimal as the pod's log has it: a string, as an id of 64 bits is
+                                rounded by a tool that reads every number as a JavaScript one.
+                              maxLength: 20
+                              pattern: ^(0|[1-9][0-9]*)$
+                              type: string
+                          required:
+                          - address
+                          - member
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
+                    - generation
+                    - latest
+                    - named
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
             type: object
         type: object
         x-kubernetes-validations:

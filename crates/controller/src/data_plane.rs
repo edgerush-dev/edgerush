@@ -561,6 +561,11 @@ fn rate_limiting(limiting: &DataPlaneRateLimiting) -> Result<PlaneRateLimiting, 
     let mode = match limiting.mode.as_str() {
         "Disabled" => PlaneRateLimitMode::Off,
         "Local" => PlaneRateLimitMode::Local,
+        // The schema's, which need the rate-limiting service this control plane does not yet
+        // give its data planes (05 §2).
+        shared @ ("Synchronous" | "Asynchronous") => {
+            return Err(("mode".to_owned(), format!("`{shared}` is not served yet")));
+        }
         other => {
             return Err((
                 "mode".to_owned(),

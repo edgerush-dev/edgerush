@@ -2,6 +2,7 @@
 //! `install/gateway.edgerush.dev_controlplanes.yaml`: not to be edited (the crate's docs say how it is written again).
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -35,6 +36,10 @@ pub struct ControlPlaneSpec {
     /// one of its own on first start, in its own namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<ControlPlaneAuthority>,
+    /// RateLimiting is the control plane's part in its DataPlanes' rate limiting.
+    #[serde(rename = "rateLimiting")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limiting: Option<ControlPlaneRateLimiting>,
     /// Replicas is how many controllers run. One leads, elected by a Lease; the
     /// others stand by to take over.
     #[serde(default = "default_control_plane_spec_replicas")]
@@ -70,6 +75,66 @@ pub struct ControlPlaneAuthoritySecretRef {
     /// Name is the Secret's name.
     #[serde(default)]
     pub name: String,
+}
+
+/// RateLimiting is the control plane's part in its DataPlanes' rate limiting.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneRateLimiting {
+    /// Service is the rate-limiting service the DataPlanes of the control plane
+    /// share counts through, in either of the modes that share them: present,
+    /// the operator deploys it in the ControlPlane's namespace; left out, there
+    /// is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<ControlPlaneRateLimitingService>,
+}
+
+/// Service is the rate-limiting service the DataPlanes of the control plane
+/// share counts through, in either of the modes that share them: present,
+/// the operator deploys it in the ControlPlane's namespace; left out, there
+/// is none.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneRateLimitingService {
+    /// Copies is how many pods keep a copy of each shard beside its owner, as
+    /// far as there are pods for them: one of them takes the shard over when its
+    /// owner goes.
+    #[serde(default = "default_control_plane_rate_limiting_service_copies")]
+    pub copies: i32,
+    /// ForwarderDecides is whether a pod a Synchronous data plane asks about a
+    /// key whose owner it has not heard from for a while decides the key
+    /// itself, from its copy, rather than forward the ask to an owner it cannot
+    /// reach: so that an owner gone has its keys held to their limits while a
+    /// copy takes over, the charges lost if another copy takes them.
+    #[serde(rename = "forwarderDecides")]
+    #[serde(default = "default_control_plane_rate_limiting_service_forwarder_decides")]
+    pub forwarder_decides: bool,
+    /// MaxKeyBytes is what the keys may take in each pod's memory: past it,
+    /// keys are evicted, and start again full. Three quarters of the pods'
+    /// memory limit unless said, and with no memory limit 268,435,456 (256 MiB).
+    #[serde(rename = "maxKeyBytes")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_key_bytes: Option<i64>,
+    /// Replicas is how many pods run. Three is the fewest that go on serving
+    /// with one of them lost.
+    #[serde(default = "default_control_plane_rate_limiting_service_replicas")]
+    pub replicas: i32,
+    /// Resources is each pod's compute resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ControlPlaneRateLimitingServiceResources>,
+    /// Shards is how many shards the keys are split into, fixed while the
+    /// service is declared: a pod of another number would not join the others.
+    #[serde(default = "default_control_plane_rate_limiting_service_shards")]
+    pub shards: i32,
+}
+
+/// Resources is each pod's compute resources.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneRateLimitingServiceResources {
+    /// Limits is the most of each resource a pod may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<BTreeMap<String, IntOrString>>,
+    /// Requests is how much of each resource a pod is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<BTreeMap<String, IntOrString>>,
 }
 
 /// Watch is where the control plane follows Ingresses, routes and what they name.
@@ -163,6 +228,10 @@ pub struct ControlPlaneStatus {
     ///   replica available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<Condition>>,
+    /// RateLimiting is what the control plane keeps of its rate-limiting service.
+    #[serde(rename = "rateLimiting")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limiting: Option<ControlPlaneStatusRateLimiting>,
 }
 
 /// Authority is the control plane's certificate authority, as its leader
@@ -175,6 +244,60 @@ pub struct ControlPlaneStatusAuthority {
     /// too, as each of its workloads is given them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
+}
+
+/// RateLimiting is what the control plane keeps of its rate-limiting service.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneStatusRateLimiting {
+    /// Naming is the control plane's last naming of the service's pods to form
+    /// its cluster, which its leader writes before it tells any pod, in place of
+    /// the one before: kept across the controller's restarts, so that a new
+    /// leader goes on from it, and dropped with the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming: Option<ControlPlaneStatusRateLimitingNaming>,
+}
+
+/// Naming is the control plane's last naming of the service's pods to form
+/// its cluster, which its leader writes before it tells any pod, in place of
+/// the one before: kept across the controller's restarts, so that a new
+/// leader goes on from it, and dropped with the service.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneStatusRateLimitingNaming {
+    /// Generation is the cluster's generation named.
+    #[serde(default)]
+    pub generation: i64,
+    /// Latest is the latest table any of the pods named held then, by its term
+    /// and version: the one the cluster forms from.
+    #[serde(default)]
+    pub latest: ControlPlaneStatusRateLimitingNamingLatest,
+    /// Named is the pods named to form it.
+    #[serde(default)]
+    pub named: Vec<ControlPlaneStatusRateLimitingNamingNamed>,
+}
+
+/// Latest is the latest table any of the pods named held then, by its term
+/// and version: the one the cluster forms from.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneStatusRateLimitingNamingLatest {
+    /// Term is the table's term.
+    #[serde(default)]
+    pub term: i64,
+    /// Version is the table's version in its term.
+    #[serde(default)]
+    pub version: i64,
+}
+
+/// A pod named, as it answered the control plane.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ControlPlaneStatusRateLimitingNamingNamed {
+    /// Address is where the other pods reach it, host:port.
+    #[serde(default)]
+    pub address: String,
+    /// Member is its member id, a new one each time the pod starts, in
+    /// decimal as the pod's log has it: a string, as an id of 64 bits is
+    /// rounded by a tool that reads every number as a JavaScript one.
+    #[serde(default)]
+    pub member: String,
 }
 
 /// The schema's default.
@@ -199,6 +322,30 @@ fn default_control_plane_spec_watch() -> ControlPlaneWatch {
 #[rustfmt::skip]
 fn default_control_plane_spec_webhook() -> ControlPlaneWebhook {
     ControlPlaneWebhook { enabled: default_control_plane_webhook_enabled() }
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_control_plane_rate_limiting_service_copies() -> i32 {
+    2
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_control_plane_rate_limiting_service_forwarder_decides() -> bool {
+    true
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_control_plane_rate_limiting_service_replicas() -> i32 {
+    3
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_control_plane_rate_limiting_service_shards() -> i32 {
+    256
 }
 
 /// The schema's default.

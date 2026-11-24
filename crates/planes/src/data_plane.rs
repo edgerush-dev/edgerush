@@ -1292,6 +1292,10 @@ pub struct DataPlanePortsProxyProtocol {
 /// every request it forwards is under. Left out, it has no limits.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DataPlaneRateLimiting {
+    /// Asynchronous is how each proxy shares what it admitted, which only the
+    /// Asynchronous mode takes; each setting has its value when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asynchronous: Option<DataPlaneRateLimitingAsynchronous>,
     /// Global is the limits every request the data plane forwards is under, each
     /// counted apart; a request is charged to all of them or to none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1306,10 +1310,50 @@ pub struct DataPlaneRateLimiting {
     ///
     /// * Disabled: none enforced, nothing counted; the limits are still validated, so that enabling them again cannot fail on one.
     /// * Local: each proxy on what it sees alone, so that a client spread over several proxies gets each one's limit.
+    /// * Synchronous: the key's owner in the ControlPlane's rate-limiting service decides every request.
+    /// * Asynchronous: each proxy decides from its copies of the keys, and shares what it admitted through the ControlPlane's rate-limiting service every cycle.
     ///
-    /// The schema's values: `Disabled`, `Local`. Another is read as it is.
+    /// The schema's values: `Asynchronous`, `Disabled`, `Local`, `Synchronous`. Another is read as it is.
     #[serde(default)]
     pub mode: String,
+    /// Synchronous is how a request waits for its key's owner, and what decides
+    /// it when the owner does not answer: what the Synchronous mode needs, and
+    /// no other takes. Every field is required, as how a proxy behaves when its
+    /// owners are out of reach is the DataPlane's to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synchronous: Option<DataPlaneRateLimitingSynchronous>,
+}
+
+/// Asynchronous is how each proxy shares what it admitted, which only the
+/// Asynchronous mode takes; each setting has its value when left out.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct DataPlaneRateLimitingAsynchronous {
+    /// CycleMs is milliseconds between a proxy's messages to the service; 10
+    /// unless said. Every limit's bucket holds at least two cycles of its rate,
+    /// so a longer cycle asks for larger buckets: at 20 ms, a burst of 40 at
+    /// 1000/s.
+    #[serde(rename = "cycleMs")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_ms: Option<i64>,
+    /// PollQuietKeys is whether a key with nothing to report is polled every
+    /// cycle while in use, to keep its copy fresh. Off, a quiet key's copy is
+    /// as fresh as its last answer until it has something to report again:
+    /// messages grow with the keys admitting, not with all those in use. On, a
+    /// key counts as in use for its refill time after its last request, so
+    /// under a limit refilling over an hour or a day every key of every client
+    /// seen in that time is polled every cycle. Off unless said, the faster.
+    #[serde(rename = "pollQuietKeys")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_quiet_keys: Option<bool>,
+    /// ScheduleKeys is whether each cycle a proxy visits only the keys that
+    /// need it, rather than every key it holds, so that quiet keys cost nothing
+    /// between their uses. Off, every cycle visits every key held, and a key is
+    /// held for twice its refill time after its last request: under a limit
+    /// refilling over an hour or a day, each cycle's work grows with every
+    /// client seen in that time. On unless said, the faster.
+    #[serde(rename = "scheduleKeys")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_keys: Option<bool>,
 }
 
 /// Limit is one limit, whose requests it counts together and how many it allows.
@@ -1413,6 +1457,52 @@ pub struct DataPlaneRateLimitingGlobalModelRollingWindow {
     /// Window is a whole number and ms, s, m, h or d, such as 500ms, 1m or 1d.
     #[serde(default)]
     pub window: String,
+}
+
+/// Synchronous is how a request waits for its key's owner, and what decides
+/// it when the owner does not answer: what the Synchronous mode needs, and
+/// no other takes. Every field is required, as how a proxy behaves when its
+/// owners are out of reach is the DataPlane's to say.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct DataPlaneRateLimitingSynchronous {
+    /// Breaker is when a proxy stops asking an owner that does not answer, and
+    /// when it tries it again: open, nothing is asked of the owner and
+    /// WhenUnreachable decides at once.
+    #[serde(default)]
+    pub breaker: DataPlaneRateLimitingSynchronousBreaker,
+    /// TimeoutMs is milliseconds a request waits for its owner's answer before
+    /// WhenUnreachable decides it.
+    #[serde(rename = "timeoutMs")]
+    #[serde(default)]
+    pub timeout_ms: i64,
+    /// WhenUnreachable is what decides a request whose owner does not answer
+    /// in time, or whose breaker is open:
+    ///
+    /// * Allow: it goes on, as under no limit.
+    /// * Deny: it is refused, 503 with Retry-After: 1, as the service failed, not the client.
+    /// * Local: the proxy's own buckets, as in the Local mode, until the owner answers again.
+    ///
+    /// The schema's values: `Allow`, `Deny`, `Local`. Another is read as it is.
+    #[serde(rename = "whenUnreachable")]
+    #[serde(default)]
+    pub when_unreachable: String,
+}
+
+/// Breaker is when a proxy stops asking an owner that does not answer, and
+/// when it tries it again: open, nothing is asked of the owner and
+/// WhenUnreachable decides at once.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct DataPlaneRateLimitingSynchronousBreaker {
+    /// Failures is timeouts and broken streams in a row that open it; any
+    /// answer starts the count again.
+    #[serde(default)]
+    pub failures: i32,
+    /// ProbeAfterMs is milliseconds open before the owner is tried again,
+    /// without a request: its first word closes the breaker, and none leaves
+    /// it open as long again.
+    #[serde(rename = "probeAfterMs")]
+    #[serde(default)]
+    pub probe_after_ms: i64,
 }
 
 /// Replicas is how many proxies run. With max above min, a
