@@ -235,7 +235,7 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
     assert!(get(web, "/")?.contains("x-upstream: two"));
 
     // A listener that is new is listened on as its config takes over, and served.
-    let free = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let free = free_over_udp_and_tcp()?;
     let more = config("127.0.0.1:0", "up", Some(one)).replace("[web]", "[web, api]")
         + &format!(
             "  api: {{ address: \"{free}\", protocol: http, proxy_protocol: off, forwarding: {{ trusted_proxies: [], trusted_only_headers: [] }}, request_id: generate }}\n"
@@ -314,16 +314,15 @@ fn proxy_serves_the_file_and_follows_it() -> io::Result<()> {
 fn proxy_drains_a_listener_taken_away_and_moves_it_once_drained() -> io::Result<()> {
     let one = upstream("one")?;
     let (held, arrived, release) = held_upstream()?;
-    // Every port it binds chosen at once, so that none is another's: one left to the
+    // Every port it binds drawn, none twice, so that none is another's: one left to the
     // operating system could be given the port `moved` holds here, once that is let go.
-    let reserved: Vec<TcpListener> = (0..4)
-        .map(|_| TcpListener::bind("127.0.0.1:0"))
-        .collect::<io::Result<_>>()?;
-    let ports: Vec<SocketAddr> = reserved
-        .iter()
-        .map(TcpListener::local_addr)
-        .collect::<io::Result<_>>()?;
-    drop(reserved);
+    let mut ports: Vec<SocketAddr> = Vec::with_capacity(4);
+    while ports.len() < 4 {
+        let drawn = free_over_udp_and_tcp()?;
+        if !ports.contains(&drawn) {
+            ports.push(drawn);
+        }
+    }
     let (web, first, moved, metrics_on) = (ports[0], ports[1], ports[2], ports[3].to_string());
     let listener = |name: &str, at: &str| {
         format!(
@@ -418,12 +417,13 @@ listeners:
     Ok(())
 }
 
-/// A port free over both UDP and TCP, for a test that names it for both, named at random
-/// from 16,384 to 32,767, below every system's ephemeral range (Linux's starts at 32,768,
-/// Windows' and macOS's at 49,152). A test lets the port go before the proxy listens on it,
-/// at its start or on a reload, and the sockets other tests leave to the system to place
-/// can never take it there: only another test's draw can (#566). A port taken, or kept from
-/// one protocol (Windows keeps runs of ports from each, #300, #310), is drawn again.
+/// A port free over both UDP and TCP, for a test that names it to the proxy, for both or
+/// for one alone, named at random from 16,384 to 32,767, below every system's ephemeral
+/// range (Linux's starts at 32,768, Windows' and macOS's at 49,152). A test lets the port
+/// go before the proxy listens on it, at its start or on a reload, and the sockets other
+/// tests leave to the system to place can never take it there: only another test's draw
+/// can (#566, #594). A port taken, or kept from one protocol (Windows keeps runs of ports
+/// from each, #300, #310), is drawn again.
 fn free_over_udp_and_tcp() -> io::Result<SocketAddr> {
     let keys = RandomState::new();
     (0..16u64)
@@ -872,7 +872,7 @@ fn proxy_serves_what_its_control_plane_sends_and_follows_it() -> io::Result<()> 
     assert_eq!(reported().running.config.as_deref(), Some(second.version()));
 
     // A listener that is new is listened on as its config takes over, as a file's is.
-    let free = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let free = free_over_udp_and_tcp()?;
     let added = offered(
         &(config("127.0.0.1:0", "up", Some(two)).replace("[web]", "[web, api]")
             + &format!(
