@@ -33,7 +33,7 @@ use http::HeaderName;
 use hub::SYNC;
 pub(crate) use hub::{FromHub, ToHub};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
 use std::num::NonZeroU64;
@@ -417,7 +417,7 @@ pub(crate) enum Undecided {
 }
 
 /// A worker's handles to its process's entries, found by key.
-type Handles = HashSet<Handle, Keyed>;
+type Handles = pooled::Handles<Keyed>;
 
 /// A worker's limiter: deciding from the entries its process's participant keeps.
 pub(crate) struct Limiter {
@@ -474,8 +474,8 @@ impl Limiter {
             service: service.clone(),
             hub,
             index,
+            handles: RefCell::new(Handles::new(Arc::clone(&registry), hasher)),
             registry,
-            handles: RefCell::new(HashSet::with_hasher(hasher)),
             next: Cell::new(0),
             asked: RefCell::new(HashMap::new()),
             waiting: Places::new(MOST_WAITING, MOST_WAITING_BYTES),
@@ -609,7 +609,7 @@ impl Limiter {
                     .iter()
                     .enumerate()
                     .filter_map(|(at, (key, contract))| {
-                        let entry = handles.get(*key)?.entry();
+                        let entry = handles.get(key)?.entry();
                         (entry.contract() == *contract).then_some((at, &**entry))
                     })
                     .unzip();
@@ -756,7 +756,7 @@ fn decide(
     let handles = handles.borrow();
     let entry = |at: usize| {
         let (key, _) = parts.get(at)?;
-        handles.get(*key).map(|held| &**held.entry())
+        handles.get(key).map(|held| &**held.entry())
     };
     // The usual few at once without a list made for them.
     let Some(first) = entry(0) else {
@@ -795,7 +795,7 @@ impl Limiter {
                 if outcome.signal & (1 << at) == 0 {
                     continue;
                 }
-                let Some(held) = handles.get(*key) else {
+                let Some(held) = handles.get(key) else {
                     continue;
                 };
                 let entry = held.entry();

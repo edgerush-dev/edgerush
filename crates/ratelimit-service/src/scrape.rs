@@ -123,8 +123,8 @@ pub fn render_store(observed: Observed) -> String {
     scrape.family(name, Kind::Gauge, help);
     scrape.sample(name, &[], u8::from(observed.ready));
     let name = "edgerush_rate_limit_key_bytes";
-    let help = "Bytes the keys hold, owned and copies, as an estimate of their own data and \
-                of their places in the schedule of when each may be forgotten.";
+    let help = "Bytes the keys take in memory, owned and copies, worked out from what each key \
+                keeps, its place in the schedule of when it may be forgotten with it.";
     scrape.family(name, Kind::Gauge, help);
     scrape.sample(name, &[], observed.key_bytes);
     if let Some(most) = observed.max_key_bytes {

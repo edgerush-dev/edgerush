@@ -1265,13 +1265,9 @@ impl Proxy {
             running.set_capacity(max_key_bytes);
             return Ok(Some(Arc::clone(running)));
         }
-        crate::ratelimit::local::Process::start(
-            self.workers.get(),
-            max_key_bytes,
-            Some(failed.clone()),
-        )
-        .map(Some)
-        .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))
+        crate::ratelimit::local::Process::start(max_key_bytes, Some(failed.clone()))
+            .map(Some)
+            .map_err(|error| ProxyError::RateLimitThread(format!("no thread: {error}")))
     }
 
     /// The synchronous mode's side of the process for `config`: none in another mode;

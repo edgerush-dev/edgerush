@@ -33,14 +33,10 @@ pub(crate) struct Process {
 }
 
 impl Process {
-    /// The keys of a process of `workers` workers, within `max_key_bytes`, and the thread
-    /// that sweeps them, which calls `failed` if it panics.
-    pub(crate) fn start(
-        workers: usize,
-        max_key_bytes: u64,
-        failed: Option<Failed>,
-    ) -> std::io::Result<Arc<Self>> {
-        let process = Self::unswept(workers, max_key_bytes);
+    /// The keys of a process, within `max_key_bytes`, and the thread that sweeps them, which
+    /// calls `failed` if it panics.
+    pub(crate) fn start(max_key_bytes: u64, failed: Option<Failed>) -> std::io::Result<Arc<Self>> {
+        let process = Self::unswept(max_key_bytes);
         let swept = Arc::downgrade(&process);
         std::thread::Builder::new()
             .name("edgerush-rate-limit-sweep".to_owned())
@@ -48,13 +44,12 @@ impl Process {
         Ok(process)
     }
 
-    /// The keys of a process of `workers` workers, within `max_key_bytes`, with no thread of
-    /// their own: whoever keeps them takes their [`turn`](Self::turn) every [`CAP_LOOK`] or
+    /// The keys of a process, within `max_key_bytes`, with no thread of their own: whoever keeps them takes their [`turn`](Self::turn) every [`CAP_LOOK`] or
     /// sooner.
-    pub(crate) fn unswept(workers: usize, max_key_bytes: u64) -> Arc<Self> {
+    pub(crate) fn unswept(max_key_bytes: u64) -> Arc<Self> {
         let entropy = RandomState::new();
         let hasher = Keyed::new([entropy.hash_one(0_u8), entropy.hash_one(1_u8)]);
-        let local = Local::new(hasher, u64::try_from(workers).unwrap_or(u64::MAX));
+        let local = Local::new(hasher);
         local.set_capacity(max_key_bytes);
         Arc::new(Self {
             local,
@@ -276,16 +271,19 @@ mod tests {
     /// (GitHub #410); a [`SWEEP`] after the last, the turn sweeps.
     #[test]
     fn a_turn_between_sweeps_evicts_past_the_cap() {
-        let process = Process::unswept(1, u64::MAX);
-        spent(&process, 0, 1);
-        let each = process.usage().bytes;
-        process.set_capacity(10 * each);
+        let process = Process::unswept(u64::MAX);
         let swept = Instant::now();
-        spent(&process, 1, 20);
+        spent(&process, 0, 20);
+        let each = process.usage().bytes - process.local.tables();
+        assert_eq!(each % 20, 0, "every key of the same bytes");
+        let (each, tables) = (each / 20, process.local.tables());
+        // Nine tenths of the cap holds the tables, which keep their room, and nine and a half
+        // keys.
+        process.set_capacity((tables + 9 * each + each / 2) * 10 / 9);
         assert_eq!(process.turn(swept, swept + CAP_LOOK), swept, "no sweep yet");
         let usage = process.usage();
         assert_eq!(usage.evicted, 11, "down to nine tenths of the cap");
-        assert_eq!(usage.bytes, 9 * each);
+        assert_eq!(usage.bytes, tables + 9 * each);
         assert_eq!(process.turn(swept, swept + SWEEP), swept + SWEEP, "a sweep");
     }
 }

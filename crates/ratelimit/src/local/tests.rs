@@ -24,7 +24,7 @@ pub(super) fn contract(limit: u64, window: u64, burst: u64) -> Contract {
 }
 
 pub(super) fn local() -> Local<FixedState> {
-    Local::new(FixedState::default(), 1)
+    Local::new(FixedState::default())
 }
 
 /// Asserts that `decision` refuses at `position` with the wait `owed` nanoseconds of `c`'s
@@ -268,6 +268,9 @@ proptest! {
     }
 }
 
+/// A key counts its own bytes as it comes and goes; the tables holding it, the registry's
+/// and the worker's handles', count as they are allocated, keep their room as keys go, and
+/// are given back with the handles.
 #[test]
 fn bytes_are_counted_as_keys_come_and_go() {
     let local = local();
@@ -275,12 +278,31 @@ fn bytes_are_counted_as_keys_come_and_go() {
     let c = contract(10, SECOND, 1);
     assert_eq!(local.holding(), 0);
     assert!(one(&local, &mut handles, b"k1", c, 0));
-    let one_key = local.holding();
-    assert_eq!(one_key, key_bytes(b"k1", c.into(), 1));
+    let tables = local.tables();
+    assert!(tables > 0, "a shard's table and a part of the handles'");
+    assert_eq!(tables, local.registry_tables() + handles.set.bytes());
+    assert_eq!(local.holding(), tables + key_bytes(b"k1", c.into()));
     assert!(one(&local, &mut handles, b"k22", c, 0));
-    assert_eq!(local.holding(), one_key + key_bytes(b"k22", c.into(), 1));
+    let tables = local.tables();
+    assert_eq!(
+        local.holding(),
+        tables + key_bytes(b"k1", c.into()) + key_bytes(b"k22", c.into())
+    );
     local.sweep(10 * SECOND, 0);
-    assert_eq!(local.holding(), 0);
+    handles.prune();
+    assert_eq!(local.holding(), tables, "the tables keep their room");
+    drop(handles);
+    assert_eq!(
+        local.holding(),
+        local.registry_tables(),
+        "the handles' given back"
+    );
+}
+
+/// A cap whose nine tenths hold `local`'s tables and `keys` keys of `each` bytes, with half a
+/// key to spare: what eviction comes down to.
+fn room_for(local: &Local<FixedState>, keys: u64, each: u64) -> u64 {
+    (local.tables() + keys * each + each / 2) * 10 / 9
 }
 
 #[test]
@@ -295,16 +317,17 @@ fn past_its_cap_it_evicts_the_keys_full_soonest() {
             assert!(one(&local, &mut handles, key.as_bytes(), c, 0));
         }
     }
-    let each = key_bytes(b"k1", c.into(), 1);
-    // Room for three keys: nine tenths of it keeps two, those full latest.
-    local.set_capacity(3 * each);
+    let each = key_bytes(b"k1", c.into());
+    let tables = local.tables();
+    // Nine tenths of the cap keeps two, those full latest.
+    local.set_capacity(room_for(&local, 2, each));
     let swept = local.sweep(0, SECOND);
     assert_eq!(swept.evicted, 3);
     let kept: Vec<bool> = (1..=5)
         .map(|spent| local.contains(format!("k{spent}").as_bytes()))
         .collect();
     assert_eq!(kept, [false, false, false, true, true]);
-    assert_eq!(local.holding(), 2 * each);
+    assert_eq!(local.holding(), tables + 2 * each);
     assert_eq!(local.evicted(), 3);
 }
 
@@ -322,19 +345,20 @@ fn eviction_alone_evicts_past_the_cap_and_forgets_nothing() {
             assert!(one(&local, &mut handles, key.as_bytes(), c, 0));
         }
     }
-    let each = key_bytes(b"k1", c.into(), 1);
+    let each = key_bytes(b"k1", c.into());
+    let tables = local.tables();
     // Every key full and quiet by then: a sweep would forget them all.
     let later = 10 * SECOND;
-    local.set_capacity(5 * each);
+    local.set_capacity(tables + 5 * each);
     assert_eq!(local.evict(later), 0, "within the cap");
     assert_eq!(local.key_count(), 5);
-    local.set_capacity(3 * each);
+    local.set_capacity(room_for(&local, 2, each));
     assert_eq!(local.evict(0), 3);
     let kept: Vec<bool> = (1..=5)
         .map(|spent| local.contains(format!("k{spent}").as_bytes()))
         .collect();
     assert_eq!(kept, [false, false, false, true, true]);
-    assert_eq!(local.holding(), 2 * each);
+    assert_eq!(local.holding(), tables + 2 * each);
     assert_eq!(local.evicted(), 3);
 }
 

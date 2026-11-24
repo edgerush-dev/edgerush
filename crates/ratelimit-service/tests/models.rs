@@ -169,7 +169,7 @@ fn reference(name: &'static str, mut model: impl Model, times: &[Time], shift: T
 }
 
 fn local(limit: impl Into<LocalLimit>, times: &[Time]) -> Run {
-    let store = Local::new(RandomState::new(), 1);
+    let store = Local::new(RandomState::new());
     let mut handles = Handles::new(RandomState::new());
     let contract: LocalLimit = limit.into();
     Run {

@@ -57,7 +57,7 @@ fn request<L: core::marker::Copy + Into<Limit> + Send + 'static>(
 #[test]
 fn loom_the_last_room_goes_to_one_of_two() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let one = request(&local, &[b"k"], contract(1, 1), 0);
         let other = request(&local, &[b"k"], contract(1, 1), 0);
         let admitted = [one.join().unwrap(), other.join().unwrap()];
@@ -71,7 +71,7 @@ fn loom_the_last_room_goes_to_one_of_two() {
 #[test]
 fn loom_an_idle_keys_one_room_goes_to_one_of_two() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let c = contract(1, 1);
         let mut handles = Handles::new(FixedState::default());
         assert_eq!(local.decide(&mut handles, &[(b"k", c)], 0), Decision::Admit);
@@ -88,7 +88,7 @@ fn loom_an_idle_keys_one_room_goes_to_one_of_two() {
 #[test]
 fn loom_two_limits_racing_never_refuse_both() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let one = request(&local, &[b"a", b"b"], contract(1, 1), 0);
         let other = request(&local, &[b"b", b"a"], contract(1, 1), 0);
         let admitted = [one.join().unwrap(), other.join().unwrap()];
@@ -102,7 +102,7 @@ fn loom_two_limits_racing_never_refuse_both() {
 #[test]
 fn loom_a_key_forgotten_under_a_request_admits_it() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 1));
+        let local = Arc::new(Local::new(FixedState::default()));
         let c = contract(1, 1);
         let mut handles = Handles::new(FixedState::default());
         assert_eq!(local.decide(&mut handles, &[(b"k", c)], 0), Decision::Admit);
@@ -114,8 +114,8 @@ fn loom_a_key_forgotten_under_a_request_admits_it() {
         };
         local.sweep(2_000 * MS, 500 * MS);
         assert!(worker.join().unwrap(), "refused though full");
-        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", c.into(), 1);
-        assert_eq!(local.holding(), held);
+        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", c.into());
+        assert_eq!(local.holding(), local.tables() + held);
     });
 }
 
@@ -123,7 +123,7 @@ fn loom_a_key_forgotten_under_a_request_admits_it() {
 #[test]
 fn loom_a_windows_last_room_goes_to_one_of_two() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let one = request(&local, &[b"k"], window(1), 0);
         let other = request(&local, &[b"k"], window(1), 0);
         let admitted = [one.join().unwrap(), other.join().unwrap()];
@@ -136,7 +136,7 @@ fn loom_a_windows_last_room_goes_to_one_of_two() {
 #[test]
 fn loom_an_idle_windows_one_room_goes_to_one_of_two() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let mut handles = Handles::new(FixedState::default());
         let w = window(1);
         assert_eq!(local.decide(&mut handles, &[(b"k", w)], 0), Decision::Admit);
@@ -151,7 +151,7 @@ fn loom_an_idle_windows_one_room_goes_to_one_of_two() {
 #[test]
 fn loom_two_windows_racing_never_refuse_both() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let one = request(&local, &[b"a", b"b"], window(1), 0);
         let other = request(&local, &[b"b", b"a"], window(1), 0);
         let admitted = [one.join().unwrap(), other.join().unwrap()];
@@ -164,7 +164,7 @@ fn loom_two_windows_racing_never_refuse_both() {
 #[test]
 fn loom_a_window_forgotten_under_a_request_admits_it() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 1));
+        let local = Arc::new(Local::new(FixedState::default()));
         let w = window(1);
         let mut handles = Handles::new(FixedState::default());
         assert_eq!(local.decide(&mut handles, &[(b"k", w)], 0), Decision::Admit);
@@ -176,8 +176,8 @@ fn loom_a_window_forgotten_under_a_request_admits_it() {
         };
         local.sweep(2_000 * MS, 500 * MS);
         assert!(worker.join().unwrap(), "refused though counting none");
-        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", w.into(), 1);
-        assert_eq!(local.holding(), held);
+        let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", w.into());
+        assert_eq!(local.holding(), local.tables() + held);
     });
 }
 
@@ -205,7 +205,7 @@ fn standing(local: &Local<FixedState>, r: Rolling, now: u64) -> (u64, u64) {
 #[test]
 fn loom_a_rolling_windows_last_room_goes_to_one_of_two() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let one = request(&local, &[b"k"], rolling(), 0);
         let other = request(&local, &[b"k"], rolling(), 0);
         let admitted = [one.join().unwrap(), other.join().unwrap()];
@@ -220,7 +220,7 @@ fn loom_a_rolling_windows_last_room_goes_to_one_of_two() {
 #[test]
 fn loom_a_slot_taken_off_under_an_admission_refuses_neither() {
     model(|| {
-        let local = Arc::new(Local::new(FixedState::default(), 2));
+        let local = Arc::new(Local::new(FixedState::default()));
         let early = request(&local, &[b"k"], rolling(), 0);
         let late = request(&local, &[b"k"], rolling(), 2 * MS);
         assert!(late.join().unwrap(), "refused, its window empty");

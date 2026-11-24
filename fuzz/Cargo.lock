@@ -211,6 +211,9 @@ dependencies = [
 [[package]]
 name = "edgerush-cluster"
 version = "0.0.0"
+dependencies = [
+ "edgerush-memory",
+]
 
 [[package]]
 name = "edgerush-cluster-asynchronous"
@@ -234,6 +237,7 @@ name = "edgerush-cluster-synchronous"
 version = "0.0.0"
 dependencies = [
  "edgerush-cluster",
+ "edgerush-memory",
 ]
 
 [[package]]
@@ -393,6 +397,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-memory"
+version = "0.0.0"
+
+[[package]]
 name = "edgerush-planes"
 version = "0.0.0"
 dependencies = [
@@ -448,6 +456,7 @@ dependencies = [
 name = "edgerush-ratelimit"
 version = "0.0.0"
 dependencies = [
+ "edgerush-memory",
  "hashbrown",
  "portable-atomic",
 ]

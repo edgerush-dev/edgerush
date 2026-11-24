@@ -1294,8 +1294,8 @@ impl Metrics {
     ) -> String {
         let mut scrape = Exposition::new();
         let name = "edgerush_rate_limit_key_bytes";
-        let help = "Bytes the rate limits' keys hold, every worker's, as an estimate of their \
-                    own data.";
+        let help = "Bytes the rate limits' keys take in memory, every worker's, worked out from \
+                    what each key keeps.";
         scrape.family(name, Kind::Gauge, help);
         let bytes = self.limiters.sum(|shard| shard.key_bytes.get());
         scrape.sample(name, &[], bytes.max(0).cast_unsigned());

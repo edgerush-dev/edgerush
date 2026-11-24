@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 edgerush-cluster.workspace = true
+edgerush-memory.workspace = true
 
 [lints]
 workspace = true

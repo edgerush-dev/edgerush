@@ -48,7 +48,7 @@ async fn a_refusal_keeps_its_reason_once_its_key_is_evicted() {
             );
             let compiled = compile(&config).unwrap();
             let rule = &compiled.rules_of(0)[0];
-            let process = crate::ratelimit::local::Process::unswept(1, 1);
+            let process = crate::ratelimit::local::Process::unswept(1);
             let limiter = crate::ratelimit::local::LocalLimiter::new(Arc::clone(&process), 0);
             let client = crate::forwarding::Requester {
                 address: "203.0.113.7".parse().unwrap(),

@@ -13,6 +13,7 @@ edgerush-cluster-asynchronous.workspace = true
 edgerush-cluster-synchronous.workspace = true
 
 [dev-dependencies]
+edgerush-memory.workspace = true
 edgerush-ratelimit.workspace = true
 iai-callgrind.workspace = true
 proptest.workspace = true

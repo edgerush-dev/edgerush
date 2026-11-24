@@ -13,9 +13,14 @@ pub trait Held: Clone + Debug + Default + PartialEq {
     /// Takes in `other`, a copy of the same key: whether it raised anything.
     fn merge(&mut self, other: &Self) -> bool;
 
-    /// About the bytes its parts take, held or sent: what `max_key_bytes` counts, with the key
-    /// and its time to forget at.
+    /// About the bytes its parts take sent: what a copy's parts are cut by
+    /// (`Config::part_bytes`), with the key and its time to forget at.
     fn bytes(&self) -> u64;
+
+    /// What it holds in memory beside its own size — its parts kept on the heap, in the
+    /// blocks glibc allocates them in ([`edgerush_memory`]): what `max_key_bytes` counts of
+    /// it, with the key's share of the store's maps. 0 for a value kept whole in place.
+    fn heap_bytes(&self) -> u64;
 
     /// Its kind, below [`KINDS`]: what the store counts it apart as, in its keys, their bytes
     /// and those forgotten and evicted. 0 for a store of one kind of value.
@@ -61,8 +66,8 @@ impl<V: Held> Kept<V> {
         self.value.kind().min(KINDS - 1)
     }
 
-    /// About the bytes it takes with its key, held or sent: the key, the time to forget at and
-    /// the value's parts.
+    /// About the bytes it takes with its key sent: the key, the time to forget at and the
+    /// value's parts.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         KEY_BYTES + 8 + self.value.bytes()
@@ -128,6 +133,10 @@ impl Held for Counts {
     /// count does.
     fn bytes(&self) -> u64 {
         8 + 16 * self.0.len() as u64
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        edgerush_memory::btree_ascending::<u64, u64>(self.0.len())
     }
 
     fn only(&self, parts: &BTreeSet<u64>) -> Self {

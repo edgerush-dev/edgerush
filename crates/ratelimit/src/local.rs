@@ -33,7 +33,8 @@ mod tests;
 pub use crate::service::Contract;
 pub use rolling::MOST_SLOTS;
 
-use key_set::{KeySet, SLOT_BYTES};
+use edgerush_memory::{allocation, arc};
+use key_set::KeySet;
 use rolling::Ring;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -618,9 +619,11 @@ pub struct Swept {
 pub struct Local<S> {
     shards: Box<[RwLock<KeySet<S, 1>>]>,
     hasher: S,
-    /// Workers holding handles to the keys, which a key's bytes count.
-    workers: u64,
+    /// The keys' own bytes, as [`key_bytes`] counts them.
     holding: AtomicU64,
+    /// What the tables of the keys take, the registry's and the workers' handles', as glibc
+    /// allocates them: added to as they grow, and given back as a worker's handles go.
+    tables: Arc<AtomicU64>,
     capacity: AtomicU64,
     evicted: AtomicU64,
     /// Each limit's terms, which its keys point to: read when a key is made, and let go of
@@ -628,48 +631,65 @@ pub struct Local<S> {
     terms: RwLock<HashMap<Limit, Arc<Terms>>>,
 }
 
-/// The bytes a key of `key` under `limit` is counted as: the key itself, its name, and a
-/// slot for its handle in the registry and in each of `workers`' sets, a byte of a table's
-/// control with each; a rolling window's own terms and ring besides. An estimate, not what
-/// the allocator takes. Any other limit's terms are not counted: there is one a limit,
-/// however many keys it has.
+/// The bytes a key of `key` under `limit` is counted as taking in memory beside its handles:
+/// the key itself and its name, in the blocks glibc allocates them in; a rolling window's
+/// own terms and ring besides. Its handles are in the tables of the registry and of the
+/// workers that met it, counted as the tables are allocated ([`Local::tables`]). Any other
+/// limit's terms are not counted: there is one a limit, however many keys it has.
 #[must_use]
-pub fn key_bytes(key: &[u8], limit: Limit, workers: u64) -> u64 {
-    // An `Arc`'s two counts beside the key.
-    let entry = 2 * size_of::<usize>() + size_of::<Key>() + key.len();
+pub fn key_bytes(key: &[u8], limit: Limit) -> u64 {
     let own = match limit {
         Limit::RollingWindow(rolling) => Ring::bytes(rolling),
         Limit::Bucket(_) | Limit::FixedWindow(_) => 0,
     };
-    entry as u64 + own + SLOT_BYTES * (1 + workers)
+    arc::<Key>() + allocation(key.len()) + own
 }
 
 impl<S: BuildHasher + Clone> Local<S> {
-    /// No keys yet, hashed by `hasher`, shared by `workers` workers; no cap until one is set.
+    /// No keys yet, hashed by `hasher`; no cap until one is set.
     #[must_use]
-    pub fn new(hasher: S, workers: u64) -> Self {
+    pub fn new(hasher: S) -> Self {
         Self {
             shards: (0..SHARDS)
                 .map(|_| RwLock::new(KeySet::with_hasher(hasher.clone())))
                 .collect(),
             hasher,
-            workers: workers.max(1),
             holding: AtomicU64::new(0),
+            tables: Arc::new(AtomicU64::new(0)),
             capacity: AtomicU64::new(u64::MAX),
             evicted: AtomicU64::new(0),
             terms: RwLock::new(HashMap::new()),
         }
     }
 
-    /// The bytes its keys may hold, as [`key_bytes`] counts them: past them, a sweep evicts.
+    /// The bytes its keys may take, as [`holding`](Self::holding) counts them: past them, a
+    /// sweep evicts.
     pub fn set_capacity(&self, bytes: u64) {
         self.capacity.store(bytes, Ordering::Relaxed);
     }
 
-    /// The bytes its keys hold, as [`key_bytes`] counts them.
+    /// The bytes its keys take in memory: each key's own ([`key_bytes`]) and the tables
+    /// holding them ([`tables`](Self::tables)).
     #[must_use]
     pub fn holding(&self) -> u64 {
-        self.holding.load(Ordering::Relaxed)
+        self.holding
+            .load(Ordering::Relaxed)
+            .saturating_add(self.tables())
+    }
+
+    /// Its registry's tables alone, as [`tables`](Self::tables) counts them: a walk, for the
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn registry_tables(&self) -> u64 {
+        self.shards.iter().map(|shard| read(shard).bytes()).sum()
+    }
+
+    /// What the tables holding its keys take, as glibc allocates them: its registry's, and
+    /// the handles' of every worker deciding from it. A table grows by doubling and never
+    /// shrinks, so this falls only as a worker's handles go.
+    #[must_use]
+    pub fn tables(&self) -> u64 {
+        self.tables.load(Ordering::Relaxed)
     }
 
     /// Keys evicted for the cap, all told.
@@ -728,19 +748,20 @@ impl<S: BuildHasher + Clone> Local<S> {
                 return Arc::clone(found);
             }
             found.close();
-            self.holding.fetch_sub(
-                key_bytes(key, found.limit(), self.workers),
-                Ordering::Relaxed,
-            );
+            self.holding
+                .fetch_sub(key_bytes(key, found.limit()), Ordering::Relaxed);
         }
         let terms = match contract {
             Limit::RollingWindow(_) => Arc::new(Terms::new(contract)),
             Limit::Bucket(_) | Limit::FixedWindow(_) => self.terms(contract),
         };
         let made = Arc::new(Key::new(key.into(), terms, hash, now));
-        set.replace_hashed(hash, Arc::clone(&made));
+        let (grown, _) = set.replace_hashed(hash, Arc::clone(&made));
+        if grown > 0 {
+            self.tables.fetch_add(grown, Ordering::Relaxed);
+        }
         self.holding
-            .fetch_add(key_bytes(key, contract, self.workers), Ordering::Relaxed);
+            .fetch_add(key_bytes(key, contract), Ordering::Relaxed);
         made
     }
 
@@ -818,7 +839,7 @@ impl<S: BuildHasher + Clone> Local<S> {
                 let forget = key.close_if_forgettable(now, quiet);
                 if forget {
                     swept.forgotten += 1;
-                    freed += key_bytes(&key.key, key.limit(), self.workers);
+                    freed += key_bytes(&key.key, key.limit());
                 }
                 !forget
             });
@@ -865,10 +886,8 @@ impl<S: BuildHasher + Clone> Local<S> {
             {
                 key.close();
                 set.remove(&key.key);
-                self.holding.fetch_sub(
-                    key_bytes(&key.key, key.limit(), self.workers),
-                    Ordering::Relaxed,
-                );
+                self.holding
+                    .fetch_sub(key_bytes(&key.key, key.limit()), Ordering::Relaxed);
                 self.evicted.fetch_add(1, Ordering::Relaxed);
                 evicted += 1;
             }
@@ -877,12 +896,25 @@ impl<S: BuildHasher + Clone> Local<S> {
     }
 }
 
-/// A worker's handles to the keys it has met: found without a lock, by the key's name.
+/// A worker's handles to the keys it has met: found without a lock, by the key's name. What
+/// its tables take is counted in the [`Local`] it decides from, one alone, from the first
+/// key it meets until it goes.
 #[derive(Debug)]
 pub struct Handles<S> {
     set: KeySet<S, HANDLE_PARTS>,
     /// The part [`prune_next`](Self::prune_next) reads next.
     next_part: usize,
+    /// Where its tables are counted, its [`Local`]'s tables, once it has met a key.
+    counted_in: Option<Arc<AtomicU64>>,
+}
+
+impl<S> Drop for Handles<S> {
+    /// Its tables go with it: no longer counted.
+    fn drop(&mut self) {
+        if let Some(tables) = &self.counted_in {
+            tables.fetch_sub(self.set.bytes(), Ordering::Relaxed);
+        }
+    }
 }
 
 impl<S: BuildHasher + Clone> Handles<S> {
@@ -892,6 +924,7 @@ impl<S: BuildHasher + Clone> Handles<S> {
         Self {
             set: KeySet::with_hasher(hasher),
             next_part: 0,
+            counted_in: None,
         }
     }
 
@@ -952,7 +985,13 @@ impl<S: BuildHasher + Clone> Handles<S> {
     #[inline(never)]
     fn made(&mut self, local: &Local<S>, key: &[u8], hash: u64, contract: Limit, now: u64) -> &Key {
         let made = local.find_or_make(key, contract, now);
-        self.set.replace_hashed(hash, made)
+        let (grown, held) = self.set.replace_hashed(hash, made);
+        if grown > 0 {
+            self.counted_in
+                .get_or_insert_with(|| Arc::clone(&local.tables))
+                .fetch_add(grown, Ordering::Relaxed);
+        }
+        held
     }
 }
 

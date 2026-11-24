@@ -3,16 +3,19 @@
 //! the bytes they take — kept as the keys change rather than counted by walking them, so that
 //! finding the keys due costs as many steps as there are keys due.
 
-use crate::{Held, KEY_BYTES, KINDS, Kept, Key, ShardId, Time};
+use crate::{Held, KINDS, Kept, Key, ShardId, Time};
+use edgerush_memory::btree_entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A second, in nanoseconds: what a key's time to be forgotten is rounded up to.
 const SECOND: Time = 1_000_000_000;
 
-/// About the bytes a key's place in the schedule takes, counted with the key toward
-/// `max_key_bytes`: the second and the key, in a B-tree's nodes, which keys made in no order
-/// leave some two thirds full.
-pub(crate) const SCHEDULED_BYTES: u64 = (8 + KEY_BYTES) * 3 / 2;
+/// What a key takes in memory in the store's maps, whatever its value holds beside: its
+/// share of its shard's B-tree of keys, the key and its [`Kept`] in place, and of the
+/// schedule's, its second and the key.
+pub(crate) const fn entry_bytes<V>() -> u64 {
+    btree_entry::<Key, Kept<V>>() + btree_entry::<(Time, Key), ()>()
+}
 
 /// The second `forget_at` falls in, rounded up: a key is looked at once that second has
 /// passed, so never before its time, and at most a second after it.
@@ -26,9 +29,10 @@ pub(crate) const fn seconds_passed(wall: Time) -> Time {
     wall / SECOND
 }
 
-/// What a key takes toward `max_key_bytes`: its own bytes, and its place in the schedule.
-fn bytes_of<V: Held>(kept: &Kept<V>) -> u64 {
-    kept.bytes().saturating_add(SCHEDULED_BYTES)
+/// What a key takes toward `max_key_bytes`: what it takes in memory, its share of the maps
+/// and what its value holds on the heap.
+pub(crate) fn bytes_of<V: Held>(kept: &Kept<V>) -> u64 {
+    entry_bytes::<V>().saturating_add(kept.value.heap_bytes())
 }
 
 /// A pod's keys, owned and copies, by shard. Every change goes through it, so the keys, their
@@ -393,6 +397,26 @@ mod tests {
             "2 s, due at 2"
         );
         assert_eq!((keys.len(), keys.bytes()), (0, 0));
+    }
+
+    /// A key counts its share of the store's maps — of its shard's keys, an entry of 16 bytes
+    /// and 32 in a node of 560 bytes as glibc allocates it, and of the schedule, 32 bytes in
+    /// one of 384, each node seven entries on average — and what its value holds on the heap.
+    #[test]
+    fn a_key_counts_its_share_of_the_maps_and_its_values_heap() {
+        assert_eq!(entry_bytes::<Counts>(), 560 / 7 + 384 / 7);
+        let mut keys = Keys::default();
+        keys.insert(0, 1, kept(1, ms(1_000)));
+        let one_part = Counts::of(1).heap_bytes();
+        assert_eq!(keys.bytes(), entry_bytes::<Counts>() + one_part);
+        keys.change(0, 1, |kept| kept.value.add(5));
+        assert_eq!(
+            keys.bytes(),
+            entry_bytes::<Counts>() + edgerush_memory::btree_ascending::<u64, u64>(2)
+        );
+        keys.insert(0, 2, kept(1, ms(1_000)));
+        assert_eq!(keys.bytes(), 2 * entry_bytes::<Counts>() + 2 * one_part);
+        assert!(keys.agrees());
     }
 
     /// The soonest of all goes first, whatever its shard; of one second, by shard.

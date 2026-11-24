@@ -10,6 +10,7 @@
 
 use super::Key;
 use super::sync::Arc;
+use edgerush_memory::allocation;
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use std::hash::BuildHasher;
@@ -25,15 +26,22 @@ struct Held {
     key: Arc<Key>,
 }
 
-/// The bytes one key takes in a set: what `key_bytes` counts for each set holding it.
-pub(super) const SLOT_BYTES: u64 = size_of::<Held>() as u64 + 1;
-
 /// Keys found by their names, hashed by `S`, in `PARTS` parts, a power of two.
 #[derive(Debug)]
 pub(super) struct KeySet<S, const PARTS: usize> {
     parts: [HashTable<Held>; PARTS],
     len: usize,
+    /// What its parts' tables take, as glibc allocates them: kept as they grow, which they
+    /// do only as keys come in, never shrinking as keys go.
+    bytes: u64,
     hasher: S,
+}
+
+impl<S, const PARTS: usize> KeySet<S, PARTS> {
+    /// What its parts' tables take, as glibc allocates them.
+    pub(super) const fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl<S: BuildHasher, const PARTS: usize> KeySet<S, PARTS> {
@@ -45,6 +53,7 @@ impl<S: BuildHasher, const PARTS: usize> KeySet<S, PARTS> {
         Self {
             parts: std::array::from_fn(|_| HashTable::new()),
             len: 0,
+            bytes: 0,
             hasher,
         }
     }
@@ -82,24 +91,31 @@ impl<S: BuildHasher, const PARTS: usize> KeySet<S, PARTS> {
             .map(|held| &held.key)
     }
 
-    /// Holds `key`, whose name's hash is `hash`, in place of any of its name: the key as held.
-    pub(super) fn replace_hashed(&mut self, hash: u64, key: Arc<Key>) -> &Arc<Key> {
-        // The part by its field, not `part_mut`, so that the count can change beside it.
-        match self.parts[Self::part_of(hash)].entry(
-            hash,
-            |held| held.key.key == key.key,
-            |held| held.hash,
-        ) {
+    /// Holds `key`, whose name's hash is `hash`, in place of any of its name: the bytes its
+    /// tables grew by, and the key as held. The part's room for one more made first, as
+    /// finding its place would make it, so that what its table takes is counted as it grows.
+    pub(super) fn replace_hashed(&mut self, hash: u64, key: Arc<Key>) -> (u64, &Arc<Key>) {
+        let Self {
+            parts, len, bytes, ..
+        } = self;
+        let part = &mut parts[Self::part_of(hash)];
+        let before = allocation(part.allocation_size());
+        part.reserve(1, |held| held.hash);
+        // A table only grows: never less than it was.
+        let grown = allocation(part.allocation_size()) - before;
+        *bytes += grown;
+        let held = match part.entry(hash, |held| held.key.key == key.key, |held| held.hash) {
             Entry::Occupied(found) => {
                 let held = found.into_mut();
                 held.key = key;
                 &held.key
             }
             Entry::Vacant(room) => {
-                self.len += 1;
+                *len += 1;
                 &room.insert(Held { hash, key }).into_mut().key
             }
-        }
+        };
+        (grown, held)
     }
 
     /// Lets go of the key of `name`, if held.

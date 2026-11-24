@@ -84,6 +84,11 @@ impl<S: BuildHasher, P, K> Keys<S, P, K> {
         self.table.len()
     }
 
+    /// The bytes its table takes, as hashbrown asked for them.
+    pub(super) fn allocation_size(&self) -> usize {
+        self.table.allocation_size()
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = &Tracked<P, K>> {
         self.table.iter()
     }
