@@ -1,6 +1,8 @@
 //! A pod of both modes against each mode alone, its logic over a store of its own values (G1,
 //! docs/06 §4): the same messages to each, at the same times, give the same answers, and leave
-//! the same values and the same bytes, whatever a mode's requests or batches are. And a data plane's keys of the other mode's are
+//! the same values and the same bytes — a synchronous key's but for the room of the larger
+//! asynchronous value, the two modes' values being one type — whatever a mode's requests or
+//! batches are. And a data plane's keys of the other mode's are
 //! never served, nor held.
 
 #![allow(
@@ -10,10 +12,11 @@
     reason = "test set-up: the helpers around the tests fail them the way the tests would"
 )]
 
-use edgerush_cluster::{Config, Key, Message as StoreMessage, Node, NodeId, Time, ms, table};
+use edgerush_cluster::{Config, Kept, Key, Message as StoreMessage, Node, NodeId, Time, ms, table};
 use edgerush_cluster_asynchronous::{self as asynchronous, Batch, Entry};
 use edgerush_cluster_modes::{Kind, Message, Pod, Value};
 use edgerush_cluster_synchronous::{self as synchronous, Answer, Rule};
+use edgerush_memory::btree_entry;
 use edgerush_ratelimit::service::{Contract, Report};
 use proptest::prelude::*;
 use std::num::NonZeroU64;
@@ -224,7 +227,8 @@ struct Reported {
 proptest! {
     /// The synchronous mode's requests, any of its rules, give-backs among them, at any times:
     /// a pod of both modes answers each as the mode alone does, its ticks send what the mode
-    /// alone sends, and it holds the same value under each key, of the same bytes.
+    /// alone sends, and it holds the same value under each key, of the same bytes but for the
+    /// room the larger asynchronous value takes in the store's map.
     #[test]
     fn the_synchronous_mode_on_a_pod_of_both_is_its_own(
         asked in proptest::collection::vec(
@@ -256,7 +260,9 @@ proptest! {
                 both.value(key)
             );
         }
-        prop_assert_eq!(own.store().key_bytes(), both.store().key_bytes());
+        let room = btree_entry::<Key, Kept<Value>>() - btree_entry::<Key, Kept<synchronous::Value>>();
+        let count = u64::try_from(own.store().key_count()).unwrap();
+        prop_assert_eq!(both.store().key_bytes(), own.store().key_bytes() + count * room);
         prop_assert_eq!(own.store().key_count(), both.store().key_count());
         prop_assert_eq!(both.store().keys_by_kind()[1], (0, 0));
         prop_assert_eq!(both.wrong_kind(), 0);

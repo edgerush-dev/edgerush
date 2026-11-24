@@ -23,7 +23,7 @@ fn main() {
         burst: nz(1_000_000),
     };
     let hasher = RandomState::new();
-    let local = Local::new(hasher.clone(), 1);
+    let local = Local::new(hasher.clone());
     let mut handles = Handles::new(hasher);
     let names: Vec<Vec<u8>> = (0..keys)
         .map(|i| format!("client-{i}").into_bytes())

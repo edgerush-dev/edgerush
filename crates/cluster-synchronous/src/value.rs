@@ -50,6 +50,15 @@ impl Held for Value {
         }
     }
 
+    /// A rolling window's slots, in a B-tree of their own, made in rising order; nothing of a
+    /// count or a bucket, kept in place.
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Self::Slots(slots) => edgerush_memory::btree_ascending::<u64, (u64, u64)>(slots.len()),
+            Self::Count { .. } | Self::Bucket { .. } => 0,
+        }
+    }
+
     /// Of a rolling window, the slots `parts` names alone; of any other shape, the whole.
     fn only(&self, parts: &BTreeSet<u64>) -> Self {
         match self {
@@ -431,6 +440,28 @@ mod tests {
             window,
             counted,
             given,
+        }
+    }
+
+    /// A rolling window's slots are counted as a B-tree of their own, made in rising order; a
+    /// count or a bucket holds nothing beside itself.
+    #[test]
+    fn only_a_rolling_windows_slots_take_room_of_their_own() {
+        assert_eq!(count(1, 1, 0).heap_bytes(), 0);
+        assert_eq!(Value::Bucket { due: 1, given: 0 }.heap_bytes(), 0);
+        let slots = |n: u64| Value::Slots((0..n).map(|slot| (slot, (1, 0))).collect());
+        assert_eq!(slots(0).heap_bytes(), 0);
+        assert_eq!(
+            slots(1).heap_bytes(),
+            288,
+            "a node of eleven, as glibc allocates it"
+        );
+        for n in [11, 12, 60, MOST_SLOTS] {
+            assert_eq!(
+                slots(n).heap_bytes(),
+                edgerush_memory::btree_ascending::<u64, (u64, u64)>(usize::try_from(n).unwrap()),
+                "{n} slots"
+            );
         }
     }
 

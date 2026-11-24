@@ -47,6 +47,15 @@ impl Held for Value {
         }
     }
 
+    /// The mode's own, as [`bytes`](Held::bytes) is.
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Self::Fresh => 0,
+            Self::Synchronous(value) => value.heap_bytes(),
+            Self::Asynchronous(value) => value.heap_bytes(),
+        }
+    }
+
     fn only(&self, parts: &BTreeSet<u64>) -> Self {
         match self {
             Self::Fresh => Self::Fresh,

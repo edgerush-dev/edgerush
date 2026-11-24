@@ -62,8 +62,8 @@ pub type NodeId = u64;
 /// in 10^19 years at 30 million keys turned over hourly, where 64 would about once a year.
 pub type Key = u128;
 
-/// The bytes a key takes, held or sent, by the store's count: what `max_key_bytes` counts
-/// each key as, beside its value, and each key dropped from a copy as.
+/// The bytes a key takes sent, by the store's count: what a copy's parts count each key as,
+/// beside its value, and each key dropped from a copy as.
 pub const KEY_BYTES: u64 = size_of::<Key>() as u64;
 
 /// The kinds of value a store counts apart, beside its totals: each value's [`Held::kind`],

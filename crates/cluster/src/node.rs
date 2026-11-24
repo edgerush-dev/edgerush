@@ -2854,7 +2854,7 @@ const PER_CYCLE: usize = 1_024;
 mod tests {
     use super::*;
     use crate::kept::Counts;
-    use crate::keys::SCHEDULED_BYTES;
+    use crate::keys::bytes_of;
 
     type Node = super::Node<Counts>;
     type Outbox = super::Outbox<Counts>;
@@ -2871,10 +2871,10 @@ mod tests {
     }
     use crate::ms;
 
-    /// What a key of one part takes by the store's count: its key, time and value, and its
-    /// place in the schedule (64 bytes of 8-byte keys, 84 of 16-byte).
+    /// What a key of one part takes by the store's count: its share of the maps and its
+    /// value's one part on the heap.
     fn one_key() -> u64 {
-        Kept::new(Counts::of(1)).bytes() + SCHEDULED_BYTES
+        bytes_of(&Kept::new(Counts::of(1)))
     }
 
     /// Where pod `id` is reached, in these tests.

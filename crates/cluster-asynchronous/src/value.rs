@@ -51,6 +51,10 @@ impl Held for Value {
     fn bytes(&self) -> u64 {
         self.0.bytes()
     }
+
+    fn heap_bytes(&self) -> u64 {
+        self.0.heap_bytes()
+    }
 }
 
 #[cfg(test)]

@@ -42,6 +42,7 @@ use super::{
     RESEND_AFTER_CYCLES, Report, Room, Unseen, cut_off_from_owner, encoded_entry_bytes,
 };
 use chunked::MinHeap;
+use edgerush_memory::{allocation, arc, hash_table};
 use keys::Keys;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -163,6 +164,9 @@ pub struct Registry<S> {
     scan: AtomicBool,
     /// What keys share, by contract: read when an entry is made.
     terms: RwLock<HashMap<Contract, Arc<Terms>>>,
+    /// What the tables of handles take, its shards' and its workers' ([`Handles`]), as glibc
+    /// allocates them: added to as they grow, and given back as a worker's handles go.
+    tables: AtomicU64,
 }
 
 impl<S: BuildHasher + Default> Default for Registry<S> {
@@ -178,6 +182,30 @@ impl<S: BuildHasher> Registry<S> {
             shards: (0..SHARDS).map(|_| RwLock::new(HashSet::new())).collect(),
             scan: AtomicBool::new(false),
             terms: RwLock::new(HashMap::new()),
+            tables: AtomicU64::new(0),
+        }
+    }
+
+    /// What the tables of handles take, as glibc allocates them: its shards', and those of
+    /// the workers' handles made on it. A table grows by doubling and never shrinks, so this
+    /// falls only as a worker's handles go.
+    #[must_use]
+    pub fn tables(&self) -> u64 {
+        self.tables.load(Ordering::Relaxed)
+    }
+
+    /// Holds `handle` in `shard`, one of its own under its lock, counting what its table
+    /// grows by.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a handle hashes and compares by its entry's key, which never changes"
+    )]
+    fn replace_in(&self, shard: &mut HashSet<Handle>, handle: Handle) {
+        let before = hash_table::<Handle>(shard.capacity());
+        shard.replace(handle);
+        let after = hash_table::<Handle>(shard.capacity());
+        if after > before {
+            self.tables.fetch_add(after - before, Ordering::Relaxed);
         }
     }
 
@@ -234,7 +262,7 @@ impl<S: BuildHasher> Registry<S> {
             self.terms(contract, cycle),
             now,
         ));
-        shard.replace(Handle(Arc::clone(&entry)));
+        self.replace_in(&mut shard, Handle(Arc::clone(&entry)));
         Some((entry, true))
     }
 
@@ -276,7 +304,7 @@ impl<S: BuildHasher> Registry<S> {
             .shard(&entry.key)
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        shard.replace(Handle(entry));
+        self.replace_in(&mut shard, Handle(entry));
     }
 
     /// Removes `entry`, if it is still the one held for its key.
@@ -291,6 +319,72 @@ impl<S: BuildHasher> Registry<S> {
         {
             shard.remove(&*entry.key);
         }
+    }
+}
+
+/// A worker's handles to its process's entries, found by key: one lookup a key a request.
+/// What their table takes is counted in the process's registry ([`Registry::tables`]) as
+/// it grows, and given back when they go.
+pub struct Handles<S> {
+    set: HashSet<Handle, S>,
+    registry: Arc<Registry<S>>,
+    /// What its table takes, as counted in the registry.
+    counted: u64,
+}
+
+impl<S: BuildHasher> Handles<S> {
+    /// None yet, hashed by `hasher`, counted in `registry`.
+    #[must_use]
+    pub fn new(registry: Arc<Registry<S>>, hasher: S) -> Self {
+        Self {
+            set: HashSet::with_hasher(hasher),
+            registry,
+            counted: 0,
+        }
+    }
+
+    /// The handle to `key`'s entry, if it holds one.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<&Handle> {
+        self.set.get(key)
+    }
+
+    /// Holds `handle` in place of any to the same key, counting what its table grows by.
+    pub fn replace(&mut self, handle: Handle) {
+        self.set.replace(handle);
+        let now = hash_table::<Handle>(self.set.capacity());
+        if now > self.counted {
+            self.registry
+                .tables
+                .fetch_add(now - self.counted, Ordering::Relaxed);
+            self.counted = now;
+        }
+    }
+
+    /// Keeps only the handles `keep` takes.
+    pub fn retain(&mut self, keep: impl FnMut(&Handle) -> bool) {
+        self.set.retain(keep);
+    }
+
+    /// How many it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Whether it holds none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
+impl<S> Drop for Handles<S> {
+    /// Its table goes with it: no longer counted.
+    fn drop(&mut self) {
+        self.registry
+            .tables
+            .fetch_sub(self.counted, Ordering::Relaxed);
     }
 }
 
@@ -861,9 +955,6 @@ fn later(a: u64, b: u64) -> bool {
     a.wrapping_sub(b).cast_signed() > 0
 }
 
-/// What a participant counts a key as holding: its entry and the counts beside it, its
-/// bookkeeping, the key twice (the entry's and the bookkeeping's), and a handle to it in its
-/// registry and in each of its `workers`, one byte of a table's control with each slot.
 /// The first time `entry`'s key may be idle enough to evict ([`Tracked::idle`]), from its
 /// last request.
 fn idle_at(entry: &Entry) -> u64 {
@@ -874,25 +965,20 @@ fn idle_at(entry: &Entry) -> u64 {
         .saturating_add(1)
 }
 
-fn key_bytes<P, K>(key: &[u8], workers: u64) -> u64 {
-    let tracked = size_of::<Tracked<P, K>>() + 1;
-    let handle = (size_of::<Handle>() + 1) as u64;
-    entry_bytes(key) + tracked as u64 + handle * (1 + workers)
-}
-
-/// What an entry of `key` holds, counts and key, with its eviction time: all that is left of
-/// a key no longer kept while that time keeps its entry, scheduled.
+/// What an entry of `key` takes in memory, the block holding its counts and the one holding
+/// its key as glibc allocates them, with its eviction time: what a participant counts a key
+/// as taking beside the tables it is in, its own and its registry's and workers' handles',
+/// counted as allocated ([`Participant::tables`]); and all that is left of a key no longer
+/// kept while that time keeps its entry, scheduled.
 #[must_use]
 pub fn entry_bytes(key: &[u8]) -> u64 {
-    (2 * size_of::<usize>() + size_of::<Entry>() + key.len() + size_of::<Due>()) as u64
+    arc::<Entry>() + allocation(key.len()) + size_of::<Due>() as u64
 }
 
 /// The process's side of the protocol: one participant, its keys shared with its workers,
 /// reaching the service's pods by `R`: today's by the view unless said.
 pub struct Participant<S, R: Routing> {
     id: PlaneId,
-    /// The workers that may hold a handle to each entry, which its bytes count.
-    workers: u64,
     registry: Arc<Registry<S>>,
     cycle: u64,
     routing: R,
@@ -1186,7 +1272,6 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         }
         Some(Self {
             id,
-            workers: 1,
             registry: Arc::new(Registry::new(hasher.clone())),
             cycle: cycle.max(1),
             routing,
@@ -1350,17 +1435,19 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         self.capacity = bytes;
     }
 
-    /// The workers deciding from its entries, each holding a handle to those it meets,
-    /// which a key's bytes count: one unless said. Set before it holds any key.
-    pub fn set_workers(&mut self, workers: u64) {
-        self.workers = workers.max(1);
-    }
-
-    /// The bytes its keys hold, with those of entries no longer kept that their eviction
-    /// times keep until they come.
+    /// The bytes its keys take in memory: each key's entry ([`entry_bytes`]), with those of
+    /// entries no longer kept that their eviction times keep until they come, and the tables
+    /// holding them ([`tables`](Self::tables)).
     #[must_use]
     pub fn holding(&self) -> u64 {
-        self.holding + self.stale
+        self.holding + self.stale + self.tables()
+    }
+
+    /// What the tables holding its keys take, as glibc allocates them: its own, of what it
+    /// keeps of each key, and its registry's and workers' handles' ([`Registry::tables`]).
+    #[must_use]
+    pub fn tables(&self) -> u64 {
+        allocation(self.keys.allocation_size()) + self.registry.tables()
     }
 
     /// Keys evicted to stay within its capacity, all told.
@@ -1445,9 +1532,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
     /// which its eviction time keeps until it comes or is dropped, and which counts as stale
     /// meanwhile.
     fn forget(&mut self, key: &[u8]) {
-        self.holding = self
-            .holding
-            .saturating_sub(key_bytes::<R::Pod, R::Key>(key, self.workers));
+        self.holding = self.holding.saturating_sub(entry_bytes(key));
         if self.scheduled {
             self.stale += entry_bytes(key);
         }
@@ -1490,7 +1575,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             left_out: false,
         };
         self.registry.insert(Arc::clone(&tracked.entry));
-        self.holding += key_bytes::<R::Pod, R::Key>(&tracked.entry.key, self.workers);
+        self.holding += entry_bytes(&tracked.entry.key);
         if self.scheduled {
             let at = idle_at(&tracked.entry);
             self.evictions.push(Due {
@@ -1612,12 +1697,12 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             self.evict_due(now);
         } else {
             let mut freed = 0;
-            let (registry, workers) = (&self.registry, self.workers);
+            let registry = &self.registry;
             self.keys.retain(|tracked| {
                 let evict = tracked.idle(now) && close_if_quiet(tracked);
                 if evict {
                     registry.remove(&tracked.entry);
-                    freed += key_bytes::<R::Pod, R::Key>(&tracked.entry.key, workers);
+                    freed += entry_bytes(&tracked.entry.key);
                 }
                 !evict
             });
@@ -1631,7 +1716,9 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             self.drop_stale();
         }
         let target = self.capacity - self.capacity / 10;
-        if self.holding > target {
+        // What evicting cannot give back: the tables keep their room.
+        let tables = self.tables();
+        if self.holding + tables > target {
             // Every key, whatever it has outstanding: what it has not had applied is
             // forgiven, so that memory stays within the cap however long the service is out
             // of reach.
@@ -1645,7 +1732,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 .collect();
             used.sort_unstable_by_key(|(used, _)| *used);
             for (_, key) in used {
-                if self.holding <= target {
+                if self.holding + tables <= target {
                     break;
                 }
                 let Some(tracked) = self.keys.remove(&key) else {
@@ -1689,9 +1776,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             };
             if tracked.idle(now) && close_if_quiet(tracked) {
                 self.registry.remove(&tracked.entry);
-                self.holding = self
-                    .holding
-                    .saturating_sub(key_bytes::<R::Pod, R::Key>(&due.entry.key, self.workers));
+                self.holding = self.holding.saturating_sub(entry_bytes(&due.entry.key));
                 self.keys.remove(&due.entry.key);
             } else {
                 let at = idle_at(&due.entry).max(now + self.cycle);

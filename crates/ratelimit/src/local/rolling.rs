@@ -65,13 +65,16 @@ impl Ring {
         }
     }
 
-    /// The bytes a key under `rolling` keeps beside the others': its own terms and ring.
+    /// The bytes a key under `rolling` keeps beside the others': its own terms, its ring and
+    /// the ring's counts, three blocks as glibc allocates them.
     pub(super) fn bytes(rolling: Rolling) -> u64 {
         let slots = rolling.slots.get().clamp(1, MOST_SLOTS);
         let entry = if narrow(rolling.limit.get()) { 4 } else { 8 };
-        // An `Arc`'s two counts beside the terms.
-        (2 * size_of::<usize>() + size_of::<super::Terms>() + size_of::<Self>()) as u64
-            + slots * entry
+        // At most `MOST_SLOTS` eight-byte counts: a few kilobytes, which fit any `usize`.
+        let counts = (slots * entry) as usize;
+        edgerush_memory::arc::<super::Terms>()
+            + edgerush_memory::allocation(size_of::<Self>())
+            + edgerush_memory::allocation(counts)
     }
 
     /// A new key's word at `now`: nothing counted, nothing to take off.

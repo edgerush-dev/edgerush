@@ -1068,30 +1068,75 @@ fn a_worker_finds_the_pods_entry_without_asking() {
     assert!(registry.find(key, contract(50, 10)).is_none(), "evicted");
 }
 
-/// A key's bytes count a handle to its entry for each worker that may hold one, so that a
-/// process's cap bounds its workers' handles too; and the registry's and workers' handles
-/// find an entry by its key without a copy of it.
+/// What a table counts from its capacity alone ([`hash_table`]) is what hashbrown allocates
+/// for it, at every size it grows through: the registry's and the workers' sets are std's,
+/// which say their capacity and not their size.
 #[test]
-#[expect(
-    clippy::mutable_key_type,
-    reason = "a handle hashes and compares by its entry's key, which never changes"
-)]
-fn a_keys_bytes_count_every_workers_handle() {
-    let holding = |workers| {
-        let mut participant =
-            Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
-        participant.set_workers(workers);
-        participant.ensure(b"k", contract(100, 10), 0);
-        participant.holding()
-    };
-    let handle = (size_of::<Handle>() + 1) as u64;
-    assert_eq!(holding(8) - holding(1), 7 * handle);
+fn a_tables_count_from_its_capacity_is_what_hashbrown_allocates() {
+    let mut handles: hashbrown::HashTable<u64> = hashbrown::HashTable::new();
+    let mut tracked: hashbrown::HashTable<[u64; 9]> = hashbrown::HashTable::new();
+    for n in 0..5_000_u64 {
+        assert_eq!(
+            hash_table::<u64>(handles.capacity()),
+            allocation(handles.allocation_size()),
+            "{n} of 8 bytes"
+        );
+        assert_eq!(
+            hash_table::<[u64; 9]>(tracked.capacity()),
+            allocation(tracked.allocation_size()),
+            "{n} of 72 bytes"
+        );
+        handles.insert_unique(n, n, |held| *held);
+        tracked.insert_unique(n, [n; 9], |held| held[0]);
+    }
+}
+
+/// The handles to a key's entry count as their tables are allocated: the registry's shard
+/// and a worker's set as each grows, a worker's given back when its handles go — so that a
+/// process's cap bounds its workers' handles too, and counts only those of workers that
+/// met the key. They find an entry by its key without a copy of it.
+#[test]
+fn handles_count_as_their_tables_are_allocated() {
+    let mut participant = Participant::new(7, CYCLE, Pods::none(), FixedState::default()).unwrap();
+    let c = contract(100, 10);
+    participant.ensure(b"k", c, 0);
+    let registry = participant.registry();
+    let shard = hash_table::<Handle>(3);
+    assert_eq!(
+        registry.tables(),
+        shard,
+        "one shard's table, of four buckets"
+    );
+    let own = allocation(participant.keys.allocation_size());
+    assert_eq!(participant.tables(), own + shard);
+    assert_eq!(participant.holding(), entry_bytes(b"k") + own + shard);
+    let before = participant.holding();
+    let entry = participant.entries(&[(b"k", c)]).remove(0);
+    let mut handles = Handles::new(Arc::clone(&registry), FixedState::default());
+    handles.replace(Handle::new(Arc::clone(&entry)));
+    assert_eq!(
+        participant.holding(),
+        before + hash_table::<Handle>(3),
+        "a worker met it"
+    );
+    assert!(Arc::ptr_eq(handles.get(b"k").unwrap().entry(), &entry));
+    assert!(handles.get(b"kez").is_none());
+    for at in 0..20 {
+        let key = format!("k{at}").into_bytes().into_boxed_slice();
+        handles.replace(Handle::new(Arc::new(Entry::new(key, c, CYCLE, 0))));
+    }
+    let grown = hash_table::<Handle>(handles.set.capacity());
+    assert_eq!(handles.set.capacity(), 28, "doubled from 3 to 7, 14 and 28");
+    assert_eq!(participant.holding(), before + grown);
+    handles.retain(|_| false);
+    assert_eq!(
+        participant.holding(),
+        before + grown,
+        "a table keeps its room"
+    );
+    drop(handles);
+    assert_eq!(participant.holding(), before, "given back as they go");
     assert_eq!(size_of::<Handle>(), size_of::<usize>(), "a pointer, no key");
-    let mut set = HashSet::new();
-    let made = Arc::new(Entry::new(b"key"[..].into(), contract(100, 10), CYCLE, 0));
-    set.insert(Handle::new(Arc::clone(&made)));
-    assert!(Arc::ptr_eq(set.get(&b"key"[..]).unwrap().entry(), &made));
-    assert!(!set.contains(&b"kez"[..]));
 }
 
 /// With one exchange in flight to a pod, nothing more goes to it until that one is
@@ -2187,7 +2232,11 @@ fn a_key_evicted_for_capacity_is_freed_at_once() {
     participant.set_capacity(1);
     participant.on_cycle(2 * CYCLE);
     assert_eq!(participant.key_count(), 0);
-    assert_eq!(participant.holding(), 0);
+    assert_eq!(
+        participant.holding(),
+        participant.tables(),
+        "the tables keep their room"
+    );
     assert!(held.iter().all(|entry| entry.upgrade().is_none()), "freed");
     assert!(participant.evictions.is_empty());
 }
@@ -2386,7 +2435,11 @@ fn a_replaced_entry_stops_counting_when_its_time_comes() {
     participant.on_cycle(3 * 3_600_000 * MS);
     assert!(old.upgrade().is_none());
     assert_eq!(participant.key_count(), 0, "the new one idle too");
-    assert_eq!(participant.holding(), 0);
+    assert_eq!(
+        participant.holding(),
+        participant.tables(),
+        "the tables keep their room"
+    );
     assert!(participant.evictions.is_empty());
 }
 
@@ -2900,10 +2953,12 @@ fn a_participant_past_its_capacity_evicts_the_least_recently_used() {
         participant.on_cycle(now);
         settle(&mut participant, &mut pod, now);
     }
-    let each = key_bytes::<PodId, ()>(&keys[0], 1);
-    assert_eq!(participant.holding(), 5 * each);
-    // Room for three, nine tenths of that for two: the two used last stay.
-    participant.set_capacity(3 * each);
+    let each = entry_bytes(&keys[0]);
+    // The tables keep their room whatever is evicted: room for three keys beside them,
+    // nine tenths of it for two.
+    let tables = participant.tables();
+    assert_eq!(participant.holding(), tables + 5 * each);
+    participant.set_capacity(tables + 3 * each);
     participant.on_cycle(5 * MS);
     let kept = |participant: &Participant<FixedState, Pods>| -> Vec<bool> {
         keys.iter()
@@ -2911,7 +2966,7 @@ fn a_participant_past_its_capacity_evicts_the_least_recently_used() {
             .collect()
     };
     assert_eq!(kept(&participant), [false, false, false, true, true]);
-    assert_eq!(participant.holding(), 2 * each);
+    assert_eq!(participant.holding(), tables + 2 * each);
     assert_eq!(participant.evicted(), 3);
     assert_eq!(participant.forgiven(), 0, "nothing outstanding");
     // The newest has two hits not yet acknowledged: room for less than one, and it goes,
@@ -2927,7 +2982,7 @@ fn a_participant_past_its_capacity_evicts_the_least_recently_used() {
     assert_eq!(kept(&participant), [false; 5]);
     assert_eq!(participant.evicted(), 5);
     assert_eq!(participant.forgiven(), 2);
-    assert_eq!(participant.holding(), 0);
+    assert_eq!(participant.holding(), tables, "the tables' room alone");
 }
 
 /// As `DataPlane`'s: exchanges overlapping, a bucket of one that refills faster than a round

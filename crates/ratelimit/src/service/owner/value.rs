@@ -8,6 +8,7 @@
 
 use crate::reference::{BucketState, TokenBucket};
 use crate::service::{Contract, MOST_UNACKNOWLEDGED, PlaneId, RECORD_KEPT};
+use edgerush_memory::{allocation, vec};
 
 /// A key's state as its owner holds it, and every replica a copy of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -272,6 +273,20 @@ impl Value {
             .sum();
         56 + records
     }
+
+    /// What it holds in memory beside its own size: its records' list, with the room it was
+    /// grown to, and each record's batches waiting, their list and its room behind a
+    /// pointer, in the blocks glibc allocates them in.
+    #[must_use]
+    pub fn heap_bytes(&self) -> u64 {
+        let waiting: u64 = self
+            .planes
+            .0
+            .iter()
+            .map(|(_, record)| record.heap_bytes())
+            .sum();
+        vec::<(PlaneId, Record)>(self.planes.0.capacity()) + waiting
+    }
 }
 
 /// What the owner knows of one data plane, for one key.
@@ -383,6 +398,13 @@ impl Record {
                 self.waiting = None;
             }
         }
+    }
+
+    /// What its batches waiting take on the heap: none while none wait.
+    fn heap_bytes(&self) -> u64 {
+        self.waiting.as_ref().map_or(0, |waiting| {
+            allocation(size_of::<Vec<(u64, Tally)>>()) + vec::<(u64, Tally)>(waiting.capacity())
+        })
     }
 
     /// How many batches wait.
@@ -852,6 +874,44 @@ mod tests {
         assert_eq!(value.bytes(), 56 + 24);
         apply(&mut value, 1, contract(), hits(3, 1, 1), CYCLE, 0);
         assert_eq!(value.bytes(), 56 + 24 + 24);
+    }
+
+    /// What a value holds on the heap is its records' list, with the room it was grown to, and
+    /// each record's batches waiting behind their pointer, as glibc allocates them: room for
+    /// one record at first, then twice the room each time it fills.
+    #[test]
+    fn a_value_counts_its_records_and_batches_waiting_on_the_heap() {
+        let record = size_of::<(PlaneId, Record)>();
+        assert_eq!(
+            allocation(record),
+            48,
+            "32 bytes and a header, rounded to 16"
+        );
+        let mut value = Value::default();
+        apply(&mut value, 1, contract(), Report::Poll, CYCLE, 0);
+        assert_eq!(value.heap_bytes(), 0, "a poll leaves no record");
+        apply(&mut value, 1, contract(), hits(1, 1, 0), CYCLE, 0);
+        assert_eq!(value.heap_bytes(), allocation(record));
+        apply(&mut value, 2, contract(), hits(1, 1, 0), CYCLE, 0);
+        assert_eq!(value.heap_bytes(), allocation(2 * record));
+        apply(&mut value, 3, contract(), hits(1, 1, 0), CYCLE, 0);
+        assert_eq!(value.heap_bytes(), allocation(4 * record), "room for four");
+        apply(&mut value, 1, contract(), hits(3, 1, 1), CYCLE, 0);
+        let room = value
+            .planes
+            .get(1)
+            .unwrap()
+            .waiting
+            .as_ref()
+            .unwrap()
+            .capacity();
+        assert_eq!(
+            value.heap_bytes(),
+            allocation(4 * record)
+                + allocation(size_of::<Vec<(u64, Tally)>>())
+                + allocation(room * size_of::<(u64, Tally)>()),
+            "a batch waiting: its list behind a pointer, and the list's room"
+        );
     }
 
     /// Two states of one bucket merge as the further charged, in either order.

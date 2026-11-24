@@ -121,8 +121,9 @@ pub struct ServiceStore {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ServiceKeys {
-    /// Bytes the keys may hold, past which those that may be forgotten soonest are evicted,
-    /// down to nine tenths, a bounded number each cycle. 256 MiB when left out.
+    /// Bytes the keys may take in memory, worked out from what each key keeps, past which
+    /// those that may be forgotten soonest are evicted, down to nine tenths, a bounded number
+    /// each cycle. 256 MiB when left out.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub max_bytes: Option<u64>,

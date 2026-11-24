@@ -141,7 +141,7 @@ impl Process {
                     local.set_capacity(config.max_key_bytes);
                     Arc::clone(local)
                 }
-                None => LocalKeys::unswept(workers.get(), config.max_key_bytes),
+                None => LocalKeys::unswept(config.max_key_bytes),
             }
         });
         let process = Arc::new(Self {

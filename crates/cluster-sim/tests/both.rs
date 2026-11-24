@@ -222,7 +222,7 @@ fn past_the_cap_the_keys_forgettable_soonest_go_whatever_their_mode() {
         {
             let mut config = Config::defaults();
             config.shards = 64;
-            config.max_key_bytes = Some(500_000);
+            config.max_key_bytes = Some(1_000_000);
             let mut world = World::new(seed, config);
             let pods = world.start_cluster(3);
             assert!(world.run_while_not(ms(10_000), World::settled).is_some());

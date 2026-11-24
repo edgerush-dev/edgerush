@@ -293,6 +293,7 @@ dependencies = [
 name = "edgerush-cluster"
 version = "0.0.0"
 dependencies = [
+ "edgerush-memory",
  "proptest",
 ]
 
@@ -311,6 +312,7 @@ dependencies = [
  "edgerush-cluster",
  "edgerush-cluster-asynchronous",
  "edgerush-cluster-synchronous",
+ "edgerush-memory",
  "edgerush-ratelimit",
  "iai-callgrind",
  "proptest",
@@ -333,6 +335,7 @@ name = "edgerush-cluster-synchronous"
 version = "0.0.0"
 dependencies = [
  "edgerush-cluster",
+ "edgerush-memory",
 ]
 
 [[package]]
@@ -494,6 +497,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgerush-memory"
+version = "0.0.0"
+
+[[package]]
 name = "edgerush-operator"
 version = "0.0.0"
 dependencies = [
@@ -577,6 +584,7 @@ dependencies = [
 name = "edgerush-ratelimit"
 version = "0.0.0"
 dependencies = [
+ "edgerush-memory",
  "hashbrown",
  "iai-callgrind",
  "loom",

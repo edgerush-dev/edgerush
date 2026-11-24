@@ -44,6 +44,7 @@ edgerush-controller = { path = "crates/controller" }
 edgerush-discovery = { path = "crates/discovery" }
 edgerush-dns = { path = "crates/dns" }
 edgerush-kubernetes = { path = "crates/kubernetes" }
+edgerush-memory = { path = "crates/memory" }
 edgerush-explain = { path = "crates/explain" }
 edgerush-gateway-api = { path = "crates/gateway-api" }
 edgerush-operator = { path = "crates/operator" }

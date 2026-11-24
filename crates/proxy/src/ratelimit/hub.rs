@@ -466,7 +466,6 @@ fn run(
     };
     participant.set_exchange_timeout(EXCHANGE_TIMEOUT);
     participant.set_capacity(max_key_bytes);
-    participant.set_workers(workers as u64);
     // One exchange in flight to each service pod, what comes meanwhile gathered for the
     // next.
     participant.set_one_in_flight(true);

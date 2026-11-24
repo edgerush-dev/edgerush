@@ -219,7 +219,11 @@ fn a_quiet_rolling_window_is_forgotten_once_it_counts_none() {
         "still counting"
     );
     assert_eq!(local.sweep(LATER + SECOND, 0).forgotten, 1);
-    assert_eq!(local.holding(), 0);
+    assert_eq!(
+        local.holding(),
+        local.tables(),
+        "the tables keep their room"
+    );
 }
 
 /// One counting none but used lately is kept until it has been quiet for the time asked,
@@ -257,25 +261,37 @@ fn a_rolling_window_is_counting_until_its_newest_slot_leaves() {
     assert_eq!(key.full_in(1_300 * MS), 0);
 }
 
-/// A rolling key is counted with its own terms and its ring: a count a slot, 4 bytes below
-/// 2^19, 8 from it.
+/// A rolling key is counted with its own terms and its ring, and the ring's counts, a count a
+/// slot, 4 bytes below 2^19, 8 from it: each a block, as glibc allocates it.
 #[test]
 fn a_rolling_key_counts_its_ring_in_its_bytes() {
-    let bucket = key_bytes(b"k", contract(1, SECOND, 1).into(), 1);
-    let ring = |limit, slots| key_bytes(b"k", rolling(limit, SECOND, slots).into(), 1) - bucket;
-    let own = (2 * size_of::<usize>() + size_of::<Terms>() + size_of::<Ring>()) as u64;
-    assert_eq!(ring(100, 1_000), own + 4_000);
-    assert_eq!(ring(100, 60), own + 240);
-    assert_eq!(ring(NARROW_BELOW, 1_000), own + 8_000);
-    assert_eq!(ring(NARROW_BELOW - 1, 1_000), own + 4_000);
-    assert_eq!(ring(100, 5_000), own + 4 * MOST_SLOTS, "at most a thousand");
+    let bucket = key_bytes(b"k", contract(1, SECOND, 1).into());
+    let ring = |limit, slots| key_bytes(b"k", rolling(limit, SECOND, slots).into()) - bucket;
+    let own = edgerush_memory::arc::<Terms>() + edgerush_memory::allocation(size_of::<Ring>());
+    assert_eq!(
+        ring(100, 1_000),
+        own + 4_016,
+        "4,000 bytes and a header, rounded to 16"
+    );
+    assert_eq!(ring(100, 60), own + 256);
+    assert_eq!(ring(NARROW_BELOW, 1_000), own + 8_016);
+    assert_eq!(ring(NARROW_BELOW - 1, 1_000), own + 4_016);
+    assert_eq!(
+        ring(100, 5_000),
+        own + edgerush_memory::allocation(4 * MOST_SLOTS as usize),
+        "at most a thousand"
+    );
     let local = local();
     let mut handles = Handles::new(FixedState::default());
     let r = rolling(100, SECOND, 60);
     assert_eq!(one(&local, &mut handles, b"k", r, 0), Ok(()));
-    assert_eq!(local.holding(), key_bytes(b"k", r.into(), 1));
+    assert_eq!(local.holding(), local.tables() + key_bytes(b"k", r.into()));
     local.sweep(10 * SECOND, 0);
-    assert_eq!(local.holding(), 0);
+    assert_eq!(
+        local.holding(),
+        local.tables(),
+        "the tables keep their room"
+    );
 }
 
 /// A ring counts in entries of 4 bytes below 2^19, of 8 from it, as its bytes say.
@@ -341,7 +357,7 @@ fn a_rolling_window_of_other_slots_starts_the_key_afresh() {
     );
     assert_eq!(
         local.holding(),
-        key_bytes(b"k", rolling(1, SECOND, 60).into(), 1)
+        local.tables() + key_bytes(b"k", rolling(1, SECOND, 60).into())
     );
 }
 

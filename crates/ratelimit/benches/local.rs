@@ -53,7 +53,7 @@ type Worker = Box<(Local<Keyed>, Handles<Keyed>)>;
 /// A worker holding handles to a thousand keys and `KEY`, `ROUTE` and `GLOBAL`, each asked
 /// about once.
 fn held(burst: u64) -> (Worker, Limit) {
-    let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
+    let mut worker: Worker = Box::new((Local::new(hasher()), Handles::new(hasher())));
     let contract = contract(burst);
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY, ROUTE, GLOBAL].map(<[u8]>::to_vec)) {
@@ -82,7 +82,7 @@ fn held_window(limit: u64) -> (Worker, Limit) {
         limit: n(limit),
         window: n(1_000 * MS),
     });
-    let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
+    let mut worker: Worker = Box::new((Local::new(hasher()), Handles::new(hasher())));
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY.to_vec()]) {
         let (local, handles) = &mut *worker;
@@ -115,7 +115,7 @@ fn held_rolling(limit: u64, slots: u64, hinted: bool) -> (Worker, Limit) {
         window: n(1_000 * MS),
         slots: n(slots),
     });
-    let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
+    let mut worker: Worker = Box::new((Local::new(hasher()), Handles::new(hasher())));
     let keys = (0..1_000).map(|k| format!("api/0\0key-{k}").into_bytes());
     for key in keys.chain([KEY.to_vec()]) {
         let (local, handles) = &mut *worker;
@@ -171,7 +171,7 @@ fn decide_all(setup: (Worker, Limit), limits: usize) -> (Decision, Worker) {
 /// A registry of a hundred thousand keys, `KEY` among them unless said, and a worker with
 /// no handles.
 fn registry(with_key: bool) -> (Worker, Limit) {
-    let mut worker: Worker = Box::new((Local::new(hasher(), 4), Handles::new(hasher())));
+    let mut worker: Worker = Box::new((Local::new(hasher()), Handles::new(hasher())));
     let contract = contract(100);
     {
         let (local, _) = &mut *worker;

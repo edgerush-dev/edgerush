@@ -331,13 +331,7 @@ impl World {
         for _ in 0..fleet.planes.max(1) {
             let id = self.next_client;
             self.next_client += 1;
-            let data = fed_participant(
-                id,
-                table.clone(),
-                fleet.poll_quiet,
-                fleet.scheduled,
-                workers,
-            );
+            let data = fed_participant(id, table.clone(), fleet.poll_quiet, fleet.scheduled);
             planes.push((id, data));
         }
         // The run's key, and each beside it the first after it whose owner is another pod.
@@ -449,7 +443,7 @@ impl World {
         };
         let failed = fed.pending.len() as u64;
         let workers = fed.handles.len();
-        let data = fed_participant(new, table, fed.poll_quiet, fed.scheduled, workers);
+        let data = fed_participant(new, table, fed.poll_quiet, fed.scheduled);
         let fresh = Fed {
             arrivals: std::mem::take(&mut fed.arrivals),
             kinds: Arc::clone(&fed.kinds),
@@ -902,7 +896,6 @@ fn fed_participant(
     table: Option<edgerush_cluster::table::Table>,
     poll_quiet: bool,
     scheduled: bool,
-    workers: usize,
 ) -> Participant<Keyed, Routed> {
     let mut data = Participant::new(id, CYCLE, routed(table), Keyed::new(SECRET))
         .expect("native 128-bit atomics");
@@ -910,6 +903,5 @@ fn fed_participant(
     data.set_exchange_timeout(EXCHANGE_TIMEOUT);
     data.set_levers(Levers { poll_quiet });
     data.set_scheduled(scheduled);
-    data.set_workers(workers as u64);
     data
 }
