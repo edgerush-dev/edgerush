@@ -89,14 +89,45 @@ pub(super) fn forwarding_config(upstream: SocketAddr, trusted: &[&str]) -> Confi
     config
 }
 
-/// `config`'s rate-limiting service reached with mutual TLS: the pods checked against
-/// `pods`, an authority's certificate in PEM, and `shown` shown them, under the name
-/// `plane`.
-/// The SPIFFE ID the rate-limiting service's pods share in the tests.
-pub(super) const POD_ID: &str = "spiffe://cluster.test/ns/edge/sa/ratelimit";
+/// The trust domain of the rate-limiting service's pods in the tests, their ControlPlane's.
+pub(super) const TRUST_DOMAIN: &str = "edge.cluster.test";
 
-/// The SPIFFE ID of the data plane the pods serve in the tests.
-pub(super) const PLANE_ID: &str = "spiffe://cluster.test/ns/edge/sa/plane";
+/// The SPIFFE ID the rate-limiting service's pods share in the tests.
+pub(super) const POD_ID: &str = "spiffe://edge.cluster.test/ns/edge/sa/edgerush-ratelimit-edge";
+
+/// The SPIFFE ID of the data plane the pods serve in the tests, one of their ControlPlane's.
+pub(super) const PLANE_ID: &str = "spiffe://edge.cluster.test/ns/edge/sa/edgerush-proxy-plane";
+
+/// The SPIFFE ID of the controller that forms the pods in the tests.
+pub(super) const CONTROLLER_ID: &str =
+    "spiffe://edge.cluster.test/ns/edge/sa/edgerush-controller-edge";
+
+/// Pods served with mutual TLS in the tests: their TLS, their certificate from an authority
+/// carrying [`POD_ID`] for `127.0.0.1`, and how the controller dials them to form them, with
+/// a certificate of its own carrying [`CONTROLLER_ID`].
+pub(super) struct SecuredPods {
+    pub(super) tls: edgerush_ratelimit_service::secure::PodTls,
+    pub(super) forming: edgerush_ratelimit_service::cluster::link::Dial,
+}
+
+/// Pods served with mutual TLS, their certificates and the controller's issued by `authority`.
+pub(super) fn secured_pods(authority: &edgerush_certificates::testing::Authority) -> SecuredPods {
+    use edgerush_ratelimit_service::secure::{self, PodCredentials, PodTls};
+    let tls = PodTls::new(&PodCredentials {
+        certificate: authority.issue(&["127.0.0.1", POD_ID]),
+        authorities: authority.pem(),
+        trust_domain: TRUST_DOMAIN.to_owned(),
+    })
+    .unwrap();
+    let shown = authority.issue(&["controller", CONTROLLER_ID]);
+    let connector = secure::controller(&shown, &[authority.pem()], POD_ID).unwrap();
+    SecuredPods {
+        tls,
+        forming: edgerush_ratelimit_service::cluster::link::Dial::Secured(
+            tokio::sync::watch::channel(connector).1,
+        ),
+    }
+}
 
 /// `config` reaching its rate-limiting service's pods with mutual TLS: trusting
 /// `authority`, checking each pod for `pod_id`, and showing `shown`.

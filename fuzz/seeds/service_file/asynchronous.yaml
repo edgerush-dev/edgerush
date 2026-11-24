@@ -18,4 +18,4 @@ tls:
   certificate: pod.pem
   key: /etc/secrets/pod.key
   authorities: ca.pem
-  data_plane_id: spiffe://cluster.local/ns/edge/sa/edge
+  trust_domain: edge.cluster.local

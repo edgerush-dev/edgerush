@@ -38,7 +38,7 @@ async fn run() -> Result<(), String> {
     let file: ServiceFile =
         serde_saphyr::from_slice(&yaml).map_err(|error| format!("{pod}: {error}"))?;
     // The keys' cap is the pods' to keep, not forming's: any the store takes will do.
-    let settings = settings(&file, 1 << 20)
+    let settings = settings(&file, 1 << 20, None)
         .map_err(|error| format!("{pod}: {error}"))?
         .ok_or_else(|| format!("{pod}: no `store` section"))?;
     let forming =

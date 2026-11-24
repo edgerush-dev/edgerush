@@ -10,7 +10,7 @@
 //! ```yaml
 //! pod:
 //!   listen: 0.0.0.0:7000
-//!   address: rl-0.rl:7000
+//!   address: rl-0.rl:7000     # POD_IP with listen's port when left out
 //!   metrics: 0.0.0.0:9090     # nowhere when left out
 //! store:
 //!   seeds: [rl-0:7000]        # none when left out
@@ -30,14 +30,16 @@
 //!   certificate: pod.pem
 //!   key: pod.key
 //!   authorities: ca.pem
-//!   data_plane_id: spiffe://cluster.local/ns/edge/sa/edge
+//!   trust_domain: edge.cluster.local
 //! ```
 //!
 //! A pod serves both modes, on one cluster store (`edgerush_cluster`, the pod of both modes
 //! `edgerush_cluster_modes`): each data plane's stream is its mode's, `Decide` or `Exchange`,
 //! and each key's top bit says its mode, so the file names none. `store` is what it runs the
 //! store with, which every pod of a cluster is to share, and `pod.address` where the other
-//! pods and data planes reach it; both are needed (`edgerush_ratelimit_service::cluster::settings`).
+//! pods and data planes reach it; both are needed (`edgerush_ratelimit_service::cluster::settings`),
+//! the address, left out, taken from the environment's `POD_IP`, an IP, with `pod.listen`'s
+//! port, as Kubernetes gives each pod its own while every pod reads one file.
 //! A pod takes a member id of its own each time it starts, shows its store's `/metrics` and what
 //! each mode counts, says at `/ready` whether it is ready, and, told to stop, hands its shards on
 //! before it does. `keys.max_bytes` is what its keys of both modes may hold, past which those
@@ -53,8 +55,11 @@
 //! every second, and serve the service with mutual TLS (`edgerush_ratelimit_service::secure`):
 //! the pod presents `certificate` to data planes and to the other pods alike, trusts the
 //! `authorities` to vouch for every caller, and tells them apart by the SPIFFE ID their
-//! certificate carries: its own is the pods', `data_plane_id` the data plane's it serves,
-//! and any other is refused. It dials the other pods checking theirs for its own ID.
+//! certificate carries: its own is the pods', of `trust_domain`; a data plane's of that
+//! domain (`…/sa/edgerush-proxy-<dataplane>`) any of its ControlPlane's data planes'; the
+//! controller's (`…/sa/edgerush-controller-<controlplane>`) the one that forms the store; and
+//! any other is refused. It dials the other pods checking theirs for its own ID, and for the
+//! name dialled unless it dials an IP.
 
 use boring::ssl::SslConnector;
 use edgerush_cluster_modes::Pod;
@@ -68,7 +73,7 @@ use edgerush_ratelimit_service::secure::{self, PodFiles, PodTls};
 use edgerush_ratelimit_service::service_file::{PodSettings, parsed};
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -90,11 +95,25 @@ fn config_path(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String
     }
 }
 
-/// The pod's settings from the config file at `path`.
-fn read(path: &Path) -> Result<PodSettings, String> {
+/// The pod's own address, from its environment's `POD_IP`, `value`: none if unset, as
+/// outside Kubernetes.
+fn own_address(value: Option<std::ffi::OsString>) -> Result<Option<IpAddr>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .and_then(|value| value.parse().ok())
+        .map(Some)
+        .ok_or_else(|| format!("POD_IP `{}` is not an IP address", value.to_string_lossy()))
+}
+
+/// The pod's settings from the config file at `path`, reached at `own` where the file says
+/// no `pod.address`.
+fn read(path: &Path, own: Option<IpAddr>) -> Result<PodSettings, String> {
     let yaml = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let directory = path.parent().unwrap_or(Path::new(""));
-    parsed(&yaml, directory).map_err(|error| format!("{}: {error}", path.display()))
+    parsed(&yaml, directory, own).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// A pod answers on one thread, both modes': a stream's answers and its connection's writes
@@ -127,7 +146,7 @@ fn run(args: impl Iterator<Item = String>) -> ExitCode {
     if let (OpenFiles::Kept { .. }, Some(files)) = (open_files, open_files.described()) {
         eprintln!("edgerush-ratelimit-service: warning: {files}");
     }
-    let args = match read(&path) {
+    let args = match own_address(std::env::var_os("POD_IP")).and_then(|own| read(&path, own)) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("edgerush-ratelimit-service: {error}");
@@ -357,14 +376,14 @@ mod tests {
             &path,
             with(&format!(
                 "tls:\n  certificate: pod.pem\n  key: '{}'\n  authorities: ca.pem\n  \
-                 data_plane_id: spiffe://cluster.local/ns/edge/sa/edge\n",
+                 trust_domain: edge.cluster.local\n",
                 elsewhere.display()
             )),
         )
         .unwrap();
-        let file = read(&path);
+        let file = read(&path, None);
         let missing = directory.join("missing.yaml");
-        let not_read = read(&missing);
+        let not_read = read(&missing, None);
         std::fs::remove_dir_all(&directory).unwrap();
         let tls = file.unwrap().tls.unwrap();
         assert_eq!(
@@ -382,6 +401,25 @@ mod tests {
         );
     }
 
+    /// Kubernetes gives a pod its own address in `POD_IP` (06 §4); one that is no IP is
+    /// refused as the pod starts, not dialled.
+    #[test]
+    fn its_own_address_is_the_ip_in_pod_ip() {
+        assert_eq!(own_address(None), Ok(None));
+        assert_eq!(
+            own_address(Some("10.1.2.3".into())),
+            Ok(Some("10.1.2.3".parse().unwrap()))
+        );
+        assert_eq!(
+            own_address(Some("fd00::1".into())),
+            Ok(Some("fd00::1".parse().unwrap()))
+        );
+        assert_eq!(
+            own_address(Some("rl-0.rl".into())),
+            Err("POD_IP `rl-0.rl` is not an IP address".to_owned())
+        );
+    }
+
     #[test]
     fn a_file_refused_is_said_with_its_path() {
         let directory = std::env::temp_dir().join(format!(
@@ -391,7 +429,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("service.yaml");
         std::fs::write(&path, with("shards: 256\n")).unwrap();
-        let refused = read(&path);
+        let refused = read(&path, None);
         std::fs::remove_dir_all(&directory).unwrap();
         let said = refused.unwrap_err();
         assert!(

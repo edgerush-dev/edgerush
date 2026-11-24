@@ -1,11 +1,14 @@
 //! Mutual TLS on the service (06 §4): who may call a pod, told apart by the SPIFFE ID in
 //! the caller's certificate, the authorities trusted establishing only that it is one of
 //! the cluster's workloads (12 item 22). A caller with the pod's own ID, which the
-//! service's pods share, is a pod, and may only send heartbeats and copies; one with the
-//! ID of the data plane it serves may only exchange, or in the synchronous mode decide;
-//! any other is refused. Each end dials the other with the control stream's TLS
-//! (`edgerush_control_service`): 1.3 alone, the pod dialled checked against the name
-//! dialled and for the pods' ID.
+//! service's pods share, is a pod, and may only send heartbeats and copies; one with a data
+//! plane's ID of the pod's trust domain, any of its ControlPlane's DataPlanes, may only
+//! exchange, or in the synchronous mode decide; one with its controller's may only ask what
+//! the pod has applied and name those to form; any other is refused. Each end dials the
+//! other with the control stream's TLS (`edgerush_control_service`): 1.3 alone, the pod
+//! dialled checked for the pods' ID, and against the name dialled where it is dialled by
+//! name: a pod dialled at its own address, its IP, is checked for the ID alone, as the pods
+//! share one certificate, made before any pod has an address.
 //!
 //! TLS is the operator's choice: a pod served plain takes any call from anyone, as before.
 //!
@@ -41,10 +44,59 @@ use tonic::transport::server::Connected;
 /// served plain tells none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
-    /// The data plane served: its certificate carries that data plane's ID.
+    /// A data plane of the pod's ControlPlane: its certificate carries a data plane's ID of
+    /// the pod's trust domain.
     DataPlane,
     /// A service pod: its certificate carries the pods' ID.
     Pod,
+    /// The pod's ControlPlane's controller, which forms the store: its certificate carries
+    /// the controller's ID of the pod's trust domain.
+    Controller,
+}
+
+/// What a data plane's ServiceAccount, and so its SPIFFE ID's last part, starts with: the
+/// operator names it `edgerush-proxy-<dataplane>` (05 §2).
+pub const DATA_PLANE_ACCOUNT: &str = "edgerush-proxy-";
+
+/// What a controller's ServiceAccount starts with: `edgerush-controller-<controlplane>`.
+pub const CONTROLLER_ACCOUNT: &str = "edgerush-controller-";
+
+/// The path of SPIFFE ID `id` past trust domain `domain`, if it is of that domain.
+fn within<'a>(id: &'a str, domain: &str) -> Option<&'a str> {
+    id.strip_prefix("spiffe://")?
+        .strip_prefix(domain)?
+        .strip_prefix('/')
+}
+
+/// Whose SPIFFE ID `id` is, of trust domain `domain`, by the ServiceAccount it names
+/// (`spiffe://<domain>/ns/<namespace>/sa/<account>`, 12 item 22): a data plane's or the
+/// controller's, in whatever namespace; none for any other.
+#[must_use]
+pub fn role(id: &str, domain: &str) -> Option<Caller> {
+    let mut parts = within(id, domain)?.split('/');
+    let (Some("ns"), Some(namespace), Some("sa"), Some(account), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    let named = |prefix: &str| {
+        account
+            .strip_prefix(prefix)
+            .is_some_and(|name| !name.is_empty())
+    };
+    if namespace.is_empty() {
+        None
+    } else if named(DATA_PLANE_ACCOUNT) {
+        Some(Caller::DataPlane)
+    } else if named(CONTROLLER_ACCOUNT) {
+        Some(Caller::Controller)
+    } else {
+        None
+    }
 }
 
 /// Refuses `request` unless its caller is `allowed`, or it says no caller, as a request on
@@ -54,12 +106,13 @@ pub(crate) fn refused<B>(request: &http::Request<B>, allowed: Caller) -> Option<
         Some(caller) if *caller != allowed => Some(Status::permission_denied(match allowed {
             Caller::DataPlane => "only a data plane may call this",
             Caller::Pod => "only a service pod may call this",
+            Caller::Controller => "only the controller may call this",
         })),
         _ => None,
     }
 }
 
-/// What a pod presents, whom it trusts, and which data plane it serves.
+/// What a pod presents, whom it trusts, and the trust domain its callers are of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodCredentials {
     /// Its certificate, and the key: shown to data planes and to the other pods alike. The
@@ -68,9 +121,9 @@ pub struct PodCredentials {
     /// The certificates, in PEM, of the authorities trusted to vouch for every caller and
     /// every pod dialled.
     pub authorities: String,
-    /// The SPIFFE ID of the data plane it serves: its DataPlane's, which that DataPlane's
-    /// pods share.
-    pub data_plane: String,
+    /// The trust domain of its ControlPlane, whose data planes and controller call it, and
+    /// of which its own ID is.
+    pub trust_domain: String,
 }
 
 /// A pod's TLS, made from its credentials: how it is dialled, how it tells its callers
@@ -79,7 +132,7 @@ pub struct PodTls {
     acceptor: SslAcceptor,
     /// The pods' ID, its own.
     pods: String,
-    data_plane: String,
+    trust_domain: String,
     connector: SslConnector,
 }
 
@@ -89,23 +142,29 @@ impl PodTls {
     /// # Errors
     ///
     /// A [`TlsError`] for credentials that cannot be used, among them a certificate without
-    /// one SPIFFE ID, and a data plane's ID that is not one or is the pods' own.
+    /// one SPIFFE ID, a trust domain that is none, and an ID of the pods' that is not of it
+    /// or is a data plane's or the controller's.
     pub fn new(credentials: &PodCredentials) -> Result<Self, TlsError> {
         let leaf = Identity::read(&credentials.certificate)?.leaf;
         let pods = spiffe_id(&leaf).ok_or_else(|| {
             TlsError::Identity("the pod's certificate carries no one SPIFFE ID".to_owned())
         })?;
-        let data_plane = &credentials.data_plane;
-        if !data_plane.starts_with("spiffe://") {
+        let domain = &credentials.trust_domain;
+        if domain.is_empty() || domain.contains('/') {
             return Err(TlsError::Identity(format!(
-                "the data plane's ID `{data_plane}` is not a SPIFFE ID"
+                "the trust domain `{domain}` is not one"
             )));
         }
-        // Then a data plane would be served as a pod.
-        if *data_plane == pods {
-            return Err(TlsError::Identity(
-                "the data plane's ID is the pods' own".to_owned(),
-            ));
+        if within(&pods, domain).is_none() {
+            return Err(TlsError::Identity(format!(
+                "the pods' ID `{pods}` is not of the trust domain `{domain}`"
+            )));
+        }
+        // Then a data plane, or the controller, would be served as a pod.
+        if role(&pods, domain).is_some() {
+            return Err(TlsError::Identity(format!(
+                "the pods' ID `{pods}` is a data plane's or the controller's"
+            )));
         }
         let own = Credentials {
             certificate: credentials.certificate.clone(),
@@ -115,7 +174,7 @@ impl PodTls {
             acceptor: acceptor(&own)?,
             connector: connector_to(&own, &pods)?,
             pods,
-            data_plane: data_plane.clone(),
+            trust_domain: domain.clone(),
         })
     }
 
@@ -125,22 +184,26 @@ impl PodTls {
         &self.connector
     }
 
-    /// Who is on the other end of `ssl`, its handshake done: a pod or the data plane, by the
-    /// SPIFFE ID its certificate carries; else why it is refused.
+    /// Who is on the other end of `ssl`, its handshake done: a pod, a data plane or the
+    /// controller, by the SPIFFE ID its certificate carries; else why it is refused.
     fn caller(&self, ssl: &SslRef) -> Result<Caller, String> {
         // The acceptor has refused a caller without a certificate.
         let id = ssl.peer_certificate().as_deref().and_then(spiffe_id);
         match id {
             Some(id) if id == self.pods => Ok(Caller::Pod),
-            Some(id) if id == self.data_plane => Ok(Caller::DataPlane),
-            Some(id) => Err(format!("{id} is neither a pod nor the data plane served")),
+            Some(id) => role(&id, &self.trust_domain).ok_or_else(|| {
+                format!(
+                    "{id} is neither a pod, a data plane nor the controller of `{}`",
+                    self.trust_domain
+                )
+            }),
             None => Err("the caller's certificate carries no one SPIFFE ID".to_owned()),
         }
     }
 }
 
-/// A data plane's TLS to the pods: `certificate` shown, carrying the data plane's ID, and
-/// each pod checked against `authorities`, each in PEM, and for the pods' ID, `pods`.
+/// A data plane's TLS to the pods, or the controller's: `certificate` shown, carrying its
+/// ID, and each pod checked against `authorities`, each in PEM, and for the pods' ID, `pods`.
 ///
 /// # Errors
 ///
@@ -157,7 +220,21 @@ pub fn data_plane(
     connector_to(&credentials, pods)
 }
 
-/// Where a pod's credentials are, each a PEM file, and the data plane it serves.
+/// The controller's TLS to the pods, as it forms the store: as a data plane's, `certificate`
+/// carrying the controller's ID.
+///
+/// # Errors
+///
+/// A [`TlsError`] for credentials that cannot be used.
+pub fn controller(
+    certificate: &Certificate,
+    authorities: &[String],
+    pods: &str,
+) -> Result<SslConnector, TlsError> {
+    data_plane(certificate, authorities, pods)
+}
+
+/// Where a pod's credentials are, each a PEM file, and the trust domain its callers are of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodFiles {
     /// The certificate it presents, then the intermediates.
@@ -166,8 +243,8 @@ pub struct PodFiles {
     pub key: PathBuf,
     /// The authorities it trusts.
     pub authorities: PathBuf,
-    /// The SPIFFE ID of the data plane it serves.
-    pub data_plane: String,
+    /// The trust domain of its ControlPlane.
+    pub trust_domain: String,
 }
 
 impl PodFiles {
@@ -184,7 +261,7 @@ impl PodFiles {
                 key: read(&self.key).await?,
             },
             authorities: read(&self.authorities).await?,
-            data_plane: self.data_plane.clone(),
+            trust_domain: self.trust_domain.clone(),
         })
     }
 }
@@ -374,7 +451,9 @@ impl AsyncWrite for Secured {
 }
 
 /// Dials a pod: TCP, then TLS with the latest of its connector, the pod's certificate
-/// checked against the host it is dialled by.
+/// checked for the pods' ID and, where it is dialled by name, against the name: one dialled
+/// at an IP, its own address, is checked for the ID alone, as every pod shares one
+/// certificate, made before any has an address (12 item 22).
 #[derive(Clone)]
 pub(crate) struct Dialler {
     address: Arc<str>,
@@ -449,7 +528,10 @@ impl tower_service::Service<Uri> for Dialler {
             let dial = async {
                 let socket = connect(&address, from).await?;
                 socket.set_nodelay(true)?;
-                let configured = tls.configure().map_err(|error| failed(error.to_string()))?;
+                let mut configured = tls.configure().map_err(|error| failed(error.to_string()))?;
+                if name.parse::<IpAddr>().is_ok() {
+                    configured.set_verify_hostname(false);
+                }
                 let secured = tokio_boring::connect(configured, &name, socket)
                     .await
                     .map_err(|error| failed(error.to_string()))?;

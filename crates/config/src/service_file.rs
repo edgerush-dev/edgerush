@@ -42,7 +42,9 @@ pub struct ServicePod {
     /// Where it serves data planes and the other pods, `host:port`.
     pub listen: SocketAddr,
     /// Where the other pods and data planes reach it, `host:port`, as it tells them in its
-    /// hellos and as it asks to join the store. Needed.
+    /// hellos and as it asks to join the store. Needed with a store; left out, the pod takes
+    /// the address in its `POD_IP` environment variable, with `listen`'s port, as a pod in
+    /// Kubernetes is given its own, every pod reading one file.
     #[serde(default)]
     pub address: Option<String>,
     /// Where `/metrics` shows the pod's store and what each mode counts, and `/ready` whether
@@ -139,10 +141,13 @@ pub struct ServicePodTls {
     pub key: PathBuf,
     /// The authorities trusted to vouch for every caller.
     pub authorities: PathBuf,
-    /// The SPIFFE ID of the data plane the pod serves. A caller is told apart by the ID its
-    /// certificate carries: the pod's own is the pods', this one the data plane's, and any
-    /// other is refused.
-    pub data_plane_id: String,
+    /// The trust domain of the ControlPlane whose workloads call the pod, by which a caller
+    /// is told apart by the SPIFFE ID its certificate carries: the pod's own is the pods',
+    /// which must be of this domain; any
+    /// `spiffe://<trust domain>/ns/<namespace>/sa/edgerush-proxy-<dataplane>` a data plane's;
+    /// any `spiffe://<trust domain>/ns/<namespace>/sa/edgerush-controller-<controlplane>`
+    /// the controller's; and any other is refused.
+    pub trust_domain: String,
 }
 
 #[cfg(test)]
@@ -179,7 +184,7 @@ tls:
   certificate: pod.pem
   key: pod.key
   authorities: ca.pem
-  data_plane_id: spiffe://cluster.local/ns/edge/sa/edge
+  trust_domain: edge.cluster.local
 ";
         assert_eq!(
             read(yaml).unwrap(),
@@ -208,7 +213,7 @@ tls:
                     certificate: "pod.pem".into(),
                     key: "pod.key".into(),
                     authorities: "ca.pem".into(),
-                    data_plane_id: "spiffe://cluster.local/ns/edge/sa/edge".to_owned(),
+                    trust_domain: "edge.cluster.local".to_owned(),
                 }),
             }
         );

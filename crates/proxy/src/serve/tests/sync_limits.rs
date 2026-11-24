@@ -10,7 +10,7 @@ use edgerush_ratelimit_service::cluster::forming::Forming;
 use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::plane::{Answer, Plane, Rule, Told};
 use edgerush_ratelimit_service::cluster::pod::{StorePod, StoreServer, decide_stream};
-use edgerush_ratelimit_service::secure::{self, PodCredentials, PodTls};
+use edgerush_ratelimit_service::secure;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::AtomicUsize;
 use tokio::task::JoinHandle;
@@ -75,16 +75,19 @@ impl Store {
     /// Pods served on `listeners`, each giving the address beside its listener — its own, or a
     /// relay's in front of it — with `config`, forwarding as the service's binary has them, and
     /// formed into one cluster by `Forming` at those addresses; once every pod is ready on one
-    /// table. Served plain, or with `tls`, which `Forming` dials with as a pod.
+    /// table. Served plain, or with `tls`'s, which `Forming` dials as the controller.
     async fn formed(
         listeners: Vec<(TcpListener, String)>,
         config: &StoreConfig,
-        tls: Option<PodTls>,
+        tls: Option<SecuredPods>,
     ) -> Self {
-        let dial = tls.as_ref().map_or(Dial::Plain, |tls| {
-            Dial::Secured(tokio::sync::watch::channel(tls.connector().clone()).1)
+        let dial = tls.as_ref().map_or(Dial::Plain, |secured| {
+            Dial::Secured(tokio::sync::watch::channel(secured.tls.connector().clone()).1)
         });
-        let serving = tls.map(|tls| tokio::sync::watch::channel(Arc::new(tls)).1);
+        let forming_dial = tls
+            .as_ref()
+            .map_or(Dial::Plain, |secured| secured.forming.clone());
+        let serving = tls.map(|secured| tokio::sync::watch::channel(Arc::new(secured.tls)).1);
         let mut pods = Vec::new();
         for (id, (listener, address)) in (1..).zip(listeners) {
             let pod = StorePod::spawn(id, address.clone(), *config, dial.clone(), Vec::new());
@@ -117,7 +120,9 @@ impl Store {
             });
         }
         let addresses = pods.iter().map(|pod| pod.address.clone()).collect();
-        let forming = Forming::new(config, naming_file()).unwrap().dialling(dial);
+        let forming = Forming::new(config, naming_file())
+            .unwrap()
+            .dialling(forming_dial);
         let forming = tokio::spawn(async move {
             let _stopped = forming.run(addresses).await;
         });
@@ -794,12 +799,7 @@ async fn owners_are_asked_with_the_certificate_the_config_shows() {
             let authority = Authority::new("workloads");
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let owner = listener.local_addr().unwrap().to_string();
-            let tls = PodTls::new(&PodCredentials {
-                certificate: authority.issue(&["127.0.0.1", POD_ID]),
-                authorities: authority.pem(),
-                data_plane: PLANE_ID.to_owned(),
-            })
-            .unwrap();
+            let tls = secured_pods(&authority);
             let _store =
                 Store::formed(vec![(listener, owner.clone())], &store_config(), Some(tls)).await;
             let (upstream, _) = counting_upstream().await;
@@ -961,7 +961,7 @@ impl GatedRelay {
 /// A pod alone behind a gated relay, the relay's address the one it gives, so that every
 /// connection to it goes through the relay: formed, then with every connection forming made
 /// forgotten. Served plain, or with `tls`.
-async fn behind_a_relay(tls: Option<PodTls>) -> (Store, GatedRelay) {
+async fn behind_a_relay(tls: Option<SecuredPods>) -> (Store, GatedRelay) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay = GatedRelay::to(listener.local_addr().unwrap()).await;
     let store = Store::formed(
@@ -986,14 +986,7 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
         .run_until(async {
             for secured in [false, true] {
                 let authority = Authority::new("workloads");
-                let tls = secured.then(|| {
-                    PodTls::new(&PodCredentials {
-                        certificate: authority.issue(&["127.0.0.1", POD_ID]),
-                        authorities: authority.pem(),
-                        data_plane: PLANE_ID.to_owned(),
-                    })
-                    .unwrap()
-                });
+                let tls = secured.then(|| secured_pods(&authority));
                 let (_store, relay) = behind_a_relay(tls).await;
                 relay.shut_all();
                 let (upstream, _) = counting_upstream().await;

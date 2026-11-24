@@ -1,5 +1,7 @@
 //! What a pod runs the store with, from its file's `pod.address` and `store` section
-//! (`edgerush_config::ServiceStore`), and the member id it takes for each life.
+//! (`edgerush_config::ServiceStore`), and the member id it takes for each life. A file
+//! without `pod.address` gives the pod the address it was given in its environment, as
+//! Kubernetes gives each pod its own while every pod reads one file (06 §4).
 //!
 //! Every setting left out has the store's default (`Config::defaults`), and the timings are
 //! checked against each other as the store checks them. The keys' cap is the file's
@@ -9,6 +11,7 @@
 use super::pod::CLIENTS;
 use edgerush_cluster::{Config, ConfigError, NodeId, Time, ms};
 use edgerush_config::{STORE_MOST_MS, ServiceFile};
+use std::net::{IpAddr, SocketAddr};
 
 /// What a pod runs the store with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +30,7 @@ pub struct Settings {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SettingsError {
     /// A `store` section, but nowhere for the other pods to reach this one.
-    #[error("`pod.address` is needed with a `store` section")]
+    #[error("`pod.address`, or an address in `POD_IP`, is needed with a `store` section")]
     NoAddress,
     /// An address, but no store to give it in.
     #[error("`pod.address` is for the store, and there is no `store` section")]
@@ -66,16 +69,24 @@ pub enum SettingsError {
 }
 
 /// The store's settings in `file`, its keys capped at `max_key_bytes`: none when it has no
-/// `store` section.
+/// `store` section. Where the file says no `pod.address`, the pod is reached at `own`, the
+/// address it was given, on the port it listens on.
 ///
 /// # Errors
 ///
 /// The first [`SettingsError`] the file has.
-pub fn settings(file: &ServiceFile, max_key_bytes: u64) -> Result<Option<Settings>, SettingsError> {
-    let (address, store) = match (&file.pod.address, &file.store) {
+pub fn settings(
+    file: &ServiceFile,
+    max_key_bytes: u64,
+    own: Option<IpAddr>,
+) -> Result<Option<Settings>, SettingsError> {
+    let given = own.map(|ip| SocketAddr::new(ip, file.pod.listen.port()).to_string());
+    let (address, store) = match (file.pod.address.clone().or(given), &file.store) {
         (None, None) => return Ok(None),
         (None, Some(_)) => return Err(SettingsError::NoAddress),
-        (Some(_), None) => return Err(SettingsError::NoStore),
+        // Only an address the file says is one without a store; one given is not its to say.
+        (Some(_), None) if file.pod.address.is_some() => return Err(SettingsError::NoStore),
+        (Some(_), None) => return Ok(None),
         (Some(address), Some(store)) => (address, store),
     };
     let defaults = Config::defaults();
@@ -124,7 +135,7 @@ pub fn settings(file: &ServiceFile, max_key_bytes: u64) -> Result<Option<Setting
         ConfigError::PartBytes => SettingsError::Fixed(error),
     })?;
     Ok(Some(Settings {
-        address: address.clone(),
+        address,
         seeds: store.seeds.clone(),
         config,
         forwarder_decides: store.forwarder_decides.unwrap_or(true),
@@ -159,12 +170,12 @@ mod tests {
 
     #[test]
     fn a_file_without_a_store_has_none() {
-        assert_eq!(settings(&file("", None), 1 << 20), Ok(None));
+        assert_eq!(settings(&file("", None), 1 << 20, None), Ok(None));
     }
 
     #[test]
     fn what_is_left_out_has_the_stores_default_and_the_keys_their_cap() {
-        let settings = settings(&file(ADDRESS, Some("")), 1 << 20)
+        let settings = settings(&file(ADDRESS, Some("")), 1 << 20, None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -186,7 +197,7 @@ mod tests {
         let store = "seeds: [rl-1:7000, rl-2:7000], shards: 64, replicas: 1, heartbeat_ms: 50, \
                      stop_serving_ms: 200, silence_ms: 300, election_jitter_ms: 100, \
                      cycle_ms: 20, skew_warning_ms: 500, forwarder_decides: false";
-        let settings = settings(&file(ADDRESS, Some(store)), 1 << 30)
+        let settings = settings(&file(ADDRESS, Some(store)), 1 << 30, None)
             .unwrap()
             .unwrap();
         assert_eq!(settings.seeds, ["rl-1:7000", "rl-2:7000"]);
@@ -211,12 +222,31 @@ mod tests {
     #[test]
     fn an_address_goes_with_a_store_and_a_store_with_an_address() {
         assert_eq!(
-            settings(&file("", Some("")), 1),
+            settings(&file("", Some("")), 1, None),
             Err(SettingsError::NoAddress)
         );
         assert_eq!(
-            settings(&file(ADDRESS, None), 1),
+            settings(&file(ADDRESS, None), 1, None),
             Err(SettingsError::NoStore)
+        );
+    }
+
+    #[test]
+    fn a_pod_without_an_address_takes_its_own_ip_with_the_port_it_listens_on() {
+        let own = |ip: &str| settings(&file("", Some("")), 1, Some(ip.parse().unwrap()));
+        assert_eq!(own("10.1.2.3").unwrap().unwrap().address, "10.1.2.3:7000");
+        assert_eq!(own("fd00::1").unwrap().unwrap().address, "[fd00::1]:7000");
+        // An address the file says is the pod's, whatever it was given.
+        let said = settings(
+            &file(ADDRESS, Some("")),
+            1,
+            Some("10.1.2.3".parse().unwrap()),
+        );
+        assert_eq!(said.unwrap().unwrap().address, "rl-0.rl:7000");
+        // No store, no address needed: the pod refuses a file without one elsewhere.
+        assert_eq!(
+            settings(&file("", None), 1, Some("10.1.2.3".parse().unwrap())),
+            Ok(None)
         );
     }
 
@@ -253,14 +283,14 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                settings(&file(ADDRESS, Some(store)), 1),
+                settings(&file(ADDRESS, Some(store)), 1, None),
                 Err(refused),
                 "{store}"
             );
         }
         // At the edges: an hour, and a stop exactly two heartbeats short.
-        assert!(settings(&file(ADDRESS, Some("skew_warning_ms: 3600000")), 1).is_ok());
-        assert!(settings(&file(ADDRESS, Some("stop_serving_ms: 400")), 1).is_ok());
+        assert!(settings(&file(ADDRESS, Some("skew_warning_ms: 3600000")), 1, None).is_ok());
+        assert!(settings(&file(ADDRESS, Some("stop_serving_ms: 400")), 1, None).is_ok());
     }
 
     #[test]

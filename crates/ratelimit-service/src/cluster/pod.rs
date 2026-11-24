@@ -1219,11 +1219,13 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for StoreServer {
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let pod = self.pod.clone();
         Box::pin(async move {
-            // The data planes' streams, those its mode serves, are theirs; every other method
-            // the pods'.
+            // The data planes' streams are theirs, asking what a pod has applied and naming
+            // those to form the controller's; every other method the pods'.
             let plane = plane(request.uri().path());
             let caller = if plane.is_some() {
                 Caller::DataPlane
+            } else if request.uri().path() == CONTROL {
+                Caller::Controller
             } else {
                 Caller::Pod
             };

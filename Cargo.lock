@@ -597,6 +597,7 @@ dependencies = [
  "edgerush-cluster-synchronous",
  "edgerush-config",
  "edgerush-control-service",
+ "edgerush-planes",
  "edgerush-ratelimit",
  "edgerush-telemetry",
  "futures-core",
