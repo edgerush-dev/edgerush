@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 /// it. The operator deploys it, gives it the rights of its scope, and makes the
 /// GatewayClass named as it is.
 ///
-/// Its name is a DNS label of at most 43 characters, so that its controller's Service,
-/// `edgerush-controller-<name>`, is a DNS label too. It is unique in the cluster: the
-/// oldest ControlPlane of a name holds it, and a later one of the same name in another
-/// namespace is not accepted.
+/// Its name is a DNS label of at most 38 characters, so that its Services are DNS
+/// labels too, the longest its rate-limiting service's `edgerush-ratelimit-<name>-peers`.
+/// It is unique in the cluster: the oldest ControlPlane of a name holds it, and a later
+/// one of the same name in another namespace is not accepted.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct ControlPlane {
     /// The object's metadata.
@@ -108,8 +108,8 @@ pub struct ControlPlaneRateLimitingService {
     #[serde(default = "default_control_plane_rate_limiting_service_forwarder_decides")]
     pub forwarder_decides: bool,
     /// MaxKeyBytes is what the keys may take in each pod's memory: past it,
-    /// keys are evicted, and start again full. Three quarters of the pods'
-    /// memory limit unless said, and with no memory limit 268,435,456 (256 MiB).
+    /// keys are evicted, and start again full. Half the pods' memory limit
+    /// unless said, and with no memory limit 268,435,456 (256 MiB).
     #[serde(rename = "maxKeyBytes")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_key_bytes: Option<i64>,

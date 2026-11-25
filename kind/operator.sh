@@ -84,6 +84,12 @@
 #     the registration gone;
 #   - a ServiceAccount of a name the operator would use, made by hand, is left alone, and
 #     its ControlPlane says so;
+#   - ControlPlane `edge` declaring its rate-limiting service (docs/05 §2) has its
+#     ServiceAccount, ConfigMap, Deployment, PodDisruptionBudget and two Services made,
+#     owned by it, the peers Service headless and listing pods not ready, its controller
+#     left alone; its copies changed changes the digest its pods' template carries, rolling
+#     them; the service taken away deletes all six, the ControlPlane programmed (its pods
+#     wait meanwhile for the certificate the control plane will write, #598);
 #   - `web` at a fixed 2, then autoscaled from 2, has an autoscaler that runs it at 2, and
 #     its Deployment never states fewer on the way, its replicas handed over to the
 #     autoscaler (docs/05 §2); its `max` taken away and `min` made 1 deletes the autoscaler,
@@ -156,11 +162,11 @@ made_in() {
         -l "gateway.edgerush.dev/control-plane=$2" -o name 2>/dev/null)" ]
 }
 
-echo "== building the binary and its image"
-cargo build -q --release --locked -p edgerush
+echo "== building the binaries and their image"
+cargo build -q --release --locked -p edgerush -p edgerush-ratelimit-service
 image=target/kind/image
 rm -rf "$image" && mkdir -p "$image"
-cp target/release/edgerush "$image/"
+cp target/release/edgerush target/release/edgerush-ratelimit-service "$image/"
 sed "s|BASE|$BASE|" kind/discovery/Dockerfile > "$image/Dockerfile"
 docker build -q -t edgerush:dev "$image" >/dev/null
 kind load docker-image edgerush:dev --name "$name" >/dev/null
@@ -1224,6 +1230,47 @@ condition_is controlplane/own own Programmed "False NotOurs" 60 ||
 [ -z "$(k -n own get serviceaccount edgerush-controller-own -o jsonpath='{.metadata.labels}')" ] ||
     fail "the ServiceAccount made by hand was taken over"
 pass "an object of a name the operator would use, made by hand, is left alone, and said"
+
+echo "== the rate-limiting service"
+rl=edgerush-ratelimit-edge
+service_objects() {
+    k -n edge get serviceaccounts,configmaps,deployments,poddisruptionbudgets,services \
+        -l app.kubernetes.io/component=ratelimit,gateway.edgerush.dev/control-plane=edge -o name 2>/dev/null |
+        LC_ALL=C sort | tr '\n' ' '
+}
+controller_pods() {
+    k -n edge get pods -l app.kubernetes.io/component=controller,gateway.edgerush.dev/control-plane=edge \
+        -o jsonpath='{.items[*].metadata.uid}'
+}
+digest() {
+    k -n edge get deploy $rl -o jsonpath='{.spec.template.metadata.annotations.gateway\.edgerush\.dev/config-digest}'
+}
+# In byte order, whatever the host's locale sorts by.
+expected="configmap/$rl deployment.apps/$rl poddisruptionbudget.policy/$rl service/$rl service/$rl-peers serviceaccount/$rl "
+controller_before=$(controller_pods)
+k -n edge patch controlplane edge --type=merge -p '{"spec":{"rateLimiting":{"service":{"copies":1}}}}' >/dev/null
+until_true '[ "$(service_objects)" = "$expected" ]' 60 ||
+    fail "ControlPlane edge declaring its rate-limiting service has $(service_objects), not $expected"
+[ "$(k -n edge get service $rl-peers -o jsonpath='{.spec.clusterIP} {.spec.publishNotReadyAddresses}')" = "None true" ] ||
+    fail "the peers Service is not headless, listing pods not ready: $(k -n edge get service $rl-peers -o jsonpath='{.spec}')"
+[ "$(k -n edge get deploy $rl -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}')" = ControlPlane/edge ] ||
+    fail "the service's Deployment is not owned by ControlPlane edge"
+k -n edge get configmap $rl -o jsonpath='{.data.service\.yaml}' | grep -q '^  replicas: 1$' ||
+    fail "the service's file does not say its copies: $(k -n edge get configmap $rl -o jsonpath='{.data.service\.yaml}')"
+[ "$(controller_pods)" = "$controller_before" ] || fail "the controller's pods were replaced by its service declared"
+pass "a ControlPlane declaring its rate-limiting service has its six objects made, owned by it, the controller left alone"
+first=$(digest)
+k -n edge patch controlplane edge --type=merge -p '{"spec":{"rateLimiting":{"service":{"copies":2}}}}' >/dev/null
+until_true '[ -n "$(digest)" ] && [ "$(digest)" != "$first" ]' 60 ||
+    fail "the service's file changed, its pods' template did not: $(digest)"
+pass "the service's settings changed roll its pods, by the digest of its file"
+k -n edge patch controlplane edge --type=json -p '[{"op":"remove","path":"/spec/rateLimiting"}]' >/dev/null
+until_true '[ -z "$(service_objects)" ]' 60 ||
+    fail "the service no longer declared left $(service_objects)"
+condition_is controlplane/edge edge Programmed "True Programmed" 60 ||
+    fail "ControlPlane edge, its service gone: $(condition controlplane/edge edge Programmed)"
+[ "$(controller_pods)" = "$controller_before" ] || fail "the controller's pods were replaced by its service taken away"
+pass "the service no longer declared is deleted whole, the controller left alone"
 
 echo "== an autoscaler taking over the count"
 deployment_replicas() { k -n edge get deploy edgerush-proxy-web -o jsonpath='{.spec.replicas}'; }

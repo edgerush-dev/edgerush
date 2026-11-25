@@ -1,0 +1,503 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-controller-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-controller-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-control-plane
+subjects:
+- kind: ServiceAccount
+  name: edgerush-controller-payments
+  namespace: payments-edge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-controller-payments-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-control-plane-cluster
+subjects:
+- kind: ServiceAccount
+  name: edgerush-controller-payments
+  namespace: payments-edge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-controller-payments-own
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edgerush-control-plane-own
+subjects:
+- kind: ServiceAccount
+  name: edgerush-controller-payments
+  namespace: payments-edge
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-controller-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: controller
+      app.kubernetes.io/managed-by: edgerush-operator
+      app.kubernetes.io/name: edgerush
+      gateway.edgerush.dev/control-plane: payments
+      gateway.edgerush.dev/namespace: payments-edge
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/managed-by: edgerush-operator
+        app.kubernetes.io/name: edgerush
+        gateway.edgerush.dev/control-plane: payments
+        gateway.edgerush.dev/namespace: payments-edge
+    spec:
+      containers:
+      - args:
+        - controller
+        - --control-plane
+        - payments
+        - --cluster-domain
+        - cluster.local
+        - --listen
+        - 0.0.0.0:9443
+        - --leader-lease
+        - payments-edge/edgerush-controller-payments
+        - --health
+        - 0.0.0.0:8081
+        - --peers
+        - 0.0.0.0:9444
+        - --authority
+        - edgerush-controller-payments-authority
+        - --namespace
+        - payments-edge
+        env:
+        - name: EDGERUSH_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        image: edgerush:golden
+        name: edgerush
+        ports:
+        - containerPort: 9443
+          name: stream
+        - containerPort: 8081
+          name: health
+        - containerPort: 9444
+          name: peers
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+      securityContext:
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: edgerush-controller-payments
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-controller-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+spec:
+  ports:
+  - name: stream
+    port: 9443
+    targetPort: stream
+  selector:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-ratelimit-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+---
+apiVersion: v1
+kind: ConfigMap
+data:
+  service.yaml: |
+    pod:
+      listen: 0.0.0.0:7000
+      metrics: 0.0.0.0:9090
+    store:
+      seeds:
+      - edgerush-ratelimit-payments-peers.payments-edge.svc:7000
+      shards: 512
+      replicas: 1
+      forwarder_decides: false
+    keys:
+      max_bytes: 8589934592
+    tls:
+      certificate: /etc/edgerush/identity/tls.crt
+      key: /etc/edgerush/identity/tls.key
+      authorities: /etc/edgerush/identity/ca.crt
+      trust_domain: payments.cluster.local
+metadata:
+  labels:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-ratelimit-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-ratelimit-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: ratelimit
+      app.kubernetes.io/managed-by: edgerush-operator
+      app.kubernetes.io/name: edgerush
+      gateway.edgerush.dev/control-plane: payments
+      gateway.edgerush.dev/namespace: payments-edge
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        gateway.edgerush.dev/config-digest: 376fe1acf69b6c69
+      labels:
+        app.kubernetes.io/component: ratelimit
+        app.kubernetes.io/managed-by: edgerush-operator
+        app.kubernetes.io/name: edgerush
+        gateway.edgerush.dev/control-plane: payments
+        gateway.edgerush.dev/namespace: payments-edge
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - args:
+        - --config
+        - /etc/edgerush/ratelimit/service.yaml
+        command:
+        - edgerush-ratelimit-service
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        image: edgerush:golden
+        name: ratelimit
+        ports:
+        - containerPort: 7000
+          name: store
+        - containerPort: 9090
+          name: metrics
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: metrics
+        resources:
+          limits:
+            memory: 16Gi
+          requests:
+            cpu: "2"
+            memory: 8Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /etc/edgerush/ratelimit
+          name: config
+          readOnly: true
+        - mountPath: /etc/edgerush/identity
+          name: identity
+          readOnly: true
+      securityContext:
+        runAsGroup: 65534
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: edgerush-ratelimit-payments
+      tolerations:
+      - effect: NoExecute
+        key: node.kubernetes.io/not-ready
+        operator: Exists
+        tolerationSeconds: 30
+      - effect: NoExecute
+        key: node.kubernetes.io/unreachable
+        operator: Exists
+        tolerationSeconds: 30
+      topologySpreadConstraints:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/component: ratelimit
+            app.kubernetes.io/managed-by: edgerush-operator
+            app.kubernetes.io/name: edgerush
+            gateway.edgerush.dev/control-plane: payments
+            gateway.edgerush.dev/namespace: payments-edge
+        maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/component: ratelimit
+            app.kubernetes.io/managed-by: edgerush-operator
+            app.kubernetes.io/name: edgerush
+            gateway.edgerush.dev/control-plane: payments
+            gateway.edgerush.dev/namespace: payments-edge
+        maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+      volumes:
+      - configMap:
+          name: edgerush-ratelimit-payments
+        name: config
+      - name: identity
+        secret:
+          secretName: edgerush-ratelimit-payments-identity
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-ratelimit-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: ratelimit
+      app.kubernetes.io/managed-by: edgerush-operator
+      app.kubernetes.io/name: edgerush
+      gateway.edgerush.dev/control-plane: payments
+      gateway.edgerush.dev/namespace: payments-edge
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-ratelimit-payments-peers
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+spec:
+  clusterIP: None
+  ports:
+  - name: store
+    port: 7000
+    targetPort: store
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: edgerush-ratelimit-payments
+  namespace: payments-edge
+  ownerReferences:
+  - apiVersion: gateway.edgerush.dev/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: ControlPlane
+    name: payments
+    uid: 6f1c2b8e-0000-4000-8000-000000000007
+spec:
+  ports:
+  - name: store
+    port: 7000
+    targetPort: store
+  selector:
+    app.kubernetes.io/component: ratelimit
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/managed-by: edgerush-operator
+    app.kubernetes.io/name: edgerush
+    gateway.edgerush.dev/control-plane: payments
+    gateway.edgerush.dev/namespace: payments-edge
+  name: payments
+spec:
+  controllerName: edgerush.dev/gateway-controller
+  description: Served by EdgeRush's ControlPlane payments-edge/payments.

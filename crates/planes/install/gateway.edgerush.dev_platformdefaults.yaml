@@ -77,7 +77,7 @@ spec:
                           description: |-
                             IPFamily is what each port is bound on, and the families of the data plane's
                             Service:
-                            
+                        
                             * IPv4: `0.0.0.0`, which binds wherever there is a network.
                             * IPv6: `[::]`, which takes IPv4 as well wherever the host has it.
                             * Dual: the same socket, the Service reached over both.
@@ -107,7 +107,7 @@ spec:
                                   type:
                                     description: |-
                                       Type is where:
-                                      
+                        
                                       * Stdout: the process's standard output, which the container runtime collects.
                                       * File: a file, appended to; listeners that name the same path share it.
                                     enum:
@@ -214,7 +214,7 @@ spec:
                                 description: |-
                                   RequestID is what an HTTP listener does with X-Request-ID, Generate unless
                                   said:
-                                  
+                        
                                   * Generate: every request gets an ID the gateway makes, in place of any it
                                     came with; the answer tells the client the same ID.
                                   * Pass: the header is left as it is, both ways.
@@ -309,7 +309,7 @@ spec:
                                   key:
                                     description: |-
                                       Key is whose requests are counted together:
-                                      
+                        
                                       * Client: the client's address, as the port's forwarding works it out, an IPv6 client by its /64.
                                     enum:
                                     - Client

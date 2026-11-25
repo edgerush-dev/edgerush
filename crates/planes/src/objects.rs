@@ -14,7 +14,9 @@
 //! plane's too, and the data plane's probes come with the slice that builds them; the
 //! controller's readiness probe asks its `/ready`. A ControlPlane's
 //! webhook is registered only once its status holds its authority's bundle, which the
-//! control plane publishes there (05 §2): never with an empty one, filled in later.
+//! control plane publishes there (05 §2): never with an empty one, filled in later. A
+//! ControlPlane that declares a rate-limiting service has its objects made too
+//! ([`ratelimit`]), and none while it does not.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,7 +35,7 @@ use k8s_openapi::api::autoscaling::v2::{
     CrossVersionObjectReference, HorizontalPodAutoscaler, HorizontalPodAutoscalerSpec,
 };
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
+    Capabilities, ConfigMap, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     ObjectFieldSelector, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
     SeccompProfile, SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort,
     ServiceSpec, Sysctl, TopologySpreadConstraint, Volume, VolumeMount,
@@ -49,11 +51,12 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::Serialize;
 
 use crate::control_plane::{ControlPlane, ControlPlaneWatchNamespacesSelector};
-use crate::data_plane::{DataPlane, DataPlaneResources};
+use crate::data_plane::DataPlane;
 use crate::gateway_first::carried;
 use crate::rate_limit_policy::RateLimitPolicy;
 use crate::workers::workers;
 
+pub mod ratelimit;
 #[cfg(test)]
 mod tests;
 
@@ -96,6 +99,9 @@ pub const NAMESPACE_LABEL: &str = "gateway.edgerush.dev/namespace";
 /// its own namespace, the shipped admission policy lets a control plane write only what
 /// carries both, of its own (05 §2). [`NAMESPACE_LABEL`] there is the DataPlane's.
 pub const CONTROL_PLANE_NAMESPACE_LABEL: &str = "gateway.edgerush.dev/control-plane-namespace";
+/// The label naming which of a plane's workloads an object is for: `controller`, `proxy`, or
+/// the rate-limiting service's ([`ratelimit::RATE_LIMITING_COMPONENT`]).
+pub const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
 /// The label saying the operator made an object.
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 /// Its value.
@@ -127,7 +133,8 @@ const NOBODY: i64 = 65534;
 /// What every object takes from the install rather than from a resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Install {
-    /// The image the planes run, the operator's own: one binary, one image (05 §7).
+    /// The image the planes run, the operator's own: one image, holding both binaries,
+    /// `edgerush` and the rate-limiting service's (05 §7).
     pub image: String,
     /// The cluster's DNS domain, which a Service's name ends in: `cluster.local` unless
     /// the cluster was set up otherwise (05 §3).
@@ -146,8 +153,11 @@ pub enum Object {
     ClusterRoleBinding(ClusterRoleBinding),
     /// A plane's workload.
     Deployment(Box<Deployment>),
-    /// The control plane's Service, which its data planes dial.
+    /// A Service: the control plane's, which its data planes dial, or one of its
+    /// rate-limiting service's two.
     Service(Box<Service>),
+    /// The rate-limiting service's config file.
+    ConfigMap(ConfigMap),
     /// The data plane's autoscaler, where its replicas' `max` is above `min`.
     HorizontalPodAutoscaler(Box<HorizontalPodAutoscaler>),
     /// The data plane's disruption budget.
@@ -187,6 +197,7 @@ impl Object {
             Self::ClusterRoleBinding(_) => "ClusterRoleBinding",
             Self::Deployment(_) => "Deployment",
             Self::Service(_) => "Service",
+            Self::ConfigMap(_) => "ConfigMap",
             Self::HorizontalPodAutoscaler(_) => "HorizontalPodAutoscaler",
             Self::PodDisruptionBudget(_) => "PodDisruptionBudget",
             Self::GatewayClass(_) => "GatewayClass",
@@ -205,6 +216,7 @@ impl Object {
             Self::ClusterRoleBinding(object) => &object.metadata,
             Self::Deployment(object) => &object.metadata,
             Self::Service(object) => &object.metadata,
+            Self::ConfigMap(object) => &object.metadata,
             Self::HorizontalPodAutoscaler(object) => &object.metadata,
             Self::PodDisruptionBudget(object) => &object.metadata,
             Self::GatewayClass(object) => &object.metadata,
@@ -222,6 +234,7 @@ impl Object {
             Self::ClusterRoleBinding(object) => &mut object.metadata,
             Self::Deployment(object) => &mut object.metadata,
             Self::Service(object) => &mut object.metadata,
+            Self::ConfigMap(object) => &mut object.metadata,
             Self::HorizontalPodAutoscaler(object) => &mut object.metadata,
             Self::PodDisruptionBudget(object) => &mut object.metadata,
             Self::GatewayClass(object) => &mut object.metadata,
@@ -284,6 +297,13 @@ pub enum Error {
     /// The DataPlane's `ipFamily` is none its schema holds.
     #[error("the DataPlane's ipFamily {0} is not IPv4, IPv6 or Dual")]
     IpFamily(String),
+    /// A memory limit of the rate-limiting service's resources that no cap of its keys can
+    /// be read from.
+    #[error("the memory quantity {0} is not one a cap of keys can be read from")]
+    Memory(String),
+    /// The rate-limiting service's config file could not be written.
+    #[error("the rate-limiting service's config file cannot be written: {0}")]
+    ServiceFile(String),
 }
 
 /// A plane's name, namespace and UID, read from its metadata.
@@ -485,10 +505,7 @@ fn labels(
 ) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::from([
         ("app.kubernetes.io/name".to_owned(), "edgerush".to_owned()),
-        (
-            "app.kubernetes.io/component".to_owned(),
-            component.to_owned(),
-        ),
+        (COMPONENT_LABEL.to_owned(), component.to_owned()),
         (MANAGED_BY_LABEL.to_owned(), MANAGED_BY.to_owned()),
         (CONTROL_PLANE_LABEL.to_owned(), cp.to_owned()),
         (NAMESPACE_LABEL.to_owned(), namespace.to_owned()),
@@ -619,7 +636,8 @@ fn port(name: &str, number: i32) -> ContainerPort {
 /// # Errors
 ///
 /// [`Error::Missing`], for a ControlPlane the API server did not give a name, namespace or
-/// UID; [`Error::Selector`], for a selector of namespaces the API server would not read.
+/// UID; [`Error::Selector`], for a selector of namespaces the API server would not read;
+/// [`Error::ServiceFile`], for a rate-limiting service whose file cannot be written.
 pub fn for_control_plane(
     control_plane: &ControlPlane,
     selected: &BTreeSet<String>,
@@ -794,6 +812,15 @@ pub fn for_control_plane(
         }),
         ..Service::default()
     })));
+
+    if let Some(service) = control_plane
+        .spec
+        .rate_limiting
+        .as_ref()
+        .and_then(|rate_limiting| rate_limiting.service.as_ref())
+    {
+        objects.extend(ratelimit::objects(&cp, &owner, service, install)?);
+    }
 
     if webhook && let Some(bundle) = authority_bundle(control_plane) {
         objects.push(Object::ValidatingWebhookConfiguration(Box::new(
@@ -1025,7 +1052,7 @@ pub fn for_data_plane(
             read_only: Some(true),
             ..VolumeMount::default()
         }]),
-        resources: resources.map(requirements),
+        resources: resources.map(|r| requirements(r.limits.as_ref(), r.requests.as_ref())),
         security_context: Some(locked_down()),
         ..Container::default()
     };
@@ -1345,10 +1372,13 @@ impl ProxyService {
     }
 }
 
-/// The DataPlane's resources as a container's.
-fn requirements(resources: &DataPlaneResources) -> ResourceRequirements {
-    let quantities = |q: &Option<BTreeMap<String, IntOrString>>| {
-        q.as_ref().map(|q| {
+/// A resource's `limits` and `requests`, as its CRD has them, as a container's.
+fn requirements(
+    limits: Option<&BTreeMap<String, IntOrString>>,
+    requests: Option<&BTreeMap<String, IntOrString>>,
+) -> ResourceRequirements {
+    let quantities = |q: Option<&BTreeMap<String, IntOrString>>| {
+        q.map(|q| {
             q.iter()
                 .map(|(name, amount)| {
                     let amount = match amount {
@@ -1361,8 +1391,8 @@ fn requirements(resources: &DataPlaneResources) -> ResourceRequirements {
         })
     };
     ResourceRequirements {
-        limits: quantities(&resources.limits),
-        requests: quantities(&resources.requests),
+        limits: quantities(limits),
+        requests: quantities(requests),
         ..ResourceRequirements::default()
     }
 }

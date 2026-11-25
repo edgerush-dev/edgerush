@@ -35,7 +35,7 @@ use edgerush_planes::platform_defaults::PlatformDefaults;
 use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
-use k8s_openapi::api::core::v1::{Namespace, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::IngressClass;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
@@ -218,6 +218,7 @@ struct Children {
     cluster_role_bindings: Followed<ClusterRoleBinding>,
     deployments: Followed<Deployment>,
     services: Followed<Service>,
+    config_maps: Followed<ConfigMap>,
     autoscalers: Followed<HorizontalPodAutoscaler>,
     disruption_budgets: Followed<PodDisruptionBudget>,
     ingress_classes: Followed<IngressClass>,
@@ -238,6 +239,7 @@ impl Children {
             each(&self.role_bindings, &mut children),
             each(&self.cluster_role_bindings, &mut children),
             each(&self.services, &mut children),
+            each(&self.config_maps, &mut children),
             each(&self.autoscalers, &mut children),
             each(&self.disruption_budgets, &mut children),
             each(&self.ingress_classes, &mut children),
@@ -285,6 +287,7 @@ pub async fn operate(
         cluster_role_bindings: followed(&mut tasks, &api, made.clone(), &changed, &say),
         deployments: followed(&mut tasks, &api, made.clone(), &changed, &say),
         services: followed(&mut tasks, &api, made.clone(), &changed, &say),
+        config_maps: followed(&mut tasks, &api, made.clone(), &changed, &say),
         autoscalers: followed(&mut tasks, &api, made.clone(), &changed, &say),
         disruption_budgets: followed(&mut tasks, &api, made.clone(), &changed, &say),
         ingress_classes: followed(&mut tasks, &api, made.clone(), &changed, &say),

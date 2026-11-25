@@ -133,7 +133,7 @@ data_plane() {
 
 # What is to be admitted.
 admitted "a ControlPlane of every default" "$(control_plane payments)"
-admitted "a ControlPlane of the longest name" "$(control_plane "$(name 43)")"
+admitted "a ControlPlane of the longest name" "$(control_plane "$(name 38)")"
 admitted "a ControlPlane watching what it selects" "$(control_plane payments 'spec:
   watch: { namespaces: { from: Selector, selector: { matchLabels: { team: payments } } } }
   replicas: 2
@@ -173,7 +173,7 @@ done
 
 # What the ControlPlane's rules refuse.
 refused "a ControlPlane whose name is no DNS label" "must be a DNS label" "$(control_plane pay.ments)"
-refused "a ControlPlane of a name too long for its Service's" "at most 43" "$(control_plane "$(name 44)")"
+refused "a ControlPlane of a name too long for its Services'" "at most 38" "$(control_plane "$(name 39)")"
 refused "a ControlPlane selecting without a selector" "selector must be given" "$(control_plane payments 'spec: { watch: { namespaces: { from: Selector } } }')"
 refused "a ControlPlane of its own namespace with a selector" "selector must be given" "$(control_plane payments 'spec: { watch: { namespaces: { selector: { matchLabels: { a: b } } } } }')"
 refused "a ControlPlane of no replicas" "spec.replicas" "$(control_plane payments 'spec: { replicas: 0 }')"

@@ -282,7 +282,7 @@ fn every_case_makes_its_objects() {
     }
     assert_eq!(
         kinds.len(),
-        11,
+        12,
         "a kind the operator makes is in no case: {kinds:?}"
     );
 }

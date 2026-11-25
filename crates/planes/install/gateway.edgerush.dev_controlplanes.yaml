@@ -31,10 +31,10 @@ spec:
           it. The operator deploys it, gives it the rights of its scope, and makes the
           GatewayClass named as it is.
 
-          Its name is a DNS label of at most 43 characters, so that its controller's Service,
-          `edgerush-controller-<name>`, is a DNS label too. It is unique in the cluster: the
-          oldest ControlPlane of a name holds it, and a later one of the same name in another
-          namespace is not accepted.
+          Its name is a DNS label of at most 38 characters, so that its Services are DNS
+          labels too, the longest its rate-limiting service's `edgerush-ratelimit-<name>-peers`.
+          It is unique in the cluster: the oldest ControlPlane of a name holds it, and a later
+          one of the same name in another namespace is not accepted.
         properties:
           apiVersion:
             description: |-
@@ -114,8 +114,8 @@ spec:
                       maxKeyBytes:
                         description: |-
                           MaxKeyBytes is what the keys may take in each pod's memory: past it,
-                          keys are evicted, and start again full. Three quarters of the pods'
-                          memory limit unless said, and with no memory limit 268,435,456 (256 MiB).
+                          keys are evicted, and start again full. Half the pods' memory limit
+                          unless said, and with no memory limit 268,435,456 (256 MiB).
                         format: int64
                         minimum: 1
                         type: integer
@@ -413,8 +413,8 @@ spec:
             type: object
         type: object
         x-kubernetes-validations:
-        - message: the name of a ControlPlane must be a DNS label of at most 43 lower-case letters, digits and '-', starting and ending with a letter or digit, as its controller's Service, edgerush-controller-<name>, is a DNS label
-          rule: size(self.metadata.name) <= 43 && self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        - message: the name of a ControlPlane must be a DNS label of at most 38 lower-case letters, digits and '-', starting and ending with a letter or digit, as its Services, the longest edgerush-ratelimit-<name>-peers, are DNS labels
+          rule: size(self.metadata.name) <= 38 && self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
     served: true
     storage: true
     subresources:
