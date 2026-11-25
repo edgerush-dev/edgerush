@@ -139,8 +139,8 @@ pub enum RateLimitMode {
 
 /// How a request waits for its key's owner in the synchronous mode, and what decides it
 /// when the owner does not answer ([06 §4](../../../docs/06-rate-limiting.md)). Every
-/// field is required: how a data plane behaves when its owners are out of reach is the
-/// operator's to say.
+/// field but `timeouts_before_reconnect` is required: how a data plane behaves when its
+/// owners are out of reach is the operator's to say.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -152,6 +152,13 @@ pub struct RateLimitSynchronous {
     /// What decides a request whose owner does not answer in time, or whose breaker is
     /// open.
     pub when_unreachable: WhenUnreachable,
+    /// Timeouts in a row on a worker's own connection to a pod, with no answer read on it
+    /// between, after which that worker asks the pod on a new connection, still reading the
+    /// old one a while for answers that come late; 2 when left out. It marks the pod down
+    /// for no one.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub timeouts_before_reconnect: Option<u32>,
     /// When the data plane stops asking an owner that does not answer, and when it tries
     /// it again.
     pub breaker: RateLimitBreaker,

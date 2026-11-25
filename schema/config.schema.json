@@ -1338,7 +1338,7 @@
       ]
     },
     "RateLimitSynchronous": {
-      "description": "How a request waits for its key's owner in the synchronous mode, and what decides it\nwhen the owner does not answer. Every\nfield is required: how a data plane behaves when its owners are out of reach is the\noperator's to say.",
+      "description": "How a request waits for its key's owner in the synchronous mode, and what decides it\nwhen the owner does not answer. Every\nfield but `timeouts_before_reconnect` is required: how a data plane behaves when its\nowners are out of reach is the operator's to say.",
       "type": "object",
       "properties": {
         "breaker": {
@@ -1349,6 +1349,16 @@
           "description": "Milliseconds a request waits for its owner's answer before `when_unreachable`\ndecides it.",
           "type": "integer",
           "format": "uint64",
+          "minimum": 1
+        },
+        "timeouts_before_reconnect": {
+          "description": "Timeouts in a row on a worker's own connection to a pod, with no answer read on it\nbetween, after which that worker asks the pod on a new connection, still reading the\nold one a while for answers that come late; 2 when left out. It marks the pod down\nfor no one.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
           "minimum": 1
         },
         "when_unreachable": {

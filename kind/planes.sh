@@ -34,8 +34,9 @@
 #     ingress, or two entries of one class; rate limiting of a mode the DataPlane does not
 #     take or of none, a bound on keys with it disabled, the synchronous mode without how
 #     a request waits or that given in another mode, a wait without what decides an owner
-#     unheard, that in lower case, or of no time, a breaker opened by no failure or never
-#     tried again, the asynchronous mode's settings in another or a cycle of no time, a
+#     unheard, that in lower case, or of no time, a reconnect after no timeout, a breaker
+#     opened by no failure or never tried again, the asynchronous mode's settings in
+#     another or a cycle of no time, a
 #     limit of no model or of two, keyed by what it does not know, a rate or a
 #     window of no unit, a rolling window of one slot, a method in lower case, a path
 #     prefix that is no path, and two limits of one name; a RateLimitPolicy of no target or
@@ -282,6 +283,10 @@ admitted "a DataPlane limiting synchronously" "$(limiting "
     maxKeyBytes: 1048576
     synchronous: $waits
     global: [{ name: per-client, key: Client, model: { bucket: { rate: 100/s, burst: 200 } } }]")"
+reconnect=$(k apply --dry-run=server -o jsonpath='{.spec.rateLimiting.synchronous.timeoutsBeforeReconnect}' -f - <<<"$(limiting "{ mode: Synchronous, synchronous: $waits }")")
+[ "$reconnect" = 2 ] || fail "a synchronous wait left to its default reconnects after $reconnect"
+pass "a synchronous wait left to its default reconnects after two timeouts in a row"
+admitted "a synchronous wait reconnecting after one timeout" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, timeoutsBeforeReconnect: 1, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
 admitted "a DataPlane limiting asynchronously, of every default" "$(limiting '{ mode: Asynchronous }')"
 admitted "a DataPlane limiting asynchronously, of each setting" "$(limiting '{ mode: Asynchronous, asynchronous: { cycleMs: 20, pollQuietKeys: true, scheduleKeys: false } }')"
 refused "a rate-limiting mode the DataPlane does not take" "spec.rateLimiting.mode" "$(limiting '{ mode: Off }')"
@@ -292,6 +297,7 @@ refused "how a request waits for its owner, in another mode" "synchronous must b
 refused "a synchronous wait without what decides an owner unheard" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
 refused "what decides an owner unheard, in lower case" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: allow, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
 refused "a wait for the owner of no time" "spec.rateLimiting.synchronous.timeoutMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 0, whenUnreachable: Allow, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
+refused "a reconnect after no timeout" "spec.rateLimiting.synchronous.timeoutsBeforeReconnect" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, timeoutsBeforeReconnect: 0, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
 refused "a breaker opened by no failure" "spec.rateLimiting.synchronous.breaker.failures" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, breaker: { failures: 0, probeAfterMs: 1000 } } }')"
 refused "a breaker never tried again" "spec.rateLimiting.synchronous.breaker.probeAfterMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, breaker: { failures: 5 } } }')"
 refused "the asynchronous mode's settings in another" "asynchronous is for the Asynchronous mode alone" "$(limiting "{ mode: Synchronous, synchronous: $waits, asynchronous: { cycleMs: 20 } }")"

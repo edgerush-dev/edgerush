@@ -151,6 +151,9 @@ pub struct CompiledSynchronous {
     pub timeout: Duration,
     /// What decides a request whose owner does not answer in time.
     pub when_unreachable: crate::WhenUnreachable,
+    /// Timeouts in a row on a worker's own connection to a pod after which it asks the pod
+    /// on a new one; at least 1.
+    pub timeouts_before_reconnect: u32,
     /// Failures in a row that open an owner's breaker.
     pub breaker_failures: u32,
     /// How long an owner's breaker stays open before the owner is tried again.
@@ -159,6 +162,11 @@ pub struct CompiledSynchronous {
     pub max_key_bytes: u64,
     /// Mutual TLS to the pods, if they are reached so.
     pub tls: Option<CompiledServiceTls>,
+}
+
+impl CompiledSynchronous {
+    /// What `timeouts_before_reconnect` is when left out.
+    const TIMEOUTS_BEFORE_RECONNECT: u32 = 2;
 }
 
 /// The 128 bits the service's keys are hashed under (`rate_limiting.service.key_secret`), as the
@@ -842,6 +850,10 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
         (Some(waiting), true) => {
             let never = [
                 ("timeout_ms", waiting.timeout_ms == 0),
+                (
+                    "timeouts_before_reconnect",
+                    waiting.timeouts_before_reconnect == Some(0),
+                ),
                 ("breaker.failures", waiting.breaker.failures == 0),
                 (
                     "breaker.probe_after_ms",
@@ -880,6 +892,9 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
                     key_secret,
                     timeout: Duration::from_millis(waiting.timeout_ms),
                     when_unreachable: waiting.when_unreachable,
+                    timeouts_before_reconnect: waiting
+                        .timeouts_before_reconnect
+                        .unwrap_or(CompiledSynchronous::TIMEOUTS_BEFORE_RECONNECT),
                     breaker_failures: waiting.breaker.failures,
                     probe_after: Duration::from_millis(waiting.breaker.probe_after_ms),
                     max_key_bytes,
@@ -7151,11 +7166,27 @@ upstreams: {}
                 key_secret: KeySecret([0x0011_2233_4455_6677, 0x8899_aabb_ccdd_eeff]),
                 timeout: Duration::from_millis(20),
                 when_unreachable: crate::WhenUnreachable::Allow,
+                timeouts_before_reconnect: 2,
                 breaker_failures: 5,
                 probe_after: Duration::from_secs(1),
                 max_key_bytes: 1000,
                 tls: None,
             }))
+        );
+        // Said, it is taken as said; left out, as above, it is 2.
+        let said = with(&format!(
+            r#"rate_limiting: {{ mode: synchronous, service: {{ addresses: ["rl-0:7000"], key_secret: {SECRET} }}, {} }}"#,
+            WAITS.replace("allow, ", "allow, timeouts_before_reconnect: 5, ")
+        ));
+        assert!(
+            matches!(
+                said,
+                Ok(CompiledRateLimiting::Synchronous(CompiledSynchronous {
+                    timeouts_before_reconnect: 5,
+                    ..
+                }))
+            ),
+            "{said:?}"
         );
         // The mode is always written: a section saying nothing would leave it implied.
         let unsaid: Result<Config, _> =
@@ -7400,6 +7431,11 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}, key_s
         }
         for (field, said, zero) in [
             ("timeout_ms", "timeout_ms: 20", "timeout_ms: 0"),
+            (
+                "timeouts_before_reconnect",
+                "allow, ",
+                "allow, timeouts_before_reconnect: 0, ",
+            ),
             ("breaker.failures", "failures: 5", "failures: 0"),
             (
                 "breaker.probe_after_ms",
@@ -7441,7 +7477,8 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}, key_s
                 "{when}"
             );
         }
-        // Every field is required, and an owner out of reach is decided by one of three.
+        // Every field but `timeouts_before_reconnect` (not in `WAITS`) is required, and an
+        // owner out of reach is decided by one of three.
         let parses = |waits: &str| {
             let yaml = format!(
                 "listeners: {{}}\nroutes: []\nupstreams: {{}}\nrate_limiting: {{ mode: synchronous, {service}, {waits} }}\n"

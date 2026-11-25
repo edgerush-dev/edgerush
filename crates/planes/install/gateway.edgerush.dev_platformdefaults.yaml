@@ -454,8 +454,8 @@ spec:
                               description: |-
                                 Synchronous is how a request waits for its key's owner, and what decides
                                 it when the owner does not answer: what the Synchronous mode needs, and
-                                no other takes. Every field is required, as how a proxy behaves when its
-                                owners are out of reach is the DataPlane's to say.
+                                no other takes. Every field but TimeoutsBeforeReconnect is required, as how
+                                a proxy behaves when its owners are out of reach is the DataPlane's to say.
                               properties:
                                 breaker:
                                   description: |-
@@ -487,6 +487,16 @@ spec:
                                     TimeoutMs is milliseconds a request waits for its owner's answer before
                                     WhenUnreachable decides it.
                                   format: int64
+                                  minimum: 1.0
+                                  type: integer
+                                timeoutsBeforeReconnect:
+                                  default: 2
+                                  description: |-
+                                    TimeoutsBeforeReconnect is timeouts in a row on a proxy worker's own
+                                    connection to a pod, no answer read on it between, after which that
+                                    worker asks the pod on a new connection, still reading the old one a
+                                    while for answers that come late. It marks the pod down for no one.
+                                  format: int32
                                   minimum: 1.0
                                   type: integer
                                 whenUnreachable:

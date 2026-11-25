@@ -13,6 +13,12 @@
 //! another member, chosen by the key, which forwards it. One unanswered in time leaves the
 //! request to `when_unreachable`, and is never asked again: it may have been counted.
 //!
+//! A worker whose asks time out `timeouts_before_reconnect` times in a row on its connection
+//! to a pod, no answer read on it between, asks the pod on a new connection, so that a
+//! connection stuck on its own is not kept: the old one is still read until its asks' waits
+//! are over and a while past, so that an admission that comes late is given back, and one
+//! connection drains at a time. That marks the pod down for no one.
+//!
 //! The process keeps a breaker for each member, which its workers share: after `failures` in
 //! a row it opens, and every worker sends that member's keys through another at once. A
 //! thread of the process's own probes it after `probe_after`, opening a stream of its own: the
@@ -58,6 +64,11 @@ const PROBE_WAIT: Duration = Duration::from_secs(1);
 /// later than this after their time.
 const PROBE_LOOK: Duration = Duration::from_millis(50);
 
+/// How long a connection given up for a new one is still read past the longest any ask on
+/// it may wait: the asks on it have all given up by then, and an admission of theirs that
+/// comes this late is not given back.
+const DRAINING: Duration = Duration::from_secs(1);
+
 /// How many times one key of a request is sent at most: its owner, then the owner a newer
 /// table names, or another member for one not serving or out of reach. Past it, the key is
 /// out of reach.
@@ -84,13 +95,15 @@ pub(crate) struct Process {
 }
 
 /// A seed or a member of the store, as a process's workers share it: where it is reached,
-/// the member there if a table has named it, its breaker, and what was asked of it.
+/// the member there if a table has named it, its breaker, what was asked of it, and how
+/// often its workers gave a connection to it up for a new one.
 #[derive(Debug)]
 struct Member {
     address: String,
     id: Option<NodeId>,
     breaker: Arc<Breaker>,
     asks: Arc<OwnerAsks>,
+    reconnects: Arc<Sharded<Counter>>,
 }
 
 /// What a process's workers' asks of one member came to.
@@ -185,13 +198,16 @@ impl Process {
     /// (decided: one a member).
     fn member_at(&self, address: &str, id: Option<NodeId>) -> Arc<Member> {
         let mut members = self.members();
-        let (breaker, asks) = match members.get(address) {
+        let (breaker, asks, reconnects) = match members.get(address) {
             Some(found) if id.is_none() || found.id == id => return Arc::clone(found),
-            Some(found) if found.id.is_none() => {
-                (Arc::clone(&found.breaker), Arc::clone(&found.asks))
-            }
+            Some(found) if found.id.is_none() => (
+                Arc::clone(&found.breaker),
+                Arc::clone(&found.asks),
+                Arc::clone(&found.reconnects),
+            ),
             _ => (
                 Arc::new(Breaker::default()),
+                Arc::new(Sharded::new(self.workers)),
                 Arc::new(Sharded::new(self.workers)),
             ),
         };
@@ -200,6 +216,7 @@ impl Process {
             id,
             breaker,
             asks,
+            reconnects,
         });
         members.insert(address.to_owned(), Arc::clone(&member));
         member
@@ -234,8 +251,8 @@ impl Process {
             .map_or_else(Usage::default, |local| local.usage())
     }
 
-    /// What its members' asks came to, their breakers, and what was left to
-    /// `when_unreachable`, as metrics: each member labelled by its address, which a pod keeps
+    /// What its members' asks came to, their breakers, their workers' reconnects, and what was
+    /// left to `when_unreachable`, as metrics: each member labelled by its address, which a pod keeps
     /// for its life, rather than its id, new each life.
     pub(crate) fn render_stats(&self) -> String {
         let members: Vec<Arc<Member>> = self.members().values().cloned().collect();
@@ -258,6 +275,15 @@ impl Process {
                 "edgerush_rate_limit_owner_breaker_open{{pod=\"{}\"}} {}",
                 member.address,
                 u8::from(member.breaker.is_open())
+            );
+        }
+        out.push_str("# TYPE edgerush_rate_limit_pod_reconnects_total counter\n");
+        for member in &members {
+            let count: u64 = member.reconnects.sum(Counter::get);
+            let _ = writeln!(
+                out,
+                "edgerush_rate_limit_pod_reconnects_total{{pod=\"{}\"}} {count}",
+                member.address
             );
         }
         out.push_str("# TYPE edgerush_rate_limit_owner_breaker_trips_total counter\n");
@@ -444,7 +470,15 @@ enum Link {
     /// Being opened, with what is to go up once it is.
     Opening(u64, Vec<Asking>),
     /// Open.
-    Up(u64, mpsc::Sender<Asking>),
+    Up(Connection),
+}
+
+/// An open connection to a pod, of its generation: dropped, its way up closes and the task
+/// reading its answers stops.
+struct Connection {
+    generation: u64,
+    up: mpsc::Sender<Asking>,
+    _reading: oneshot::Sender<()>,
 }
 
 /// What waits on a pod's answer, by the number of the ask.
@@ -465,6 +499,11 @@ struct Stream {
     /// The generation the next connection opened gets.
     next: Cell<u64>,
     waiting: RefCell<HashMap<u64, (u64, Waiter)>>,
+    /// Asks timed out in a row on the open connection, with no answer read on it between.
+    timeouts: Cell<u32>,
+    /// A connection given up for a new one, still read for answers that come late, so that
+    /// a late admission is given back: one at a time.
+    draining: RefCell<Option<Connection>>,
 }
 
 impl Stream {
@@ -474,11 +513,11 @@ impl Stream {
     fn send(self: &Rc<Self>, message: Asking, limiter: &Weak<SyncLimiter>) -> Option<u64> {
         let mut link = self.link.borrow_mut();
         match &mut *link {
-            Link::Up(generation, up) => match up.try_send(message) {
-                Ok(()) => Some(*generation),
+            Link::Up(connection) => match connection.up.try_send(message) {
+                Ok(()) => Some(connection.generation),
                 Err(mpsc::error::TrySendError::Full(_)) => None,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    let generation = *generation;
+                    let generation = connection.generation;
                     *link = Link::Down;
                     drop(link);
                     self.broke(generation, Gone::Broken);
@@ -533,7 +572,12 @@ impl Stream {
     /// breaker is open.
     fn shut(&self) {
         let was = std::mem::replace(&mut *self.link.borrow_mut(), Link::Down);
-        if let Link::Opening(generation, _) | Link::Up(generation, _) = was {
+        let generation = match &was {
+            Link::Opening(generation, _) => Some(*generation),
+            Link::Up(connection) => Some(connection.generation),
+            Link::Down => None,
+        };
+        if let Some(generation) = generation {
             self.broke(generation, Gone::of(&was));
         }
     }
@@ -542,13 +586,94 @@ impl Stream {
     /// the stream is down if it is still the one it has, and what waited on it is told.
     fn ended(&self, generation: u64, why: Gone) {
         let mut link = self.link.borrow_mut();
-        if let Link::Opening(current, _) | Link::Up(current, _) = &*link
-            && *current == generation
-        {
+        let current = match &*link {
+            Link::Opening(current, _) => Some(*current),
+            Link::Up(connection) => Some(connection.generation),
+            Link::Down => None,
+        };
+        if current == Some(generation) {
             *link = Link::Down;
         }
         drop(link);
+        if self.is_draining(generation) {
+            *self.draining.borrow_mut() = None;
+        }
         self.broke(generation, why);
+    }
+
+    /// The generation of the connection open now, if one is.
+    fn open_now(&self) -> Option<u64> {
+        match &*self.link.borrow() {
+            Link::Up(connection) => Some(connection.generation),
+            Link::Opening(..) | Link::Down => None,
+        }
+    }
+
+    /// An answer read on the connection of `generation`: if it is the one open, its
+    /// timeouts in a row start again.
+    fn answered(&self, generation: u64) {
+        if self.open_now() == Some(generation) {
+            self.timeouts.set(0);
+        }
+    }
+
+    /// An ask on the connection of `generation` timed out: whether that gave it up. The
+    /// `after`th in a row on the one open gives it up for a new one, which the next ask opens, unless another is still
+    /// draining: the one given up is read on for `draining` more, for answers that come
+    /// late, then let go of. The pod is marked down for no one: a worker too far behind to
+    /// read its answers in time reconnects too, its asks answered as before. A timeout on a
+    /// connection still opening counts for nothing, as one is new already (one whose pod never
+    /// answers is dropped by its keepalive), nor does one on a connection no longer open.
+    fn timed_out(self: &Rc<Self>, generation: u64, after: u32, draining: Duration) -> bool {
+        if self.open_now() != Some(generation) {
+            return false;
+        }
+        let timeouts = self.timeouts.get().saturating_add(1);
+        self.timeouts.set(timeouts);
+        if timeouts < after || self.draining.borrow().is_some() {
+            return false;
+        }
+        let Link::Up(connection) = std::mem::replace(&mut *self.link.borrow_mut(), Link::Down)
+        else {
+            return false;
+        };
+        *self.draining.borrow_mut() = Some(connection);
+        self.timeouts.set(0);
+        let stream = Rc::downgrade(self);
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(draining).await;
+            if let Some(stream) = stream.upgrade() {
+                stream.drained(generation);
+            }
+        });
+        true
+    }
+
+    /// Whether the connection of `generation` is the one draining.
+    fn is_draining(&self, generation: u64) -> bool {
+        self.draining
+            .borrow()
+            .as_ref()
+            .is_some_and(|connection| connection.generation == generation)
+    }
+
+    /// Lets go of the connection of `generation` if it is the one draining: what still waits
+    /// on it hears that it broke, and late answers to asks given up on are no longer read.
+    fn drained(&self, generation: u64) {
+        if !self.is_draining(generation) {
+            return;
+        }
+        *self.draining.borrow_mut() = None;
+        self.broke(generation, Gone::Broken);
+    }
+
+    /// Whether nothing waits on the connection of `generation`.
+    fn idle(&self, generation: u64) -> bool {
+        !self
+            .waiting
+            .borrow()
+            .values()
+            .any(|(on, _)| *on == generation)
     }
 }
 
@@ -566,7 +691,7 @@ async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64)
     let Some(held) = stream.upgrade() else {
         return;
     };
-    let mut down = match opened {
+    let (mut down, mut let_go) = match opened {
         Ok(opened) => {
             let mut link = held.link.borrow_mut();
             let Link::Opening(current, _) = &*link else {
@@ -575,8 +700,13 @@ async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64)
             if *current != generation {
                 return;
             }
-            let Link::Opening(_, queued) =
-                std::mem::replace(&mut *link, Link::Up(generation, opened.up.clone()))
+            let (reading, let_go) = oneshot::channel();
+            let connection = Connection {
+                generation,
+                up: opened.up.clone(),
+                _reading: reading,
+            };
+            let Link::Opening(_, queued) = std::mem::replace(&mut *link, Link::Up(connection))
             else {
                 return;
             };
@@ -586,7 +716,7 @@ async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64)
                     break;
                 }
             }
-            opened.down
+            (opened.down, let_go)
         }
         Err(_) => {
             held.ended(generation, Gone::Unreached);
@@ -595,7 +725,11 @@ async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64)
     };
     drop(held);
     loop {
-        let message = down.message().await;
+        let message = tokio::select! {
+            message = down.message() => message,
+            // Let go of: what waited on it was told, and nothing more is read.
+            _ = &mut let_go => return,
+        };
         let (Some(held), Some(worker)) = (stream.upgrade(), limiter.upgrade()) else {
             return;
         };
@@ -610,6 +744,7 @@ async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64)
         let Ok(Told::Answer { id, answer }) = worker.plane.borrow_mut().told(told) else {
             continue;
         };
+        held.answered(generation);
         let waiter = held
             .waiting
             .borrow_mut()
@@ -624,6 +759,11 @@ async fn open(stream: Weak<Stream>, limiter: Weak<SyncLimiter>, generation: u64)
                 worker.give_back(key, rule, receipt);
             }
             (Some(Waiter::GivenUp(..)) | None, _) => {}
+        }
+        // Draining, and its last answer read: let go of at once. Only a connection draining
+        // looks through what waits, never the one open.
+        if held.is_draining(generation) && held.idle(generation) {
+            held.drained(generation);
         }
     }
 }
@@ -752,6 +892,8 @@ impl SyncLimiter {
                         link: RefCell::new(Link::Down),
                         next: Cell::new(0),
                         waiting: RefCell::new(HashMap::new()),
+                        timeouts: Cell::new(0),
+                        draining: RefCell::new(None),
                     })
                 }),
         )
@@ -818,6 +960,17 @@ impl SyncLimiter {
         };
         if let Some(member) = member {
             self.process.asked(&member, how);
+        }
+    }
+
+    /// Counts a connection to `to` given up for a new one.
+    fn reconnected(&self, to: To) {
+        let member = match to {
+            To::Member(id) => self.member(id),
+            To::Seed(at) => self.seeds.get(at).cloned(),
+        };
+        if let Some(member) = member {
+            member.reconnects.local().inc();
         }
     }
 
@@ -1157,6 +1310,14 @@ impl Asked {
                         Ended::TimedOut
                     };
                     self.limiter.asked(sent.to, how);
+                    let config = &self.limiter.process.config;
+                    if sent.stream.timed_out(
+                        sent.generation,
+                        config.timeouts_before_reconnect,
+                        config.timeout.saturating_add(DRAINING),
+                    ) {
+                        self.limiter.reconnected(sent.to);
+                    }
                     unreached = Some(Undecided::Timeout);
                     given_up.push((sent, part.key, part.held.rule));
                     out_of_reach.push(part);
@@ -1304,6 +1465,7 @@ mod tests {
             key_secret: KeySecret([1, 2]),
             timeout: Duration::from_millis(timeout_ms),
             when_unreachable: WhenUnreachable::Deny,
+            timeouts_before_reconnect: 2,
             breaker_failures: 1,
             probe_after: Duration::from_secs(60),
             max_key_bytes: 1 << 20,
@@ -1397,6 +1559,89 @@ mod tests {
         let seen = breaker.opened.load(std::sync::atomic::Ordering::Relaxed);
         assert!(breaker.rearm(seen, 40), "as it was seen");
         assert!(breaker.is_open());
+    }
+
+    /// A stream to a pod, open on a connection of generation `generation`, with what that
+    /// connection's reader would hear when it is let go of.
+    fn stream_up(generation: u64) -> (std::rc::Rc<super::Stream>, oneshot::Receiver<()>) {
+        use std::cell::{Cell, RefCell};
+        let stream = std::rc::Rc::new(super::Stream {
+            address: "rl-0:7000".to_owned(),
+            dial: edgerush_ratelimit_service::cluster::link::Dial::Plain,
+            link: RefCell::new(super::Link::Down),
+            next: Cell::new(generation.wrapping_add(1)),
+            waiting: RefCell::new(std::collections::HashMap::new()),
+            timeouts: Cell::new(0),
+            draining: RefCell::new(None),
+        });
+        let let_go = reopen(&stream, generation);
+        (stream, let_go)
+    }
+
+    /// Opens connection `generation` on `stream`, as the next ask would.
+    fn reopen(stream: &super::Stream, generation: u64) -> oneshot::Receiver<()> {
+        let (up, _) = tokio::sync::mpsc::channel(1);
+        let (reading, let_go) = oneshot::channel();
+        *stream.link.borrow_mut() = super::Link::Up(super::Connection {
+            generation,
+            up,
+            _reading: reading,
+        });
+        let_go
+    }
+
+    /// The second timeout in a row on the connection open gives it up: the next ask opens
+    /// another, and the one given up is read until its bound, then let go of, what still
+    /// waited on it told it broke. While it drains, timeouts on the next give up nothing; a
+    /// timeout on a connection no longer open counts for nothing, and an answer starts the
+    /// count again.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_given_up_is_drained_until_its_bound_one_at_a_time() {
+        use super::{Link, Waiter};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let bound = Duration::from_secs(1);
+                let (stream, mut first) = stream_up(0);
+                assert!(!stream.timed_out(0, 2, bound));
+                stream.answered(0);
+                assert!(!stream.timed_out(0, 2, bound));
+                assert_eq!(stream.open_now(), Some(0), "an answer between");
+                let (asked, mut answer) = oneshot::channel();
+                stream
+                    .waiting
+                    .borrow_mut()
+                    .insert(1, (0, Waiter::Asked(asked)));
+                assert!(stream.timed_out(0, 2, bound));
+                assert!(matches!(*stream.link.borrow(), Link::Down), "given up");
+                assert!(stream.is_draining(0));
+                let empty = Err(oneshot::error::TryRecvError::Empty);
+                assert_eq!(first.try_recv(), empty, "still read");
+                assert!(matches!(
+                    answer.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                let mut second = reopen(&stream, 1);
+                assert!(!stream.timed_out(0, 2, bound));
+                assert!(!stream.timed_out(1, 2, bound));
+                assert!(!stream.timed_out(1, 2, bound));
+                assert!(!stream.timed_out(1, 2, bound));
+                assert_eq!(stream.open_now(), Some(1), "one draining at a time");
+                tokio::time::sleep(bound - Duration::from_millis(1)).await;
+                assert!(stream.is_draining(0), "until its bound");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                assert!(!stream.is_draining(0), "let go of at its bound");
+                assert!(matches!(
+                    first.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+                assert!(matches!(answer.try_recv(), Ok(Err(Gone::Broken))));
+                assert!(stream.waiting.borrow().is_empty());
+                assert!(stream.timed_out(1, 2, bound));
+                assert!(stream.is_draining(1), "none draining: given up now");
+                assert_eq!(second.try_recv(), empty, "and read");
+            })
+            .await;
     }
 
     /// A failure at time 0 still opens it: a time of 0 is not taken for closed.

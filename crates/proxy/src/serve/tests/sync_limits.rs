@@ -962,8 +962,15 @@ impl GatedRelay {
 /// connection to it goes through the relay: formed, then with every connection forming made
 /// forgotten. Served plain, or with `tls`.
 async fn behind_a_relay(tls: Option<SecuredPods>) -> (Store, GatedRelay) {
+    let (store, relay, _) = behind_a_relay_reached(tls).await;
+    (store, relay)
+}
+
+/// The same, and where the pod itself is reached, past the relay, to be asked directly.
+async fn behind_a_relay_reached(tls: Option<SecuredPods>) -> (Store, GatedRelay, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let relay = GatedRelay::to(listener.local_addr().unwrap()).await;
+    let direct = listener.local_addr().unwrap();
+    let relay = GatedRelay::to(direct).await;
     let store = Store::formed(
         vec![(listener, relay.address.clone())],
         &store_config(),
@@ -973,7 +980,7 @@ async fn behind_a_relay(tls: Option<SecuredPods>) -> (Store, GatedRelay) {
     store.stop_forming();
     tokio::time::sleep(Duration::from_millis(50)).await;
     relay.forget();
-    (store, relay)
+    (store, relay, direct.to_string())
 }
 
 /// An open breaker is probed after `probe_after`: once its pod is back and tells its table on
@@ -1758,6 +1765,161 @@ async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
                 assert!(Instant::now() < deadline, "the limiter outlived its mode");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        })
+        .await;
+}
+
+/// The name of the metric of the times a worker gave a connection to the pod at `address`
+/// up for a new one.
+fn reconnects(address: &str) -> String {
+    format!(r#"edgerush_rate_limit_pod_reconnects_total{{pod="{address}"}}"#)
+}
+
+/// `config` for a worker behind `relay`, one limit of a bucket of `burst`, waiting
+/// `timeout_ms` and denying what is out of reach, with a breaker that the tests' few timeouts
+/// never open: `timeouts_before_reconnect` left out, at 2.
+fn reconnecting(upstream: SocketAddr, relay: &GatedRelay, burst: u64, timeout_ms: u64) -> Config {
+    with_breaker(
+        synchronous_in(
+            everything_config(upstream),
+            &[("per-client", burst)],
+            std::slice::from_ref(&relay.address),
+            timeout_ms,
+            "deny",
+        ),
+        100,
+        60_000,
+    )
+}
+
+/// A worker whose asks time out twice in a row on its connection asks on a new one, and its
+/// requests are answered again, the pod marked down for no one. The connection given up is
+/// still read: the admissions its pod sent too late are given back when they come, and once
+/// the last is read it is let go of, before its asks' waits and a second past are over. (The
+/// gate is shut for well under the connection's keepalive, 1 s, which would drop it.)
+#[tokio::test]
+async fn a_connection_that_keeps_timing_out_is_replaced_and_drained() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay, direct) = behind_a_relay_reached(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = reconnecting(upstream, &relay, 5, 300);
+            let (_, key) = keys_of(&config).remove(0);
+            let (proxy, mut sends) = serving(&config, 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(0, false);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            assert_eq!(relay.accepted(), 1, "one timeout: the same connection");
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            let replaced = Instant::now();
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 2, "a new connection after the second");
+            let scrape = proxy.metrics();
+            assert_eq!(
+                metric(
+                    &scrape,
+                    &format!(
+                        r#"edgerush_rate_limit_owner_breaker_open{{pod="{}"}}"#,
+                        relay.address
+                    )
+                ),
+                Some(0),
+                "down for no one: {scrape}"
+            );
+            assert_eq!(metric(&scrape, &reconnects(&relay.address)), Some(1));
+            // The two late admissions come through on connection 0, and it is let go of.
+            relay.gate(0, true);
+            while !relay.has_ended(0) {
+                assert!(
+                    replaced.elapsed() < Duration::from_millis(1_000),
+                    "connection 0 kept until its bound (1.3 s), or for good"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!relay.has_ended(1), "the new one carries on");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Charged for the two answered alone: the late two given back.
+            assert_eq!(ask_directly(&direct, &key, 5).await, 3);
+        })
+        .await;
+}
+
+/// An answer read between two timeouts starts the count again: a timeout, an answer, a
+/// timeout keeps the connection; a second timeout in a row replaces it.
+#[tokio::test]
+async fn an_answer_between_timeouts_keeps_the_connection() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let (proxy, mut sends) = serving(&reconnecting(upstream, &relay, 100, 100), 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(0, false);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            relay.gate(0, true);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(0, false);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            // Kept: this one goes on connection 0 too, and times out.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            assert_eq!(relay.accepted(), 1, "the count began again at the answer");
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 2, "two in a row: replaced");
+            assert_eq!(
+                metric(&proxy.metrics(), &reconnects(&relay.address)),
+                Some(1)
+            );
+        })
+        .await;
+}
+
+/// One connection drains at a time: while the one given up is still read, timeouts on its
+/// replacement open no third; once it is gone (at its bound, or dropped by its keepalive
+/// first, its gate shut; the bound alone is the unit tests'), two timeouts in a row replace
+/// the second.
+#[tokio::test]
+async fn one_connection_drains_at_a_time() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let (proxy, mut sends, fronts) =
+                serving_at(&reconnecting(upstream, &relay, 100, 100), 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(0, false);
+            assert_eq!(statuses(&send_round(&mut sends, 2).await), [503, 503]);
+            let replaced = Instant::now();
+            // Connection 1 opens and answers (one still opening is new already, and its
+            // timeouts count for nothing), then holds its answers too.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(1, false);
+            assert_eq!(statuses(&send_round(&mut sends, 3).await), [503, 503, 503]);
+            assert!(
+                replaced.elapsed() < Duration::from_millis(1_100),
+                "still draining: {:?}",
+                replaced.elapsed()
+            );
+            assert_eq!(relay.accepted(), 2, "no third while the first drains");
+            // Connection 1 answers meanwhile, so that its keepalive keeps it, and its count
+            // begins again; connection 0, still shut, goes.
+            relay.gate(1, true);
+            tokio::time::sleep(Duration::from_millis(1_300).saturating_sub(replaced.elapsed()))
+                .await;
+            // The client's connection went idle meanwhile: another.
+            let mut sends = vec![h2_library_client(fronts[0], &::h2::client::Builder::new()).await];
+            relay.gate(1, false);
+            assert_eq!(statuses(&send_round(&mut sends, 2).await), [503, 503]);
+            assert_eq!(relay.accepted(), 2);
+            relay.open_all();
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 3, "replaced, none draining now");
+            assert_eq!(
+                metric(&proxy.metrics(), &reconnects(&relay.address)),
+                Some(2)
+            );
         })
         .await;
 }

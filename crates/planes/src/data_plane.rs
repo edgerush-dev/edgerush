@@ -1318,8 +1318,8 @@ pub struct DataPlaneRateLimiting {
     pub mode: String,
     /// Synchronous is how a request waits for its key's owner, and what decides
     /// it when the owner does not answer: what the Synchronous mode needs, and
-    /// no other takes. Every field is required, as how a proxy behaves when its
-    /// owners are out of reach is the DataPlane's to say.
+    /// no other takes. Every field but TimeoutsBeforeReconnect is required, as how
+    /// a proxy behaves when its owners are out of reach is the DataPlane's to say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synchronous: Option<DataPlaneRateLimitingSynchronous>,
 }
@@ -1461,8 +1461,8 @@ pub struct DataPlaneRateLimitingGlobalModelRollingWindow {
 
 /// Synchronous is how a request waits for its key's owner, and what decides
 /// it when the owner does not answer: what the Synchronous mode needs, and
-/// no other takes. Every field is required, as how a proxy behaves when its
-/// owners are out of reach is the DataPlane's to say.
+/// no other takes. Every field but TimeoutsBeforeReconnect is required, as how
+/// a proxy behaves when its owners are out of reach is the DataPlane's to say.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DataPlaneRateLimitingSynchronous {
     /// Breaker is when a proxy stops asking an owner that does not answer, and
@@ -1475,6 +1475,13 @@ pub struct DataPlaneRateLimitingSynchronous {
     #[serde(rename = "timeoutMs")]
     #[serde(default)]
     pub timeout_ms: i64,
+    /// TimeoutsBeforeReconnect is timeouts in a row on a proxy worker's own
+    /// connection to a pod, no answer read on it between, after which that
+    /// worker asks the pod on a new connection, still reading the old one a
+    /// while for answers that come late. It marks the pod down for no one.
+    #[serde(rename = "timeoutsBeforeReconnect")]
+    #[serde(default = "default_data_plane_rate_limiting_synchronous_timeouts_before_reconnect")]
+    pub timeouts_before_reconnect: i32,
     /// WhenUnreachable is what decides a request whose owner does not answer
     /// in time, or whose breaker is open:
     ///
@@ -1686,6 +1693,12 @@ fn default_data_plane_ingress_https_redirect() -> bool {
 #[rustfmt::skip]
 fn default_data_plane_ingress_https_redirect_max_age() -> i64 {
     30
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_data_plane_rate_limiting_synchronous_timeouts_before_reconnect() -> i32 {
+    2
 }
 
 /// The schema's default.
