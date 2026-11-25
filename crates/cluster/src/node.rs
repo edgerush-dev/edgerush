@@ -246,9 +246,12 @@ pub struct Node<V> {
     /// since when it has said no more.
     acked: BTreeMap<(ShardId, NodeId), u64>,
     behind: BTreeMap<(ShardId, NodeId), Time>,
-    /// As owner: for each replica, the keys of each copy it has not yet said it holds, by the
-    /// copy's number: what a repair sends again.
-    unacked: BTreeMap<(ShardId, NodeId), BTreeMap<u64, BTreeSet<Key>>>,
+    /// As owner: for each replica, each copy it has not yet said it holds, by the copy's
+    /// number: when it went, and its keys, what a repair sends again.
+    unacked: BTreeMap<(ShardId, NodeId), BTreeMap<u64, Unanswered>>,
+    /// As owner: for each replica, how long its last answer that said more took, from the
+    /// copy it answered.
+    round_trips: BTreeMap<(ShardId, NodeId), Time>,
     /// As owner: each replica's assignment to each shard, by a number of this pod's that never
     /// repeats, so that its answers from another — before it was taken off the shard and put
     /// back, or before the copies were numbered afresh — count for nothing.
@@ -341,6 +344,7 @@ impl<V: Held> Node<V> {
             acked: BTreeMap::new(),
             behind: BTreeMap::new(),
             unacked: BTreeMap::new(),
+            round_trips: BTreeMap::new(),
             assignments: BTreeMap::new(),
             next_assignment: 0,
             have: BTreeMap::new(),
@@ -1371,6 +1375,7 @@ impl<V: Held> Node<V> {
                 self.acked.retain(|(shard, _), _| *shard != id);
                 self.behind.retain(|(shard, _), _| *shard != id);
                 self.unacked.retain(|(shard, _), _| *shard != id);
+                self.round_trips.retain(|(shard, _), _| *shard != id);
                 self.sending.retain(|(_, shard), _| *shard != id);
             }
             let version = self.versions.get(&id).copied().unwrap_or(1);
@@ -1392,6 +1397,7 @@ impl<V: Held> Node<V> {
         self.acked.retain(|copy, _| still(copy));
         self.behind.retain(|copy, _| still(copy));
         self.unacked.retain(|copy, _| still(copy));
+        self.round_trips.retain(|copy, _| still(copy));
         self.assignments.retain(|copy, _| still(copy));
         self.sending
             .retain(|(replica, shard), _| still(&(*shard, *replica)));
@@ -1448,20 +1454,28 @@ impl<V: Held> Node<V> {
             for replica in &copies_to(&table, shard) {
                 let mut assignment = self.assignment(shard, *replica);
                 let unacked = self.unacked.entry((shard, *replica)).or_default();
-                unacked.insert(version, keys.clone());
+                unacked.insert(
+                    version,
+                    Unanswered {
+                        at: now,
+                        keys: keys.clone(),
+                    },
+                );
                 if unacked.len() > UNACKED_MOST {
-                    // The two oldest kept as one, under the later number: an answer covering
-                    // that number covers both.
+                    // The two oldest kept as one, under the later number, from when the older
+                    // went: an answer covering that number covers both.
                     if let (Some((_, older)), Some((number, newer))) =
                         (unacked.pop_first(), unacked.pop_first())
                     {
-                        unacked.insert(number, older.union(&newer).copied().collect());
+                        let keys = older.keys.union(&newer.keys).copied().collect();
+                        unacked.insert(number, Unanswered { at: older.at, keys });
                     }
                     // Unanswered so long that the keys to send it again outnumber those the
                     // shard holds, gone ones among them: a new assignment in their place, the
                     // repair sending it the whole shard, so that what it keeps stays within
                     // the shard's size.
-                    let kept: BTreeSet<&Key> = unacked.values().flatten().collect();
+                    let kept: BTreeSet<&Key> =
+                        unacked.values().flat_map(|copy| &copy.keys).collect();
                     if kept.len() > held {
                         assignment = self.assign(shard, *replica);
                     }
@@ -1534,7 +1548,7 @@ impl<V: Held> Node<V> {
                         .get(&copy)
                         .into_iter()
                         .flat_map(BTreeMap::values)
-                        .flatten()
+                        .flat_map(|copy| &copy.keys)
                         .copied()
                         .collect();
                     (Some(acked), Some(keys))
@@ -1585,6 +1599,7 @@ impl<V: Held> Node<V> {
         self.acked.remove(&copy);
         self.behind.remove(&copy);
         self.unacked.remove(&copy);
+        self.round_trips.remove(&copy);
         self.sending.remove(&(replica, shard));
         self.next_assignment
     }
@@ -1881,12 +1896,27 @@ impl<V: Held> Node<V> {
                 continue;
             }
             let whole = self.acked.get(&copy).is_some_and(|acked| *acked > 0);
-            let behind = self.unacked.get(&copy).map_or(0, BTreeMap::len);
+            let unacked = self.unacked.get(&copy);
+            let behind = unacked.map_or(0, BTreeMap::len);
+            // The copies on their way not held against it: its oldest copy unanswered no
+            // older than its last round trip and `CAUGHT_UP` cycles, so that a taker far away
+            // under a write every cycle is caught up as one close by is.
+            let within_its_trip = match (
+                unacked.and_then(|unacked| unacked.values().next()),
+                self.round_trips.get(&copy),
+            ) {
+                (Some(oldest), Some(trip)) => {
+                    now.saturating_sub(oldest.at)
+                        <= trip.saturating_add(self.config.cycle.saturating_mul(CAUGHT_UP as Time))
+                }
+                (None, _) => true,
+                (Some(_), None) => false,
+            };
             let told = self
                 .announced
                 .get(&shard)
                 .is_some_and(|(_, _, at)| now.saturating_sub(*at) < again);
-            if !whole || behind > CAUGHT_UP || told {
+            if !whole || (behind > CAUGHT_UP && !within_its_trip) || told {
                 continue;
             }
             // Caught up: the taker told, to tell the leader itself — a taker gone tells nobody,
@@ -1922,7 +1952,7 @@ impl<V: Held> Node<V> {
                     .get(&(shard, to))
                     .into_iter()
                     .flat_map(BTreeMap::values)
-                    .flatten()
+                    .flat_map(|copy| &copy.keys)
                     .chain(self.dirty.get(&shard).into_iter().flatten())
                     .copied()
                     .collect();
@@ -2285,10 +2315,15 @@ impl<V: Held> Node<V> {
                     let copy = (shard, from);
                     let acked = self.acked.entry(copy).or_insert(0);
                     if version > *acked {
-                        // It has said more: no longer behind since before, nor owed those copies.
+                        // It has said more: no longer behind since before, nor owed those copies;
+                        // how long the copy it answered took, there and back.
                         *acked = version;
                         self.behind.remove(&copy);
                         if let Some(unacked) = self.unacked.get_mut(&copy) {
+                            if let Some(answered) = unacked.get(&version) {
+                                self.round_trips
+                                    .insert(copy, now.saturating_sub(answered.at));
+                            }
                             unacked.retain(|number, _| *number > version);
                         }
                     } else if version < *acked {
@@ -2814,6 +2849,13 @@ fn copies_to(table: &Table, shard: ShardId) -> Vec<NodeId> {
 /// How many silences a peer no table names goes unheard before it is forgotten.
 const FORGET_AFTER: Time = 2;
 
+/// A copy a replica has not yet said it holds: when it went, and its keys.
+#[derive(Clone, Debug)]
+struct Unanswered {
+    at: Time,
+    keys: BTreeSet<Key>,
+}
+
 /// How many copy cycles an owner whose taker has caught up waits for the table to move the
 /// shard before it tells the leader again: 50 ms at the defaults.
 const HANDOFF_AGAIN: Time = 5;
@@ -2823,8 +2865,8 @@ const HANDOFF_AGAIN: Time = 5;
 /// the defaults.
 const HANDOFF_WAIT: Time = 5;
 
-/// The most cycles' copies a taker may have yet to answer for its owner to hand it the shard:
-/// what it lacks then goes with the handoff.
+/// The most cycles' copies a taker may have yet to answer for its owner to hand it the shard,
+/// beyond those on their way within its round trip: what it lacks then goes with the handoff.
 const CAUGHT_UP: usize = 4;
 
 /// How many copy cycles an owner waits for a replica to say it has caught up before it sends it
@@ -4911,6 +4953,93 @@ mod tests {
         );
     }
 
+    /// A taker a round trip away, every copy answered 120 ms after it went — twelve cycles,
+    /// past `CAUGHT_UP` copies — under a write every cycle: it is told it caught up, as one
+    /// close by is, the copies on their way not held against it. Its answers stopping, it is
+    /// told no more once its oldest copy unanswered is older than its round trip and
+    /// `CAUGHT_UP` cycles.
+    #[test]
+    fn a_taker_a_round_trip_away_under_steady_writes_is_told_it_caught_up() {
+        let trip = ms(120);
+        let lease = |node: &mut Node, now: Time| {
+            for peer in [1, 3] {
+                let beat = Message::Heartbeat {
+                    term: 1,
+                    leader: Some(1),
+                    committed: node.committed_stamp(),
+                    fresh: false,
+                    sent: now,
+                    wall: 0,
+                    hears: vec![(1, now), (2, now), (3, now)],
+                    leased: true,
+                };
+                let _ = node.receive(peer, beat, now);
+            }
+        };
+        let mut owner = member();
+        let table = owner.committed().cloned().unwrap();
+        let Some(shard) = (0..4).find(|shard| table.owner(*shard) == Some(2)) else {
+            panic!("pod 2 owns nothing");
+        };
+        let key = key_in(shard);
+        lease(&mut owner, ms(2));
+        let mut moving = table;
+        moving.version = 2;
+        moving.moves = vec![(shard, 3, moving.stamp())];
+        let _ = owner.receive(1, Message::TableReply { table: moving }, ms(3));
+        let stop = ms(800);
+        let mut answers: Vec<(Time, Message<Counts>)> = Vec::new();
+        let mut told = Vec::new();
+        for step in 1..150_u64 {
+            let now = ms(3) + step * owner.config.cycle;
+            lease(&mut owner, now);
+            let due: Vec<Message<Counts>> = answers
+                .iter()
+                .filter(|(at, _)| *at <= now)
+                .map(|(_, answer)| answer.clone())
+                .collect();
+            answers.retain(|(at, _)| *at > now);
+            for answer in due {
+                let _ = owner.receive(3, answer, now);
+            }
+            let _ = owner.update(key, now, |kept, _| {
+                kept.value.add(1);
+                kept.forget_at = Time::MAX;
+                ((), Changed::Whole)
+            });
+            for (to, message) in owner.tick(now) {
+                match message {
+                    Message::Replicate {
+                        term,
+                        assignment,
+                        version,
+                        more: false,
+                        ..
+                    } if to == 3 && now < stop => {
+                        let answer = Message::Replicated {
+                            shard,
+                            term,
+                            assignment,
+                            version,
+                        };
+                        answers.push((now + trip, answer));
+                    }
+                    Message::CaughtUp { .. } if to == 3 => told.push(now),
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            told.first().is_some_and(|first| *first < stop),
+            "never told while answering: {told:?}"
+        );
+        let quiet = stop + trip + owner.config.cycle * (CAUGHT_UP as u64 + HANDOFF_AGAIN + 1);
+        assert!(
+            told.iter().all(|at| *at < quiet),
+            "told after its answers stopped: {told:?}"
+        );
+    }
+
     /// The handoff's waits are five copy cycles, as long as the cycle is configured: at a
     /// cycle of 20 ms, an owner whose taker has caught up tells it so again every 100 ms, and
     /// a taker named the owner, the old owner's last changes never coming, serves after 100
@@ -5300,7 +5429,7 @@ mod tests {
                 .get(&(shard, 2))
                 .into_iter()
                 .flat_map(BTreeMap::values)
-                .flatten()
+                .flat_map(|copy| &copy.keys)
                 .copied()
                 .collect();
             most = most.max(kept.len());
