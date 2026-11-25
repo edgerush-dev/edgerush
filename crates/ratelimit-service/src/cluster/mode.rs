@@ -49,10 +49,23 @@ pub trait Stream: Send + 'static {
 
     /// What the pod tells a client, as the stream carries it down; none for anything else.
     fn telling(message: BothMessage) -> Option<Self::Telling>;
+
+    /// The number of the check `asking` is, if it is one: the pod's task answers it itself,
+    /// never its mode. A stream that carries no checks has none.
+    fn check(asking: &Self::Asking) -> Option<u64> {
+        let _ = asking;
+        None
+    }
+
+    /// The pod's answer to check `id`, as the stream carries it down.
+    fn checked(id: u64) -> Option<Self::Telling> {
+        let _ = id;
+        None
+    }
 }
 
-/// The synchronous mode's stream (`/edgerush.cluster.v1.Cluster/Decide`): requests and requests to gather up, answers
-/// and tables down.
+/// The synchronous mode's stream (`/edgerush.cluster.v1.Cluster/Decide`): requests,
+/// requests to gather and checks up; answers, tables and checks answered down.
 #[derive(Debug, Clone, Copy)]
 pub struct Decide;
 
@@ -76,6 +89,14 @@ impl Stream for Decide {
             BothMessage::Store(message) => wire::telling(SyncMessage::<BothValue>::Store(message)),
             BothMessage::Asynchronous(_) => None,
         }
+    }
+
+    fn check(asking: &Asking) -> Option<u64> {
+        wire::check(asking)
+    }
+
+    fn checked(id: u64) -> Option<Telling> {
+        Some(wire::checked(id))
     }
 }
 

@@ -28,7 +28,9 @@ use edgerush_ratelimit_service::cluster::plane::{Plane, Told};
 use edgerush_ratelimit_service::cluster::pod::{
     DecideStream, STREAMS_IDLE, StoreClient, StorePod, StoreServer, TICK, ask, decide_stream,
 };
-use edgerush_ratelimit_service::cluster::wire::{Asking, asking, told_from};
+use edgerush_ratelimit_service::cluster::wire::{
+    Asked, Asking, Check, Told as WireTold, asking, told_from,
+};
 use edgerush_ratelimit_service::grpc::Client;
 use edgerush_ratelimit_service::scrape;
 use std::collections::{BTreeMap, BTreeSet};
@@ -708,6 +710,22 @@ async fn told_answer(stream: &mut DecideStream, id: u64, most: Duration) -> Opti
     }
 }
 
+/// The number of the check a data plane's `stream` is told answered next, within `most`,
+/// the tables told meanwhile passed over.
+async fn checked(stream: &mut DecideStream, most: Duration) -> Option<u64> {
+    let until = Instant::now() + most;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        let next = tokio::time::timeout(left, stream.down.message())
+            .await
+            .ok()?
+            .ok()??;
+        if let Some(WireTold::Checked(Check { id })) = next.told {
+            return Some(id);
+        }
+    }
+}
+
 /// What `pod` holds counted under `key`, less what was given back.
 async fn held_at(pod: &StorePod, key: Key) -> Option<u64> {
     pod.with(move |node, _| node.value(key).map(|value| net(&value)))
@@ -1179,6 +1197,25 @@ async fn a_data_planes_stream_is_told_the_table_and_answered_by_number() {
         let held = held_at(cluster.pod(owner), key).await;
         assert!(matches!(held, Some(1 | 2)), "key {key}: {held:?}");
     }
+}
+
+/// A data plane's check is answered on its stream by its number, each in turn, and counts
+/// nothing: the pod holds no key for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_planes_check_is_answered_by_number_and_counts_nothing() {
+    let _alone = ALONE.write().await;
+    let cluster = ready(1).await;
+    let address = cluster.pods[&1].relay.address.to_string();
+    let mut stream = decide_stream(&address, &Dial::Plain).await.unwrap();
+    for id in [3, 4] {
+        let check = Asking {
+            asked: Some(Asked::Check(Check { id })),
+        };
+        stream.up.send(check).await.unwrap();
+        assert_eq!(checked(&mut stream, ANSWERED).await, Some(id));
+    }
+    let observed = cluster.pod(1).observed().await.unwrap();
+    assert_eq!(observed.keys, 0);
 }
 
 /// A table the pod commits reaches the data planes' streams to it: a pod taken in is named.
