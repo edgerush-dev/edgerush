@@ -21,6 +21,13 @@
 /// request at 100 a second, 100 at a million. The rate is unchanged.
 pub const SLACK: u64 = 100_000;
 
+/// How long, in nanoseconds, a worker may go on holding a handle to a key its process has let
+/// go of: workers prune their handles a part at a time, one of [`local::HANDLE_PARTS`] every
+/// `HANDLES_PRUNED / HANDLE_PARTS`, local mode's and the service modes' alike. Past its cap,
+/// a process evicts leaving room for the keys made over this long, which is the most its
+/// workers can hold of keys it has let go of beside those it keeps (06 §8, #602).
+pub const HANDLES_PRUNED: u64 = 1_000_000_000;
+
 pub mod local;
 
 /// Whether the machine has the native 128-bit compare-and-swap a key's word needs, local
@@ -38,6 +45,8 @@ pub fn supported() -> bool {
         true
     }
 }
+mod chunked;
+mod cutoff;
 mod rate;
 pub mod reference;
 pub mod service;

@@ -219,10 +219,12 @@ fn a_quiet_rolling_window_is_forgotten_once_it_counts_none() {
         "still counting"
     );
     assert_eq!(local.sweep(LATER + SECOND, 0).forgotten, 1);
+    handles.prune();
+    assert_eq!(local.evict(LATER + SECOND), 0);
     assert_eq!(
         local.holding(),
         local.tables(),
-        "the tables keep their room"
+        "freed once the worker's handles let go; the tables keep their room"
     );
 }
 
@@ -289,8 +291,15 @@ fn a_rolling_key_counts_its_ring_in_its_bytes() {
     local.sweep(10 * SECOND, 0);
     assert_eq!(
         local.holding(),
+        local.tables() + key_bytes(b"k", r.into()) + local.gone_room(),
+        "forgotten, its ring counted while the worker's handles hold it"
+    );
+    handles.prune();
+    local.sweep(10 * SECOND, 0);
+    assert_eq!(
+        local.holding(),
         local.tables(),
-        "the tables keep their room"
+        "freed once let go of; the tables keep their room"
     );
 }
 
@@ -341,7 +350,8 @@ fn rolling_keys_keep_terms_of_their_own() {
     assert!(read(&local.terms).is_empty());
 }
 
-/// A key held to other slots, or to another limit, is a new key: counted afresh.
+/// A key held to other slots, or to another limit, is a new key: counted afresh, the old one
+/// counted until it is freed, at the next look once no handle holds it.
 #[test]
 fn a_rolling_window_of_other_slots_starts_the_key_afresh() {
     let local = local();
@@ -355,10 +365,14 @@ fn a_rolling_window_of_other_slots_starts_the_key_afresh() {
         one(&local, &mut handles, b"k", rolling(1, SECOND, 60), 0),
         Ok(())
     );
+    let new = key_bytes(b"k", rolling(1, SECOND, 60).into());
+    let old = key_bytes(b"k", rolling(1, SECOND, 1_000).into());
     assert_eq!(
         local.holding(),
-        local.tables() + key_bytes(b"k", rolling(1, SECOND, 60).into())
+        local.tables() + new + old + local.gone_room()
     );
+    assert_eq!(local.evict(0), 0);
+    assert_eq!(local.holding(), local.tables() + new);
 }
 
 /// Gaps between requests, mostly within a window, now and then an idle stretch of up to

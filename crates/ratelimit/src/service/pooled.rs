@@ -17,7 +17,6 @@
 //!
 //! No I/O: the time is passed in; the transport's messages are the caller's to carry.
 
-pub(super) mod chunked;
 mod keys;
 mod routing;
 mod sync;
@@ -41,8 +40,12 @@ use super::{
     Batch, CUT_OFF_CYCLES, Contract, Entry as BatchEntry, MOST_UNACKNOWLEDGED, PlaneId, Queued,
     RESEND_AFTER_CYCLES, Report, Room, Unseen, cut_off_from_owner, encoded_entry_bytes,
 };
-use chunked::MinHeap;
+use crate::chunked::{self, MinHeap};
+use crate::cutoff::{self, Count, First, Lately, Places};
+use crate::local::HANDLE_PARTS;
 use edgerush_memory::{allocation, arc, hash_table};
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry as Slot;
 use keys::Keys;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -322,13 +325,24 @@ impl<S: BuildHasher> Registry<S> {
     }
 }
 
+/// The bits of a hash below a part of a worker's [`Handles`]: a table places a handle by the
+/// hash's low bits and tags it with its top seven.
+const HANDLE_PART_SHIFT: u32 = 40;
+
 /// A worker's handles to its process's entries, found by key: one lookup a key a request.
-/// What their table takes is counted in the process's registry ([`Registry::tables`]) as
-/// it grows, and given back when they go.
+/// In [`HANDLE_PARTS`] tables, as local mode's handles are: a worker lets go of the handles
+/// to closed entries a part at a time ([`Self::prune_next`]), so that those the process let
+/// go of are freed a little at a time rather than all at once, and no one table of them
+/// all doubles at once (#602). What their tables take is counted in the process's registry
+/// ([`Registry::tables`]) as they grow, and given back when they go.
 pub struct Handles<S> {
-    set: HashSet<Handle, S>,
+    parts: Box<[HashTable<Handle>]>,
+    hasher: S,
+    len: usize,
+    /// The part [`prune_next`](Self::prune_next) reads next.
+    next_part: usize,
     registry: Arc<Registry<S>>,
-    /// What its table takes, as counted in the registry.
+    /// What its tables take, as counted in the registry.
     counted: u64,
 }
 
@@ -337,45 +351,84 @@ impl<S: BuildHasher> Handles<S> {
     #[must_use]
     pub fn new(registry: Arc<Registry<S>>, hasher: S) -> Self {
         Self {
-            set: HashSet::with_hasher(hasher),
+            parts: (0..HANDLE_PARTS).map(|_| HashTable::new()).collect(),
+            hasher,
+            len: 0,
+            next_part: 0,
             registry,
             counted: 0,
         }
     }
 
+    /// The part of a handle whose key's hash is `hash`.
+    fn part(hash: u64) -> usize {
+        // Truncated to the bits a part takes, which fit any `usize`.
+        (hash >> HANDLE_PART_SHIFT) as usize % HANDLE_PARTS
+    }
+
     /// The handle to `key`'s entry, if it holds one.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&Handle> {
-        self.set.get(key)
+        let hash = self.hasher.hash_one(key);
+        self.parts[Self::part(hash)].find(hash, |held| *held.0.key == *key)
     }
 
-    /// Holds `handle` in place of any to the same key, counting what its table grows by.
+    /// Holds `handle` in place of any to the same key, counting what its part's table grows
+    /// by.
     pub fn replace(&mut self, handle: Handle) {
-        self.set.replace(handle);
-        let now = hash_table::<Handle>(self.set.capacity());
-        if now > self.counted {
-            self.registry
-                .tables
-                .fetch_add(now - self.counted, Ordering::Relaxed);
-            self.counted = now;
+        let hasher = &self.hasher;
+        let hash = hasher.hash_one(&*handle.0.key);
+        let part = &mut self.parts[Self::part(hash)];
+        let before = allocation(part.allocation_size());
+        match part.entry(
+            hash,
+            |held| held.0.key == handle.0.key,
+            |held| hasher.hash_one(&*held.0.key),
+        ) {
+            Slot::Occupied(mut held) => *held.get_mut() = handle,
+            Slot::Vacant(room) => {
+                room.insert(handle);
+                self.len += 1;
+            }
+        }
+        // A table only grows: never less than it was.
+        let grown = allocation(part.allocation_size()) - before;
+        if grown > 0 {
+            self.registry.tables.fetch_add(grown, Ordering::Relaxed);
+            self.counted += grown;
         }
     }
 
     /// Keeps only the handles `keep` takes.
-    pub fn retain(&mut self, keep: impl FnMut(&Handle) -> bool) {
-        self.set.retain(keep);
+    pub fn retain(&mut self, mut keep: impl FnMut(&Handle) -> bool) {
+        for part in &mut self.parts {
+            part.retain(|held| keep(held));
+        }
+        self.len = self.parts.iter().map(HashTable::len).sum();
+    }
+
+    /// Lets go of the handles to closed entries in the next of its parts in turn: taken
+    /// [`HANDLE_PARTS`] times a second, every handle to an entry its process let go of goes
+    /// within a second, a part's worth at a time — the second the process's eviction leaves
+    /// room for (06 §8).
+    pub fn prune_next(&mut self) {
+        let part = &mut self.parts[self.next_part];
+        let before = part.len();
+        part.retain(|held| !held.0.closed());
+        self.len -= before - part.len();
+        self.next_part = (self.next_part + 1) % HANDLE_PARTS;
     }
 
     /// How many it holds.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.set.len()
+        self.len
     }
 
     /// Whether it holds none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.len == 0
     }
 }
 
@@ -1017,8 +1070,19 @@ pub struct Participant<S, R: Routing> {
     capacity: u64,
     /// The bytes of the keys it keeps.
     holding: u64,
-    /// Scheduled, the bytes of entries replaced or evicted that their eviction time, in
-    /// `evictions`, keeps until it comes or is dropped ([`Self::drop_stale`]).
+    /// The entries no longer kept — replaced, evicted or idle — while anything else may hold
+    /// them, their eviction time or a worker's handles: kept until nothing does, so that they
+    /// count until they are freed ([`Self::release`]).
+    gone: chunked::List<Arc<Entry>>,
+    /// Their bytes, as [`entry_bytes`] counts them.
+    gone_held: u64,
+    /// The bytes of every entry let go of, all told: with those kept, the bytes of every
+    /// entry made.
+    let_go: u64,
+    /// The bytes of entries made lately, which eviction leaves room for.
+    lately: Lately,
+    /// Scheduled, how many eviction times, in `evictions`, are of entries no longer kept,
+    /// which they hold until they come or are dropped ([`Self::drop_stale`]).
     stale: u64,
     evicted: u64,
     /// Hits given up without being seen applied, all told ([`Self::forgiven`]).
@@ -1035,7 +1099,7 @@ pub struct Participant<S, R: Routing> {
     next_runnable: Vec<Handle>,
     /// Scheduled, when each key may next be idle enough to evict: one for each key, a later
     /// one put back in its place when one comes due early; and one for each entry replaced
-    /// or evicted, until it comes or is dropped ([`Self::stale`]).
+    /// or evicted, until it comes or is dropped ([`Self::stale`]), holding the entry.
     evictions: MinHeap<Due>,
     /// Keys visited, all told.
     visits: u64,
@@ -1292,6 +1356,10 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
             exchange_timeout: RESEND_AFTER_CYCLES * cycle.max(1),
             capacity: u64::MAX,
             holding: 0,
+            gone: chunked::List::new(),
+            gone_held: 0,
+            let_go: 0,
+            lately: Lately::default(),
             stale: 0,
             evicted: 0,
             forgiven: 0,
@@ -1436,18 +1504,18 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
     }
 
     /// The bytes its keys take in memory: each key's entry ([`entry_bytes`]), with those of
-    /// entries no longer kept that their eviction times keep until they come, and the tables
+    /// entries no longer kept until nothing holds them and the list of them, and the tables
     /// holding them ([`tables`](Self::tables)).
     #[must_use]
     pub fn holding(&self) -> u64 {
-        self.holding + self.stale + self.tables()
+        self.holding + self.gone_held + self.gone.bytes() + self.tables()
     }
 
     /// What the tables holding its keys take, as glibc allocates them: its own, of what it
     /// keeps of each key, and its registry's and workers' handles' ([`Registry::tables`]).
     #[must_use]
     pub fn tables(&self) -> u64 {
-        allocation(self.keys.allocation_size()) + self.registry.tables()
+        self.keys.bytes() + self.registry.tables()
     }
 
     /// Keys evicted to stay within its capacity, all told.
@@ -1493,7 +1561,7 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         if let Some(old) = self.keys.remove(key) {
             close(&old.entry);
             self.registry.remove(&old.entry);
-            self.forget(key);
+            self.let_go(old.entry);
         }
         // A worker may have made the key's entry already: that one.
         let made = self
@@ -1523,36 +1591,62 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         }
         if let Some(old) = self.keys.remove(&entry.key) {
             close(&old.entry);
-            self.forget(&entry.key);
+            self.let_go(old.entry);
         }
         self.track(entry);
     }
 
-    /// Takes `key`, no longer kept, off what it holds — but for its entry while scheduled,
-    /// which its eviction time keeps until it comes or is dropped, and which counts as stale
-    /// meanwhile.
-    fn forget(&mut self, key: &[u8]) {
-        self.holding = self.holding.saturating_sub(entry_bytes(key));
+    /// Takes `entry`, no longer kept and its eviction time, if any, still scheduled, off what it
+    /// holds and onto what it has let go of, counted there until nothing else holds it.
+    fn let_go(&mut self, entry: Arc<Entry>) {
         if self.scheduled {
-            self.stale += entry_bytes(key);
+            self.stale += 1;
         }
+        self.let_go_unscheduled(entry);
     }
 
-    /// Drops the eviction times of entries no longer kept, freeing the entries: a pass over
-    /// every key's, made only past the cap, as eviction's own is.
+    /// The same for an entry no eviction time holds.
+    fn let_go_unscheduled(&mut self, entry: Arc<Entry>) {
+        let bytes = entry_bytes(&entry.key);
+        self.holding = self.holding.saturating_sub(bytes);
+        self.gone_held += bytes;
+        self.let_go += bytes;
+        self.gone.push(entry);
+    }
+
+    /// Frees the entries let go of that only its list holds: none is kept or in the registry,
+    /// so nothing takes a handle to one again, and one so held stays so. A pass over those
+    /// let go of, taken every cycle while there are any.
+    fn release(&mut self) {
+        if self.gone.is_empty() {
+            return;
+        }
+        let mut freed = 0;
+        self.gone.retain(|entry| {
+            let held = Arc::strong_count(entry) > 1;
+            if !held {
+                freed += entry_bytes(&entry.key);
+            }
+            held
+        });
+        self.gone_held -= freed;
+    }
+
+    /// Drops the eviction times of entries no longer kept, which hold them: a pass over every
+    /// key's, made only past the cap, as eviction's own is.
     fn drop_stale(&mut self) {
         let keys = &self.keys;
-        let mut freed = 0;
+        let mut dropped = 0;
         self.evictions.retain(|due| {
             let kept = keys
                 .get(&due.entry.key)
                 .is_some_and(|tracked| Arc::ptr_eq(&tracked.entry, &due.entry));
             if !kept {
-                freed += entry_bytes(&due.entry.key);
+                dropped += 1;
             }
             kept
         });
-        debug_assert_eq!(freed, self.stale, "one eviction time an entry");
+        debug_assert_eq!(dropped, self.stale, "one eviction time an entry");
         self.stale = 0;
     }
 
@@ -1696,64 +1790,96 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
         if self.scheduled {
             self.evict_due(now);
         } else {
-            let mut freed = 0;
-            let registry = &self.registry;
+            let mut moved = 0;
+            let (registry, gone) = (&self.registry, &mut self.gone);
             self.keys.retain(|tracked| {
                 let evict = tracked.idle(now) && close_if_quiet(tracked);
                 if evict {
                     registry.remove(&tracked.entry);
-                    freed += entry_bytes(&tracked.entry.key);
+                    moved += entry_bytes(&tracked.entry.key);
+                    gone.push(Arc::clone(&tracked.entry));
                 }
                 !evict
             });
-            self.holding = self.holding.saturating_sub(freed);
+            self.holding = self.holding.saturating_sub(moved);
+            self.gone_held += moved;
+            self.let_go += moved;
         }
-        if self.holding() <= self.capacity {
+        self.release();
+        // Entries no longer kept that their eviction times hold go first once what is held
+        // passes the cap, before any key that is.
+        if self.stale > 0 && self.holding() > self.capacity {
+            self.drop_stale();
+            self.release();
+        }
+        // The cap is held by the keys kept and their tables, with room for the entries made
+        // over the last `HANDLES_PRUNED`, which is the most workers may go on holding of
+        // those let go of. Those still held count in `holding()` but not here: evicting more
+        // frees none of them sooner, and counted here each cycle would evict another tenth
+        // while they wait (#602).
+        let lately = self.lately.at(now, self.holding + self.let_go);
+        let kept = self.holding + self.tables() + lately;
+        if kept <= self.capacity {
             return;
         }
-        // Entries no longer kept go first, before any key that is.
+        let target = self.capacity - self.capacity / 10;
+        self.evict_for_cap(kept - target, now);
+        // Freed now, not when the keys would have gone idle: what was evicted is gone, but
+        // for what workers still hold, which counts until they let go.
         if self.stale > 0 {
             self.drop_stale();
         }
-        let target = self.capacity - self.capacity / 10;
-        // What evicting cannot give back: the tables keep their room.
-        let tables = self.tables();
-        if self.holding + tables > target {
-            // Every key, whatever it has outstanding: what it has not had applied is
-            // forgiven, so that memory stays within the cap however long the service is out
-            // of reach.
-            let mut used: Vec<(u64, Box<[u8]>)> = self
-                .keys
+        self.release();
+    }
+
+    /// Evicts the keys asked for longest ago at `now` until `needed` bytes are let go of —
+    /// every key, whatever it has outstanding: what it has not had applied is forgiven, so
+    /// that memory stays within the cap however long the service is out of reach. In three
+    /// passes, with nothing beside the keys but a table of 8 KB ([`Count`]): one finding the
+    /// span of how long ago they were last asked for, one counting each key's bytes over that
+    /// span, the last evicting in place those asked for before the time the bytes needed end
+    /// at.
+    fn evict_for_cap(&mut self, needed: u64, now: u64) {
+        let age = |tracked: &Tracked<R::Pod, R::Key>| {
+            now.saturating_sub(tracked.entry.last_request.load(Ordering::Relaxed))
+        };
+        let stride = cutoff::stride(self.keys.len());
+        let mut span = Places::default();
+        for tracked in self.keys.sampled(stride) {
+            span.add(age(tracked));
+        }
+        let mut count = Count::new(First::Greatest, span, stride);
+        for tracked in self.keys.sampled(stride) {
+            count.add(age(tracked), entry_bytes(&tracked.entry.key));
+        }
+        let mut stop = count.stop(needed);
+        let (registry, gone, forgiven) = (&self.registry, &mut self.gone, &mut self.forgiven);
+        let (mut moved, mut evicted) = (0, 0);
+        self.keys.retain(|tracked| {
+            let bytes = entry_bytes(&tracked.entry.key);
+            if !stop.takes(age(tracked), bytes) {
+                return true;
+            }
+            let unreported = close(&tracked.entry).unreported;
+            let unseen: u64 = tracked
+                .unacknowledged
+                .as_slice()
                 .iter()
-                .map(|t| {
-                    let used = t.entry.last_request.load(Ordering::Relaxed);
-                    (used, t.entry.key.clone())
-                })
-                .collect();
-            used.sort_unstable_by_key(|(used, _)| *used);
-            for (_, key) in used {
-                if self.holding + tables <= target {
-                    break;
-                }
-                let Some(tracked) = self.keys.remove(&key) else {
-                    continue;
-                };
-                let unreported = close(&tracked.entry).unreported;
-                let unseen: u64 = tracked
-                    .unacknowledged
-                    .as_slice()
-                    .iter()
-                    .map(|u| u.count)
-                    .sum();
-                self.forgiven += unreported + tracked.unsent + unseen;
-                self.registry.remove(&tracked.entry);
-                self.forget(&key);
-                self.evicted += 1;
-            }
-            // Freed now, not when the keys would have gone idle: what was evicted is gone.
-            if self.stale > 0 {
-                self.drop_stale();
-            }
+                .map(|u| u.count)
+                .sum();
+            *forgiven += unreported + tracked.unsent + unseen;
+            registry.remove(&tracked.entry);
+            gone.push(Arc::clone(&tracked.entry));
+            moved += bytes;
+            evicted += 1;
+            false
+        });
+        self.holding = self.holding.saturating_sub(moved);
+        self.gone_held += moved;
+        self.let_go += moved;
+        self.evicted += evicted;
+        if self.scheduled {
+            self.stale += evicted;
         }
     }
 
@@ -1771,13 +1897,14 @@ impl<S: BuildHasher + Clone, R: Routing> Participant<S, R> {
                 .get(&due.entry.key)
                 .filter(|tracked| Arc::ptr_eq(&tracked.entry, &due.entry));
             let Some(tracked) = kept else {
-                self.stale = self.stale.saturating_sub(entry_bytes(&due.entry.key));
+                self.stale = self.stale.saturating_sub(1);
                 continue;
             };
             if tracked.idle(now) && close_if_quiet(tracked) {
-                self.registry.remove(&tracked.entry);
-                self.holding = self.holding.saturating_sub(entry_bytes(&due.entry.key));
+                self.registry.remove(&due.entry);
                 self.keys.remove(&due.entry.key);
+                // Its eviction time comes now, and holds it no longer.
+                self.let_go_unscheduled(due.entry);
             } else {
                 let at = idle_at(&due.entry).max(now + self.cycle);
                 self.evictions.push(Due {

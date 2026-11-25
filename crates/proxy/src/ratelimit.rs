@@ -23,7 +23,7 @@ use boring::ssl::SslConnector;
 use edgerush_config::{
     Compiled, CompiledLimit, CompiledModel, CompiledRateLimitService, CompiledRateLimiting,
 };
-use edgerush_ratelimit::local::{Limit, Rolling, Window};
+use edgerush_ratelimit::local::{HANDLE_PARTS, Limit, Rolling, Window};
 use edgerush_ratelimit::service::pooled::{
     self, Entry, Handle, Local as PooledLocal, Outcome as Pooled, Registry,
 };
@@ -650,17 +650,20 @@ impl Limiter {
     }
 
     /// The worker's side of its process: the answers to its asks, with the entries of their
-    /// keys; its signals handed over every sync; and now and then its handles to entries
-    /// its process has closed dropped.
+    /// keys; its signals handed over every sync; and its handles to entries its process has
+    /// closed dropped a part at a time, every part within `HANDLES_PRUNED` — the time its
+    /// process's eviction leaves room for (06 §8).
     async fn run(self: Rc<Self>, mut answered: mpsc::UnboundedReceiver<FromHub>) {
-        let mut sweep = tokio::time::interval(Duration::from_secs(1));
-        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut prune = tokio::time::interval(
+            Duration::from_nanos(edgerush_ratelimit::HANDLES_PRUNED) / HANDLE_PARTS as u32,
+        );
+        prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut sync = tokio::time::interval(SYNC);
         sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = sweep.tick() => {
-                    self.handles.borrow_mut().retain(|held| !held.entry().closed());
+                _ = prune.tick() => {
+                    self.handles.borrow_mut().prune_next();
                 }
                 // What its decisions signalled, handed over in one message a sync.
                 _ = sync.tick(), if self.service.schedule_keys => {

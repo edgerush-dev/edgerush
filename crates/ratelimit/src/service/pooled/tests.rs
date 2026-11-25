@@ -1107,7 +1107,7 @@ fn handles_count_as_their_tables_are_allocated() {
         shard,
         "one shard's table, of four buckets"
     );
-    let own = allocation(participant.keys.allocation_size());
+    let own = participant.keys.bytes();
     assert_eq!(participant.tables(), own + shard);
     assert_eq!(participant.holding(), entry_bytes(b"k") + own + shard);
     let before = participant.holding();
@@ -1121,12 +1121,21 @@ fn handles_count_as_their_tables_are_allocated() {
     );
     assert!(Arc::ptr_eq(handles.get(b"k").unwrap().entry(), &entry));
     assert!(handles.get(b"kez").is_none());
-    for at in 0..20 {
+    for at in 0..200 {
         let key = format!("k{at}").into_bytes().into_boxed_slice();
         handles.replace(Handle::new(Arc::new(Entry::new(key, c, CYCLE, 0))));
     }
-    let grown = hash_table::<Handle>(handles.set.capacity());
-    assert_eq!(handles.set.capacity(), 28, "doubled from 3 to 7, 14 and 28");
+    assert_eq!(handles.len(), 201);
+    // Each part's table counted from its capacity, as it grew.
+    let grown: u64 = handles
+        .parts
+        .iter()
+        .map(|part| hash_table::<Handle>(part.capacity()))
+        .sum();
+    assert!(
+        handles.parts.iter().all(|part| part.len() < 201),
+        "spread over its parts"
+    );
     assert_eq!(participant.holding(), before + grown);
     handles.retain(|_| false);
     assert_eq!(
@@ -2241,6 +2250,174 @@ fn a_key_evicted_for_capacity_is_freed_at_once() {
     assert!(participant.evictions.is_empty());
 }
 
+/// Past its cap with entries evicted earlier still held by a worker, a participant does not
+/// evict again for them each cycle: they count in what it holds until the worker lets go,
+/// but the cap is held by the keys kept — not a tenth more each cycle (#602).
+#[test]
+fn entries_evicted_and_still_held_are_not_evicted_for_again() {
+    let mut participant = participant();
+    let c = contract(100, 10);
+    let mut handles = Handles::new(participant.registry(), FixedState::default());
+    for n in 0..10 {
+        let name = format!("k{n}").into_bytes();
+        participant.ensure(&name, c, 0);
+        let entry = participant.entries(&[(&name, c)]).remove(0);
+        handles.replace(Handle::new(entry));
+    }
+    participant.on_cycle(CYCLE);
+    let _ = participant.take_outgoing();
+    let each = entry_bytes(b"k0");
+    let tables = participant.tables();
+    participant.set_capacity(tables + 7 * each);
+    participant.on_cycle(2 * CYCLE);
+    let kept = participant.key_count();
+    assert!((1..10).contains(&kept), "{kept} kept");
+    assert!(
+        participant.holding() > tables + 7 * each,
+        "past the cap with those held"
+    );
+    // Within the keys' refill time, so that none goes idle meanwhile.
+    for cycle in 3..15 {
+        participant.on_cycle(cycle * CYCLE);
+        let _ = participant.take_outgoing();
+        assert_eq!(participant.key_count(), kept, "cycle {cycle}");
+    }
+    handles.retain(|held| !held.entry().closed());
+    participant.on_cycle(15 * CYCLE);
+    assert_eq!(participant.holding(), tables + kept as u64 * each);
+}
+
+/// A worker's handles let go of those to closed entries a part at a time: each of its parts
+/// in turn, every one within `HANDLE_PARTS` turns.
+#[test]
+fn handles_to_closed_entries_go_a_part_at_a_time() {
+    let participant = participant();
+    let c = contract(100, 10);
+    let mut handles = Handles::new(participant.registry(), FixedState::default());
+    let mut entries = Vec::new();
+    for n in 0..1_000 {
+        let key = format!("k{n}").into_bytes().into_boxed_slice();
+        let entry = Arc::new(Entry::new(key, c, CYCLE, 0));
+        handles.replace(Handle::new(Arc::clone(&entry)));
+        entries.push(entry);
+    }
+    for entry in entries.iter().step_by(2) {
+        close(entry);
+    }
+    let mut left = handles.len();
+    for turn in 0..HANDLE_PARTS {
+        handles.prune_next();
+        assert!(handles.len() <= left, "turn {turn}");
+        if turn + 1 < HANDLE_PARTS {
+            assert!(handles.len() > 500, "turn {turn}: not every part yet");
+        }
+        left = handles.len();
+    }
+    assert_eq!(handles.len(), 500, "every closed one gone, the rest kept");
+    assert!(
+        entries
+            .iter()
+            .step_by(2)
+            .all(|entry| Arc::strong_count(entry) == 1)
+    );
+    assert!(
+        entries
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .all(|entry| Arc::strong_count(entry) == 2)
+    );
+}
+
+/// The participant's keys are held in shards, each counted as its table grows: what they
+/// take is what their tables allocate, spread over many.
+#[test]
+fn the_keys_are_held_in_shards_each_counted_as_it_grows() {
+    let mut participant = participant();
+    let c = contract(100, 10);
+    for n in 0..2_000 {
+        participant.ensure(format!("k{n}").as_bytes(), c, 0);
+    }
+    let shards = participant.keys.shards();
+    let allocated: u64 = shards
+        .iter()
+        .map(|shard| allocation(shard.allocation_size()))
+        .sum();
+    assert_eq!(participant.keys.bytes(), allocated);
+    assert_eq!(participant.keys.len(), 2_000);
+    let used = shards.iter().filter(|shard| !shard.is_empty()).count();
+    assert!(used > 1_000, "{used} shards hold keys");
+    assert!(
+        shards.iter().all(|shard| shard.len() < 20),
+        "none holds many"
+    );
+}
+
+/// A key evicted for capacity counts until the last worker holding its entry lets go,
+/// scheduled or not, and is freed at the next cycle once none does.
+#[test]
+fn an_entry_evicted_for_capacity_counts_until_the_workers_let_go() {
+    for scheduled in [false, true] {
+        let mut participant = participant();
+        participant.set_scheduled(scheduled);
+        let c = contract(100, 10);
+        participant.ensure(b"k", c, 0);
+        let entry = participant.entries(&[(b"k", c)]).remove(0);
+        let held = Arc::downgrade(&entry);
+        let mut handles = Handles::new(participant.registry(), FixedState::default());
+        handles.replace(Handle::new(entry));
+        participant.on_cycle(CYCLE);
+        let _ = participant.take_outgoing();
+        let tables = participant.tables();
+        participant.set_capacity(1);
+        participant.on_cycle(2 * CYCLE);
+        assert_eq!(participant.key_count(), 0, "evicted");
+        let counted = tables + entry_bytes(b"k") + participant.gone.bytes();
+        assert_eq!(participant.holding(), counted, "held by the worker");
+        participant.on_cycle(3 * CYCLE);
+        assert!(held.upgrade().is_some());
+        assert_eq!(participant.holding(), counted, "still held");
+        handles.retain(|held| !held.entry().closed());
+        participant.on_cycle(4 * CYCLE);
+        assert!(held.upgrade().is_none(), "scheduled: {scheduled}: freed");
+        assert_eq!(participant.holding(), tables, "scheduled: {scheduled}");
+    }
+}
+
+/// A key evicted once idle counts until the last worker holding its entry lets go, scheduled
+/// or not.
+#[test]
+fn an_idle_entry_evicted_counts_until_the_workers_let_go() {
+    for scheduled in [false, true] {
+        let mut participant = participant();
+        participant.set_scheduled(scheduled);
+        participant.set_levers(Levers { poll_quiet: false });
+        let c = contract(100, 10);
+        participant.ensure(b"k", c, 0);
+        participant.on_cycle(CYCLE);
+        let _ = participant.take_outgoing();
+        let entry = participant.entries(&[(b"k", c)]).remove(0);
+        let held = Arc::downgrade(&entry);
+        let tables = participant.tables();
+        let mut at = CYCLE;
+        while participant.key_count() > 0 && at < 2_000 * MS {
+            at += CYCLE;
+            participant.on_cycle(at);
+            let _ = participant.take_outgoing();
+        }
+        assert_eq!(participant.key_count(), 0, "scheduled: {scheduled}: idle");
+        assert_eq!(
+            participant.holding(),
+            tables + entry_bytes(b"k") + participant.gone.bytes(),
+            "scheduled: {scheduled}: held"
+        );
+        drop(entry);
+        participant.on_cycle(at + CYCLE);
+        assert!(held.upgrade().is_none(), "scheduled: {scheduled}: freed");
+        assert_eq!(participant.holding(), tables, "scheduled: {scheduled}");
+    }
+}
+
 /// Scheduled, the two lists of keys to visit keep their room from cycle to cycle, however
 /// few keys later cycles visit: a list made for each cycle grows from nothing and is freed,
 /// which, for a large one, holds up the workers (06 §4).
@@ -2954,11 +3131,13 @@ fn a_participant_past_its_capacity_evicts_the_least_recently_used() {
         settle(&mut participant, &mut pod, now);
     }
     let each = entry_bytes(&keys[0]);
-    // The tables keep their room whatever is evicted: room for three keys beside them,
-    // nine tenths of it for two.
+    // The tables keep their room whatever is evicted: a cap whose nine tenths hold them and
+    // two keys and a half. None counted as made lately, which would leave room for all five,
+    // made within the span.
     let tables = participant.tables();
     assert_eq!(participant.holding(), tables + 5 * each);
-    participant.set_capacity(tables + 3 * each);
+    participant.lately = Lately::default();
+    participant.set_capacity((tables + 2 * each + each / 2) * 10 / 9);
     participant.on_cycle(5 * MS);
     let kept = |participant: &Participant<FixedState, Pods>| -> Vec<bool> {
         keys.iter()
@@ -2983,6 +3162,47 @@ fn a_participant_past_its_capacity_evicts_the_least_recently_used() {
     assert_eq!(participant.evicted(), 5);
     assert_eq!(participant.forgiven(), 2);
     assert_eq!(participant.holding(), tables, "the tables' room alone");
+}
+
+/// With many keys, a participant finds where eviction stops from a sample of its shards,
+/// each key read counted for the shards not read: it still takes the least recently used,
+/// and as many as the cap needs to within a twentieth.
+#[test]
+fn a_participant_evicting_from_a_sample_takes_the_least_recently_used_and_about_as_many() {
+    let mut participant = participant();
+    let c = contract(100, 10);
+    let keys = cutoff::SAMPLED_FROM as u64;
+    let name = |n: u64| format!("key{n:08}").into_bytes();
+    // Last asked for 0 to 15 ms in, mixed over the keys.
+    let asked = |n: u64| (n.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60) * MS;
+    for n in 0..keys {
+        participant.ensure(&name(n), c, asked(n));
+    }
+    assert!(
+        cutoff::stride(participant.key_count()) > 1,
+        "read from a sample"
+    );
+    let each = entry_bytes(&name(0));
+    let room = keys / 2;
+    participant.set_capacity((participant.tables() + room * each + each / 2) * 10 / 9);
+    participant.on_cycle(20 * MS);
+    let kept = participant.key_count() as u64;
+    assert!(
+        kept.abs_diff(room) <= room / 20,
+        "kept {kept} keys, room for {room}"
+    );
+    let participant = &participant;
+    let asked_of = |kept: bool| {
+        (0..keys)
+            .filter(move |n| participant.keys.get(&name(*n)).is_some() == kept)
+            .map(asked)
+    };
+    // Least recently used: every key evicted asked for before any kept.
+    let (latest_evicted, earliest_kept) = (asked_of(false).max(), asked_of(true).min());
+    assert!(
+        latest_evicted <= earliest_kept,
+        "evicted keys asked for up to {latest_evicted:?}, kept from {earliest_kept:?}"
+    );
 }
 
 /// As `DataPlane`'s: exchanges overlapping, a bucket of one that refills faster than a round

@@ -33,6 +33,8 @@ mod tests;
 pub use crate::service::Contract;
 pub use rolling::MOST_SLOTS;
 
+use crate::chunked::List;
+use crate::cutoff::{self, Count, First, Lately, Places};
 use edgerush_memory::{allocation, arc};
 use key_set::KeySet;
 use rolling::Ring;
@@ -621,6 +623,12 @@ pub struct Local<S> {
     hasher: S,
     /// The keys' own bytes, as [`key_bytes`] counts them.
     holding: AtomicU64,
+    /// The keys let go of — forgotten, evicted or replaced — while a worker's handles may
+    /// still hold them: kept until none does, so that they count until they are freed
+    /// ([`Self::release`]).
+    gone: RwLock<Gone>,
+    /// What those take ([`Gone::bytes`]), read without the lock.
+    gone_bytes: AtomicU64,
     /// What the tables of the keys take, the registry's and the workers' handles', as glibc
     /// allocates them: added to as they grow, and given back as a worker's handles go.
     tables: Arc<AtomicU64>,
@@ -629,6 +637,26 @@ pub struct Local<S> {
     /// Each limit's terms, which its keys point to: read when a key is made, and let go of
     /// by the sweep once no key holds them.
     terms: RwLock<HashMap<Limit, Arc<Terms>>>,
+}
+
+/// The keys a [`Local`] has let go of that handles may still hold.
+#[derive(Debug)]
+struct Gone {
+    keys: List<Arc<Key>>,
+    /// Their bytes, as [`key_bytes`] counts them.
+    held: u64,
+    /// The bytes of every key let go of, all told: with those held, the bytes of every key
+    /// made.
+    let_go: u64,
+    /// The bytes of keys made lately, which eviction leaves room for.
+    lately: Lately,
+}
+
+impl Gone {
+    /// What they take: their own bytes, and the list's room.
+    fn bytes(&self) -> u64 {
+        self.held.saturating_add(self.keys.bytes())
+    }
 }
 
 /// The bytes a key of `key` under `limit` is counted as taking in memory beside its handles:
@@ -655,6 +683,13 @@ impl<S: BuildHasher + Clone> Local<S> {
                 .collect(),
             hasher,
             holding: AtomicU64::new(0),
+            gone: RwLock::new(Gone {
+                keys: List::new(),
+                held: 0,
+                let_go: 0,
+                lately: Lately::default(),
+            }),
+            gone_bytes: AtomicU64::new(0),
             tables: Arc::new(AtomicU64::new(0)),
             capacity: AtomicU64::new(u64::MAX),
             evicted: AtomicU64::new(0),
@@ -668,13 +703,20 @@ impl<S: BuildHasher + Clone> Local<S> {
         self.capacity.store(bytes, Ordering::Relaxed);
     }
 
-    /// The bytes its keys take in memory: each key's own ([`key_bytes`]) and the tables
-    /// holding them ([`tables`](Self::tables)).
+    /// The bytes its keys take in memory: each key's own ([`key_bytes`]), those of keys let go
+    /// of until no handle holds them, and the tables holding them ([`tables`](Self::tables)).
     #[must_use]
     pub fn holding(&self) -> u64 {
         self.holding
             .load(Ordering::Relaxed)
+            .saturating_add(self.gone_bytes.load(Ordering::Relaxed))
             .saturating_add(self.tables())
+    }
+
+    /// The room of its list of keys let go of, beside their own bytes: for the tests.
+    #[cfg(test)]
+    pub(crate) fn gone_room(&self) -> u64 {
+        write(&self.gone).keys.bytes()
     }
 
     /// Its registry's tables alone, as [`tables`](Self::tables) counts them: a walk, for the
@@ -748,8 +790,8 @@ impl<S: BuildHasher + Clone> Local<S> {
                 return Arc::clone(found);
             }
             found.close();
-            self.holding
-                .fetch_sub(key_bytes(key, found.limit()), Ordering::Relaxed);
+            let old = Arc::clone(found);
+            self.let_go([old]);
         }
         let terms = match contract {
             Limit::RollingWindow(_) => Arc::new(Terms::new(contract)),
@@ -833,18 +875,19 @@ impl<S: BuildHasher + Clone> Local<S> {
     /// every second or so, off the request path.
     pub fn sweep(&self, now: u64, quiet: u64) -> Swept {
         let mut swept = Swept::default();
-        let mut freed = 0;
+        let mut forgotten = Vec::new();
         for shard in &self.shards {
             write(shard).retain(|key| {
                 let forget = key.close_if_forgettable(now, quiet);
                 if forget {
-                    swept.forgotten += 1;
-                    freed += key_bytes(&key.key, key.limit());
+                    forgotten.push(Arc::clone(key));
                 }
                 !forget
             });
+            swept.forgotten += forgotten.len() as u64;
+            self.let_go(forgotten.drain(..));
         }
-        self.holding.fetch_sub(freed, Ordering::Relaxed);
+        self.release();
         // Held by the map alone: no key points to them, and none can be made meanwhile, as
         // making one takes the map's lock to find them.
         write(&self.terms).retain(|_, terms| Arc::strong_count(terms) > 1);
@@ -852,47 +895,109 @@ impl<S: BuildHasher + Clone> Local<S> {
         swept
     }
 
-    /// Past the cap, evicts the keys whose buckets will be full soonest at `now`, down to
-    /// nine tenths of it; how many. Within it, reads one count and returns, so that it can
-    /// be taken far more often than a sweep, keys being made between sweeps faster than the
-    /// cap allows (GitHub #410). Off the request path.
+    /// Frees the keys let go of that no handle holds any longer, and past the cap evicts the
+    /// keys whose buckets will be full soonest at `now`, down to nine tenths of it; how many.
+    /// Within the cap, reads a few counts and returns, so that it can be taken far more often
+    /// than a sweep, keys being made between sweeps faster than the cap allows (GitHub #410).
+    /// Off the request path.
+    ///
+    /// The cap is held by the keys kept and their tables, with room left for the keys made
+    /// over the last [`HANDLES_PRUNED`](crate::HANDLES_PRUNED): what workers may go on
+    /// holding of keys let go of. Those still held count in [`holding`](Self::holding) until
+    /// they are freed but not here, as evicting more frees none of them sooner, and counted
+    /// here each look would evict another tenth while they wait (#602). Eviction finds its
+    /// keys in three passes, with nothing beside them but a table of 8 KB: one finding the
+    /// span of when they will be full, one counting each key's bytes over that span, both
+    /// over a sample of the shards when there are many keys, and the last, over every shard
+    /// a shard at a time under its lock, evicting those full before the time the bytes needed
+    /// end at.
     pub fn evict(&self, now: u64) -> u64 {
+        self.release();
         let capacity = self.capacity.load(Ordering::Relaxed);
-        if self.holding() <= capacity {
+        let lately = {
+            let mut gone = write(&self.gone);
+            let made = self.holding.load(Ordering::Relaxed) + gone.let_go;
+            gone.lately.at(now, made)
+        };
+        let holding = self.holding.load(Ordering::Relaxed) + self.tables() + lately;
+        if holding <= capacity {
             return 0;
         }
-        let mut evicted = 0;
-        let mut keys: Vec<(u64, Arc<Key>)> = self
-            .shards
-            .iter()
-            .flat_map(|shard| {
-                read(shard)
-                    .iter()
-                    .map(|key| (key.full_in(now), Arc::clone(key)))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        keys.sort_unstable_by_key(|(full_in, _)| *full_in);
         let target = capacity - capacity / 10;
-        for (_, key) in keys {
-            if self.holding() <= target {
-                break;
-            }
-            let hash = self.hasher.hash_one(&*key.key);
-            let mut set = write(self.shard(hash));
-            if set
-                .get_hashed(hash, &key.key)
-                .is_some_and(|held| Arc::ptr_eq(held, &key))
-            {
-                key.close();
-                set.remove(&key.key);
-                self.holding
-                    .fetch_sub(key_bytes(&key.key, key.limit()), Ordering::Relaxed);
-                self.evicted.fetch_add(1, Ordering::Relaxed);
-                evicted += 1;
+        let stride = cutoff::stride(self.key_count());
+        let mut span = Places::default();
+        for shard in self.shards.iter().step_by(stride) {
+            for key in read(shard).iter() {
+                span.add(key.full_in(now));
             }
         }
+        let mut count = Count::new(First::Least, span, stride);
+        for shard in self.shards.iter().step_by(stride) {
+            for key in read(shard).iter() {
+                count.add(key.full_in(now), key_bytes(&key.key, key.limit()));
+            }
+        }
+        let mut stop = count.stop(holding - target);
+        let mut evicted = 0;
+        let mut evicting = Vec::new();
+        for shard in &self.shards {
+            write(shard).retain(|key| {
+                let evict = stop.takes(key.full_in(now), key_bytes(&key.key, key.limit()));
+                if evict {
+                    key.close();
+                    evicting.push(Arc::clone(key));
+                }
+                !evict
+            });
+            evicted += evicting.len() as u64;
+            self.let_go(evicting.drain(..));
+            if stop.done() {
+                break;
+            }
+        }
+        self.evicted.fetch_add(evicted, Ordering::Relaxed);
+        self.release();
         evicted
+    }
+
+    /// Takes `keys`, closed and out of the registry, off what it holds and onto what it has let
+    /// go of, counted there until no handle holds them. No other lock is taken while the
+    /// list's is held, so a worker may let go of a key under its shard's lock.
+    fn let_go(&self, keys: impl IntoIterator<Item = Arc<Key>>) {
+        let mut keys = keys.into_iter().peekable();
+        if keys.peek().is_none() {
+            return;
+        }
+        let mut gone = write(&self.gone);
+        let mut moved = 0;
+        for key in keys {
+            moved += key_bytes(&key.key, key.limit());
+            gone.keys.push(key);
+        }
+        gone.held += moved;
+        gone.let_go += moved;
+        // Counted as let go of before it stops counting as held: never under what is there.
+        self.gone_bytes.store(gone.bytes(), Ordering::Relaxed);
+        self.holding.fetch_sub(moved, Ordering::Relaxed);
+    }
+
+    /// Frees the keys let go of that only its list holds: none is in the registry, so no
+    /// worker can take a handle to one again, and one so held stays so.
+    fn release(&self) {
+        if self.gone_bytes.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut gone = write(&self.gone);
+        let mut freed = 0;
+        gone.keys.retain(|key| {
+            let held = Arc::strong_count(key) > 1;
+            if !held {
+                freed += key_bytes(&key.key, key.limit());
+            }
+            held
+        });
+        gone.held -= freed;
+        self.gone_bytes.store(gone.bytes(), Ordering::Relaxed);
     }
 }
 

@@ -147,7 +147,9 @@ impl LocalLimiter {
         });
         let held: RcWeak<Self> = Rc::downgrade(&limiter);
         tokio::task::spawn_local(async move {
-            let mut every = tokio::time::interval(SWEEP / HANDLE_PARTS as u32);
+            let mut every = tokio::time::interval(
+                Duration::from_nanos(edgerush_ratelimit::HANDLES_PRUNED) / HANDLE_PARTS as u32,
+            );
             every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 every.tick().await;
