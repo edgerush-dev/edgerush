@@ -1444,7 +1444,7 @@ async fn a_data_plane_behind_is_told_elsewhere_and_asks_the_owner_named() {
     assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
 }
 
-/// A data plane that cannot reach a key's owner — its stream down or its breaker open — asks
+/// A data plane that cannot reach a key's owner — its stream down or the pod marked down — asks
 /// another pod, the one the key picks, which forwards it: counted once, at the owner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_whose_owner_is_out_of_reach_is_forwarded_and_counted_once() {

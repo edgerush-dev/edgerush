@@ -34,8 +34,9 @@
 #     ingress, or two entries of one class; rate limiting of a mode the DataPlane does not
 #     take or of none, a bound on keys with it disabled, the synchronous mode without how
 #     a request waits or that given in another mode, a wait without what decides an owner
-#     unheard, that in lower case, or of no time, a reconnect after no timeout, a breaker
-#     opened by no failure or never tried again, the asynchronous mode's settings in
+#     unheard, that in lower case, or of no time, a reconnect after no timeout, a wait
+#     without how pods are checked, checks of no interval, of no time, marking a pod down
+#     by no miss or not saying how many, the asynchronous mode's settings in
 #     another or a cycle of no time, a
 #     limit of no model or of two, keyed by what it does not know, a rate or a
 #     window of no unit, a rolling window of one slot, a method in lower case, a path
@@ -277,7 +278,7 @@ admitted "a DataPlane limiting locally under a limit of each model" "$(limiting 
       - { name: writes, match: { methods: [POST], pathPrefix: /v1/ }, key: Client, model: { fixedWindow: { limit: 10, window: 1m } }, dryRun: true }
       - { name: hourly, key: Client, model: { rollingWindow: { limit: 100, window: 1h, slots: 60 } } }')"
 admitted "a DataPlane whose rate limiting is disabled" "$(limiting '{ mode: Disabled }')"
-waits='{ timeoutMs: 20, whenUnreachable: Local, breaker: { failures: 5, probeAfterMs: 1000 } }'
+waits='{ timeoutMs: 20, whenUnreachable: Local, healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 3 } }'
 admitted "a DataPlane limiting synchronously" "$(limiting "
     mode: Synchronous
     maxKeyBytes: 1048576
@@ -286,7 +287,7 @@ admitted "a DataPlane limiting synchronously" "$(limiting "
 reconnect=$(k apply --dry-run=server -o jsonpath='{.spec.rateLimiting.synchronous.timeoutsBeforeReconnect}' -f - <<<"$(limiting "{ mode: Synchronous, synchronous: $waits }")")
 [ "$reconnect" = 2 ] || fail "a synchronous wait left to its default reconnects after $reconnect"
 pass "a synchronous wait left to its default reconnects after two timeouts in a row"
-admitted "a synchronous wait reconnecting after one timeout" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, timeoutsBeforeReconnect: 1, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
+admitted "a synchronous wait reconnecting after one timeout" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, timeoutsBeforeReconnect: 1, healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 3 } } }')"
 admitted "a DataPlane limiting asynchronously, of every default" "$(limiting '{ mode: Asynchronous }')"
 admitted "a DataPlane limiting asynchronously, of each setting" "$(limiting '{ mode: Asynchronous, asynchronous: { cycleMs: 20, pollQuietKeys: true, scheduleKeys: false } }')"
 refused "a rate-limiting mode the DataPlane does not take" "spec.rateLimiting.mode" "$(limiting '{ mode: Off }')"
@@ -294,12 +295,15 @@ refused "rate limiting of no mode" "spec.rateLimiting.mode" "$(limiting '{ globa
 refused "a bound on keys with rate limiting disabled" "not Disabled" "$(limiting '{ mode: Disabled, maxKeyBytes: 1048576 }')"
 refused "the synchronous mode without how a request waits" "synchronous must be given" "$(limiting '{ mode: Synchronous }')"
 refused "how a request waits for its owner, in another mode" "synchronous must be given" "$(limiting "{ mode: Asynchronous, synchronous: $waits }")"
-refused "a synchronous wait without what decides an owner unheard" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
-refused "what decides an owner unheard, in lower case" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: allow, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
-refused "a wait for the owner of no time" "spec.rateLimiting.synchronous.timeoutMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 0, whenUnreachable: Allow, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
-refused "a reconnect after no timeout" "spec.rateLimiting.synchronous.timeoutsBeforeReconnect" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, timeoutsBeforeReconnect: 0, breaker: { failures: 5, probeAfterMs: 1000 } } }')"
-refused "a breaker opened by no failure" "spec.rateLimiting.synchronous.breaker.failures" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, breaker: { failures: 0, probeAfterMs: 1000 } } }')"
-refused "a breaker never tried again" "spec.rateLimiting.synchronous.breaker.probeAfterMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, breaker: { failures: 5 } } }')"
+refused "a synchronous wait without what decides an owner unheard" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 3 } } }')"
+refused "what decides an owner unheard, in lower case" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: allow, healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 3 } } }')"
+refused "a wait for the owner of no time" "spec.rateLimiting.synchronous.timeoutMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 0, whenUnreachable: Allow, healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 3 } } }')"
+refused "a reconnect after no timeout" "spec.rateLimiting.synchronous.timeoutsBeforeReconnect" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, timeoutsBeforeReconnect: 0, healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 3 } } }')"
+refused "a synchronous wait without how pods are checked" "spec.rateLimiting.synchronous.healthCheck" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow } }')"
+refused "checks of no interval" "spec.rateLimiting.synchronous.healthCheck.intervalMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, healthCheck: { intervalMs: 0, timeoutMs: 1000, misses: 3 } } }')"
+refused "a check of no time" "spec.rateLimiting.synchronous.healthCheck.timeoutMs" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, healthCheck: { intervalMs: 100, timeoutMs: 0, misses: 3 } } }')"
+refused "a pod marked down by no miss" "spec.rateLimiting.synchronous.healthCheck.misses" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 0 } } }')"
+refused "checks without how many misses" "spec.rateLimiting.synchronous.healthCheck.misses" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, healthCheck: { intervalMs: 100, timeoutMs: 1000 } } }')"
 refused "the asynchronous mode's settings in another" "asynchronous is for the Asynchronous mode alone" "$(limiting "{ mode: Synchronous, synchronous: $waits, asynchronous: { cycleMs: 20 } }")"
 refused "a cycle of no time" "spec.rateLimiting.asynchronous.cycleMs" "$(limiting '{ mode: Asynchronous, asynchronous: { cycleMs: 0 } }')"
 refused "a limit of no model" "one of bucket, fixedWindow and rollingWindow" "$(limit 'key: Client, model: {}')"

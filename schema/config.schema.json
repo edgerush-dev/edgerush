@@ -1196,18 +1196,24 @@
         }
       ]
     },
-    "RateLimitBreaker": {
-      "description": "A data plane's breaker for each owner, which its workers share: open, nothing is asked\nof the owner and `when_unreachable` decides at once.",
+    "RateLimitHealthCheck": {
+      "description": "How a data plane checks each pod of the store, on a thread of each process's own and a\nstream of its own, apart from its workers' requests: a check goes through the pod's task\nthat answers asks, counting nothing. Only the checks mark a pod down, and its keys go\nthrough another member meanwhile, or, none left, to `when_unreachable`; a worker's\ntimeouts decide only its own requests.",
       "type": "object",
       "properties": {
-        "failures": {
-          "description": "Timeouts and broken streams in a row, on any worker, that open it; any answer\nstarts the count again.",
+        "interval_ms": {
+          "description": "Milliseconds between checks of a pod.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "misses": {
+          "description": "Checks missed in a row that mark a pod down. A check refused — its stream broke and\ncould not be opened again — marks it down at once, and one answered marks it up.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1
         },
-        "probe_after_ms": {
-          "description": "Milliseconds open before a stream is opened to the owner again, without a request:\nthe owner's first word on it closes the breaker, and none leaves it open as long\nagain.",
+        "timeout_ms": {
+          "description": "Milliseconds a check waits for its answer before it is missed.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1
@@ -1215,8 +1221,9 @@
       },
       "additionalProperties": false,
       "required": [
-        "failures",
-        "probe_after_ms"
+        "interval_ms",
+        "timeout_ms",
+        "misses"
       ]
     },
     "RateLimitMode": {
@@ -1341,9 +1348,9 @@
       "description": "How a request waits for its key's owner in the synchronous mode, and what decides it\nwhen the owner does not answer. Every\nfield but `timeouts_before_reconnect` is required: how a data plane behaves when its\nowners are out of reach is the operator's to say.",
       "type": "object",
       "properties": {
-        "breaker": {
-          "description": "When the data plane stops asking an owner that does not answer, and when it tries\nit again.",
-          "$ref": "#/$defs/RateLimitBreaker"
+        "health_check": {
+          "description": "How the data plane checks each pod, which alone marks a pod down or up.",
+          "$ref": "#/$defs/RateLimitHealthCheck"
         },
         "timeout_ms": {
           "description": "Milliseconds a request waits for its owner's answer before `when_unreachable`\ndecides it.",
@@ -1362,7 +1369,7 @@
           "minimum": 1
         },
         "when_unreachable": {
-          "description": "What decides a request whose owner does not answer in time, or whose breaker is\nopen.",
+          "description": "What decides a request whose owner does not answer in time, or whose key no pod\nmarked up is left to ask.",
           "$ref": "#/$defs/WhenUnreachable"
         }
       },
@@ -1370,7 +1377,7 @@
       "required": [
         "timeout_ms",
         "when_unreachable",
-        "breaker"
+        "health_check"
       ]
     },
     "RateLimiting": {

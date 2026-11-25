@@ -125,11 +125,11 @@ impl Plane {
     }
 
     /// The member to ask about `key`: its owner, unless `avoid` says the owner is out of reach
-    /// (its stream down, its breaker open, or it said it is not serving); then, to forward it,
-    /// one of its shard's replicas not avoided, holding a copy it may decide the key from while
-    /// its owner is failed over; else another member not avoided. Each is chosen by the key,
-    /// not at random, so that an owner's keys spread over those it may go through rather than
-    /// falling on one. None with no table, or with every member avoided.
+    /// (its stream down, marked down by its checks, or it said it is not serving); then, to
+    /// forward it, one of its shard's replicas not avoided, holding a copy it may decide the key
+    /// from while its owner is failed over; else another member not avoided. Each is chosen by
+    /// the key, not at random, so that an owner's keys spread over those it may go through
+    /// rather than falling on one. None with no table, or with every member avoided.
     pub fn through(&self, key: Key, avoid: impl Fn(NodeId) -> bool) -> Option<NodeId> {
         let table = self.table.as_ref()?;
         if let Some(owner) = self.owner(key).filter(|owner| !avoid(*owner)) {

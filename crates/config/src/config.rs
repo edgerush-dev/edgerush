@@ -149,8 +149,8 @@ pub struct RateLimitSynchronous {
     /// decides it.
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub timeout_ms: u64,
-    /// What decides a request whose owner does not answer in time, or whose breaker is
-    /// open.
+    /// What decides a request whose owner does not answer in time, or whose key no pod
+    /// marked up is left to ask.
     pub when_unreachable: WhenUnreachable,
     /// Timeouts in a row on a worker's own connection to a pod, with no answer read on it
     /// between, after which that worker asks the pod on a new connection, still reading the
@@ -159,9 +159,8 @@ pub struct RateLimitSynchronous {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub timeouts_before_reconnect: Option<u32>,
-    /// When the data plane stops asking an owner that does not answer, and when it tries
-    /// it again.
-    pub breaker: RateLimitBreaker,
+    /// How the data plane checks each pod, which alone marks a pod down or up.
+    pub health_check: RateLimitHealthCheck,
 }
 
 /// What decides a request whose owner does not answer.
@@ -177,21 +176,25 @@ pub enum WhenUnreachable {
     Local,
 }
 
-/// A data plane's breaker for each owner, which its workers share: open, nothing is asked
-/// of the owner and `when_unreachable` decides at once.
+/// How a data plane checks each pod of the store, on a thread of each process's own and a
+/// stream of its own, apart from its workers' requests: a check goes through the pod's task
+/// that answers asks, counting nothing. Only the checks mark a pod down, and its keys go
+/// through another member meanwhile, or, none left, to `when_unreachable`; a worker's
+/// timeouts decide only its own requests.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct RateLimitBreaker {
-    /// Timeouts and broken streams in a row, on any worker, that open it; any answer
-    /// starts the count again.
+pub struct RateLimitHealthCheck {
+    /// Milliseconds between checks of a pod.
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub failures: u32,
-    /// Milliseconds open before a stream is opened to the owner again, without a request:
-    /// the owner's first word on it closes the breaker, and none leaves it open as long
-    /// again.
+    pub interval_ms: u64,
+    /// Milliseconds a check waits for its answer before it is missed.
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
-    pub probe_after_ms: u64,
+    pub timeout_ms: u64,
+    /// Checks missed in a row that mark a pod down. A check refused — its stream broke and
+    /// could not be opened again — marks it down at once, and one answered marks it up.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub misses: u32,
 }
 
 /// The rate-limiting service: where a data plane first finds its store, the secret keys are

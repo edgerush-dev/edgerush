@@ -1331,6 +1331,23 @@ pub const fn checked(id: u64) -> Telling {
     }
 }
 
+/// Check `id`, as a data plane's stream carries it up.
+#[must_use]
+pub const fn asking_check(id: u64) -> Asking {
+    Asking {
+        asked: Some(Asked::Check(Check { id })),
+    }
+}
+
+/// The number of the check `telling` answers, if it answers one.
+#[must_use]
+pub const fn told_checked(telling: &Telling) -> Option<u64> {
+    match &telling.told {
+        Some(Told::Checked(check)) => Some(check.id),
+        _ => None,
+    }
+}
+
 /// A data plane's `message` as its stream carries it up: a request or a request to gather;
 /// none for anything else.
 #[must_use]
@@ -2169,14 +2186,13 @@ mod tests {
     #[test]
     fn a_check_and_its_answer_come_through_the_stream_and_are_never_the_modes() {
         for id in [0, 7, u64::MAX] {
-            let asked = Asking {
-                asked: Some(Asked::Check(Check { id })),
-            };
+            let asked = asking_check(id);
             let decoded = Asking::decode(asked.encode_to_vec().as_slice()).unwrap();
             assert_eq!(check(&decoded), Some(id));
             assert_eq!(asked_from::<SyncValue>(decoded, 1), Err(Invalid::Check));
             let told = Telling::decode(checked(id).encode_to_vec().as_slice()).unwrap();
             assert_eq!(told, checked(id));
+            assert_eq!(told_checked(&told), Some(id));
             assert_eq!(told_from(told), Err(Invalid::Check));
         }
         let gather = asking(SyncMessage::Gather {
@@ -2186,6 +2202,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(check(&gather), None);
+        let reply = telling(SyncMessage::<SyncValue>::Reply {
+            client: 0,
+            id: 1,
+            answer: SyncAnswer::Counted(0),
+        });
+        assert_eq!(reply.as_ref().and_then(told_checked), None);
     }
 
     proptest! {

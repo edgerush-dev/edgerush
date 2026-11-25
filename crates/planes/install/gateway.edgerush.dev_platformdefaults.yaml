@@ -457,30 +457,38 @@ spec:
                                 no other takes. Every field but TimeoutsBeforeReconnect is required, as how
                                 a proxy behaves when its owners are out of reach is the DataPlane's to say.
                               properties:
-                                breaker:
+                                healthCheck:
                                   description: |-
-                                    Breaker is when a proxy stops asking an owner that does not answer, and
-                                    when it tries it again: open, nothing is asked of the owner and
-                                    WhenUnreachable decides at once.
+                                    HealthCheck is how a proxy checks each pod of the rate-limiting
+                                    service, on a thread and a stream of its own, apart from its requests;
+                                    only the checks mark a pod down, its keys going through another pod
+                                    meanwhile, or, none left, to WhenUnreachable. A proxy's timeouts decide
+                                    only their own requests.
                                   properties:
-                                    failures:
+                                    intervalMs:
+                                      description: IntervalMs is milliseconds between checks of a pod.
+                                      format: int64
+                                      minimum: 1.0
+                                      type: integer
+                                    misses:
                                       description: |-
-                                        Failures is timeouts and broken streams in a row that open it; any
-                                        answer starts the count again.
+                                        Misses is checks missed in a row that mark a pod down. A check
+                                        refused, its stream broken and not opened again, marks it down at
+                                        once, and one answered marks it up.
                                       format: int32
                                       minimum: 1.0
                                       type: integer
-                                    probeAfterMs:
+                                    timeoutMs:
                                       description: |-
-                                        ProbeAfterMs is milliseconds open before the owner is tried again,
-                                        without a request: its first word closes the breaker, and none leaves
-                                        it open as long again.
+                                        TimeoutMs is milliseconds a check waits for its answer before it is
+                                        missed.
                                       format: int64
                                       minimum: 1.0
                                       type: integer
                                   required:
-                                  - failures
-                                  - probeAfterMs
+                                  - intervalMs
+                                  - misses
+                                  - timeoutMs
                                   type: object
                                 timeoutMs:
                                   description: |-
@@ -502,7 +510,7 @@ spec:
                                 whenUnreachable:
                                   description: |-
                                     WhenUnreachable is what decides a request whose owner does not answer
-                                    in time, or whose breaker is open:
+                                    in time, or whose key no pod marked up is left to ask:
                         
                                     * Allow: it goes on, as under no limit.
                                     * Deny: it is refused, 503 with Retry-After: 1, as the service failed, not the client.
@@ -513,7 +521,7 @@ spec:
                                   - Local
                                   type: string
                               required:
-                              - breaker
+                              - healthCheck
                               - timeoutMs
                               - whenUnreachable
                               type: object

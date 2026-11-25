@@ -9,7 +9,7 @@
 //! A worker first asks the pods at `service.addresses`, its seeds, for the table, and then
 //! reaches each member at the address the table gives it. A key whose owner says it is
 //! elsewhere is asked of the owner the newer table names; one whose owner is not serving, or
-//! that never reached its owner — the stream to it down, or its breaker open — goes through
+//! that never reached its owner — the stream to it down, or the pod marked down — goes through
 //! another member, chosen by the key, which forwards it. One unanswered in time leaves the
 //! request to `when_unreachable`, and is never asked again: it may have been counted.
 //!
@@ -19,14 +19,17 @@
 //! are over and a while past, so that an admission that comes late is given back, and one
 //! connection drains at a time. That marks the pod down for no one.
 //!
-//! The process keeps a breaker for each member, which its workers share: after `failures` in
-//! a row it opens, and every worker sends that member's keys through another at once. A
-//! thread of the process's own probes it after `probe_after`, opening a stream of its own: the
-//! member's table, told first on every stream, closes it.
+//! A thread of the process's own checks each seed and member its workers have met, on a
+//! stream of its own: a check every `check_interval`, which the pod's task answers in its
+//! turn, behind what it was asked before, counting nothing. `check_misses` missed in a row
+//! mark the pod down, as does its stream broken and not opened again, and one answered marks
+//! it up; a pod starts up. Marked down, every worker sends its keys another way at once,
+//! letting go of its own stream to it. Only the checks mark a pod down: a worker's timeouts,
+//! the pod slow or the worker behind, decide only its own requests.
 //!
 //! With `when_unreachable: local`, the keys of the owners out of reach are decided from the
 //! process's own keys, as local mode decides (`super::local`): each made full when first met
-//! without its owner and kept from one outage to the next until the sweep, on the probe
+//! without its owner and kept from one outage to the next until the sweep, on the checking
 //! thread, forgets it full and idle. Nothing is charged there while the owners answer.
 
 use super::local::{LocalLimiter, Process as LocalKeys};
@@ -40,15 +43,15 @@ use edgerush_ratelimit_service::cluster::link::Dial;
 use edgerush_ratelimit_service::cluster::plane::{
     Answer, Due, GIVE_BACK_AGAIN, GIVE_BACK_LATER, Giving, NodeId, Plane, Rule, Told,
 };
-use edgerush_ratelimit_service::cluster::pod::decide_stream;
+use edgerush_ratelimit_service::cluster::pod::{DecideStream, decide_stream};
 use edgerush_ratelimit_service::cluster::wire::{self, Asking, Telling};
 use edgerush_telemetry::{Counter, Sharded};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -57,12 +60,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// another way, as if its stream were down.
 const QUEUED: usize = 1_024;
 
-/// How long a probe waits for a member's table: to connect and to hear from it.
-const PROBE_WAIT: Duration = Duration::from_secs(1);
-
-/// How often the probe thread looks for breakers due a probe, at most: probes come no
-/// later than this after their time.
-const PROBE_LOOK: Duration = Duration::from_millis(50);
+/// How often the checking thread looks for seeds and members met and not yet checked, and
+/// takes the process's own keys' turn with `when_unreachable: local`.
+const LOOK: Duration = Duration::from_millis(50);
 
 /// How long a connection given up for a new one is still read past the longest any ask on
 /// it may wait: the asks on it have all given up by then, and an admission of theirs that
@@ -75,7 +75,8 @@ const DRAINING: Duration = Duration::from_secs(1);
 const SENDS_A_KEY: u8 = 4;
 
 /// The process's side of the synchronous mode: the config its workers ask by, each seed and
-/// member of the store they have met with its breaker, and what is counted of them.
+/// member of the store they have met with what its checks say of it, and what is counted of
+/// them.
 #[derive(Debug)]
 pub(crate) struct Process {
     config: CompiledSynchronous,
@@ -87,29 +88,27 @@ pub(crate) struct Process {
     unreachable: Arc<Sharded<[Counter; 3]>>,
     /// The process's own keys, with `when_unreachable: local`.
     local: Option<Arc<LocalKeys>>,
-    /// The clock its breakers' times are read by, kept across a reload with them.
-    start: Instant,
     /// What its streams dial the pods with, if with TLS.
     tls: Option<watch::Receiver<SslConnector>>,
     workers: NonZeroUsize,
 }
 
 /// A seed or a member of the store, as a process's workers share it: where it is reached,
-/// the member there if a table has named it, its breaker, what was asked of it, and how
-/// often its workers gave a connection to it up for a new one.
+/// the member there if a table has named it, what its checks say of it, what was asked of
+/// it, and how often its workers gave a connection to it up for a new one.
 #[derive(Debug)]
 struct Member {
     address: String,
     id: Option<NodeId>,
-    breaker: Arc<Breaker>,
-    asks: Arc<OwnerAsks>,
+    health: Arc<Health>,
+    asks: Arc<PodAsks>,
     reconnects: Arc<Sharded<Counter>>,
 }
 
-/// What a process's workers' asks of one member came to.
-type OwnerAsks = Sharded<[Counter; 4]>;
+/// What a process's workers' asks of one pod came to.
+type PodAsks = Sharded<[Counter; 4]>;
 
-/// How an ask of a member ended.
+/// How an ask of a pod ended.
 #[derive(Clone, Copy)]
 enum Ended {
     Answered = 0,
@@ -117,29 +116,16 @@ enum Ended {
     Broken = 2,
     /// Answered as not serving: not ready, not failing.
     NotServing = 3,
-    /// Timed out, sent to a pod only to be forwarded: counted as timed out, but no failure of
-    /// that pod's.
-    ForwardedTimedOut = 4,
-}
-
-impl Ended {
-    /// Its place among an owner's counts: a forwarded ask's timeout is a timeout.
-    const fn counted(self) -> usize {
-        match self {
-            Self::ForwardedTimedOut => Self::TimedOut as usize,
-            how => how as usize,
-        }
-    }
 }
 
 impl Process {
     /// The process's synchronous mode for `config`, with `workers` workers, and the thread
-    /// that probes its members' open breakers, which calls `failed` if it panics.
+    /// that checks its seeds and members, which calls `failed` if it panics.
     ///
     /// A reload carries an outage's state across from the `running` one: every member met,
-    /// its breaker with it, whatever else changed, and the process's own keys while
-    /// `when_unreachable` stays `local`, within the new cap; so that tuning a setting
-    /// mid-outage neither closes the breakers nor hands out fresh buckets.
+    /// marked down or up as its checks last said, whatever else changed, and the process's
+    /// own keys while `when_unreachable` stays `local`, within the new cap; so that tuning a
+    /// setting mid-outage neither asks a pod down again nor hands out fresh buckets.
     pub(crate) fn start(
         config: CompiledSynchronous,
         workers: NonZeroUsize,
@@ -147,6 +133,22 @@ impl Process {
         running: Option<&Self>,
         tls: Option<SslConnector>,
     ) -> std::io::Result<Arc<Self>> {
+        let process = Self::new(config, workers, running, tls);
+        let checked = Arc::downgrade(&process);
+        std::thread::Builder::new()
+            .name("edgerush-rate-limit-check".to_owned())
+            .spawn(move || check(&checked, failed))?;
+        Ok(process)
+    }
+
+    /// The same, without the thread that checks: nothing marks a pod down or up. Its seeds
+    /// are met from the start, so that they are checked before any worker asks them.
+    fn new(
+        config: CompiledSynchronous,
+        workers: NonZeroUsize,
+        running: Option<&Self>,
+        tls: Option<SslConnector>,
+    ) -> Arc<Self> {
         let members = running.map_or_else(BTreeMap::new, |running| running.members().clone());
         let local = (config.when_unreachable == WhenUnreachable::Local).then(|| {
             match running.and_then(|running| running.local.as_ref()) {
@@ -164,26 +166,20 @@ impl Process {
                 |running| Arc::clone(&running.unreachable),
             ),
             local,
-            start: running.map_or_else(Instant::now, |running| running.start),
             config,
             // Fixed for its life: a reload that changes it starts another.
             tls: tls.map(|tls| watch::channel(tls).1),
             workers,
         });
-        let probed = Arc::downgrade(&process);
-        std::thread::Builder::new()
-            .name("edgerush-rate-limit-probe".to_owned())
-            .spawn(move || probe(&probed, failed))?;
-        Ok(process)
+        for seed in &process.config.addresses {
+            process.member_at(seed, None);
+        }
+        process
     }
 
     /// Whether it asks as `config` says, so that a reload saying the same keeps it.
     pub(crate) fn is_for(&self, config: &CompiledSynchronous) -> bool {
         self.config == *config
-    }
-
-    fn now(&self) -> u64 {
-        u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// The seeds and members met, a lock poisoned taken as it was: what it guards is a map
@@ -193,20 +189,20 @@ impl Process {
     }
 
     /// Whom `address` reaches, as the workers share it — a seed, with no `id`, or member `id`
-    /// — met now if not before. A seed's pod named a member keeps the seed's breaker; another
-    /// member at an address, the pod there restarted, starts with a breaker of its own
-    /// (decided: one a member).
+    /// — met now if not before. A seed's pod named a member keeps what the seed's checks
+    /// said; another member at an address, the pod there restarted, starts up, with counts of
+    /// its own (decided: one a member).
     fn member_at(&self, address: &str, id: Option<NodeId>) -> Arc<Member> {
         let mut members = self.members();
-        let (breaker, asks, reconnects) = match members.get(address) {
+        let (health, asks, reconnects) = match members.get(address) {
             Some(found) if id.is_none() || found.id == id => return Arc::clone(found),
             Some(found) if found.id.is_none() => (
-                Arc::clone(&found.breaker),
+                Arc::clone(&found.health),
                 Arc::clone(&found.asks),
                 Arc::clone(&found.reconnects),
             ),
             _ => (
-                Arc::new(Breaker::default()),
+                Arc::new(Health::default()),
                 Arc::new(Sharded::new(self.workers)),
                 Arc::new(Sharded::new(self.workers)),
             ),
@@ -214,7 +210,7 @@ impl Process {
         let member = Arc::new(Member {
             address: address.to_owned(),
             id,
-            breaker,
+            health,
             asks,
             reconnects,
         });
@@ -229,18 +225,9 @@ impl Process {
             .map_or(Dial::Plain, |tls| Dial::Secured(tls.clone()))
     }
 
-    /// Counts an ask of `member` that ended as `how`, and tells its breaker.
-    fn asked(&self, member: &Member, how: Ended) {
-        member.asks.local()[how.counted()].inc();
-        match how {
-            Ended::Answered => member.breaker.answered(),
-            Ended::TimedOut | Ended::Broken => {
-                member
-                    .breaker
-                    .failed(self.now(), self.config.breaker_failures);
-            }
-            Ended::NotServing | Ended::ForwardedTimedOut => {}
-        }
+    /// Counts an ask of `member` that ended as `how`: a count, which nothing is decided by.
+    fn asked(member: &Member, how: Ended) {
+        member.asks.local()[how as usize].inc();
     }
 
     /// What its own keys hold, in bytes, how many there are, and how many were evicted;
@@ -251,31 +238,52 @@ impl Process {
             .map_or_else(Usage::default, |local| local.usage())
     }
 
-    /// What its members' asks came to, their breakers, their workers' reconnects, and what was
-    /// left to `when_unreachable`, as metrics: each member labelled by its address, which a pod keeps
-    /// for its life, rather than its id, new each life.
+    /// What its pods' asks came to, what their checks said, their workers' reconnects, and
+    /// what was left to `when_unreachable`, as metrics: each pod labelled by its address,
+    /// which a pod keeps for its life, rather than its id, new each life.
     pub(crate) fn render_stats(&self) -> String {
         let members: Vec<Arc<Member>> = self.members().values().cloned().collect();
-        let mut out = String::from("# TYPE edgerush_rate_limit_owner_asks_total counter\n");
+        let mut out = String::from("# TYPE edgerush_rate_limit_pod_asks_total counter\n");
         let outcomes = ["answered", "timed_out", "broken", "not_serving"];
         for member in &members {
             for (at, outcome) in outcomes.iter().enumerate() {
                 let count: u64 = member.asks.sum(|counters| counters[at].get());
                 let _ = writeln!(
                     out,
-                    "edgerush_rate_limit_owner_asks_total{{pod=\"{}\",outcome=\"{outcome}\"}} {count}",
+                    "edgerush_rate_limit_pod_asks_total{{pod=\"{}\",outcome=\"{outcome}\"}} {count}",
                     member.address
                 );
             }
         }
-        out.push_str("# TYPE edgerush_rate_limit_owner_breaker_open gauge\n");
+        out.push_str("# TYPE edgerush_rate_limit_pod_down gauge\n");
         for member in &members {
             let _ = writeln!(
                 out,
-                "edgerush_rate_limit_owner_breaker_open{{pod=\"{}\"}} {}",
+                "edgerush_rate_limit_pod_down{{pod=\"{}\"}} {}",
                 member.address,
-                u8::from(member.breaker.is_open())
+                u8::from(member.health.is_down())
             );
+        }
+        out.push_str("# TYPE edgerush_rate_limit_pod_marked_down_total counter\n");
+        for member in &members {
+            let _ = writeln!(
+                out,
+                "edgerush_rate_limit_pod_marked_down_total{{pod=\"{}\"}} {}",
+                member.address,
+                member.health.marked_down.load(Ordering::Relaxed)
+            );
+        }
+        out.push_str("# TYPE edgerush_rate_limit_pod_checks_total counter\n");
+        let outcomes = ["answered", "missed", "refused"];
+        for member in &members {
+            for (at, outcome) in outcomes.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "edgerush_rate_limit_pod_checks_total{{pod=\"{}\",outcome=\"{outcome}\"}} {}",
+                    member.address,
+                    member.health.checks[at].load(Ordering::Relaxed)
+                );
+            }
         }
         out.push_str("# TYPE edgerush_rate_limit_pod_reconnects_total counter\n");
         for member in &members {
@@ -284,15 +292,6 @@ impl Process {
                 out,
                 "edgerush_rate_limit_pod_reconnects_total{{pod=\"{}\"}} {count}",
                 member.address
-            );
-        }
-        out.push_str("# TYPE edgerush_rate_limit_owner_breaker_trips_total counter\n");
-        for member in &members {
-            let _ = writeln!(
-                out,
-                "edgerush_rate_limit_owner_breaker_trips_total{{pod=\"{}\"}} {}",
-                member.address,
-                member.breaker.trips.load(Ordering::Relaxed)
             );
         }
         out.push_str("# TYPE edgerush_rate_limit_unreachable_total counter\n");
@@ -307,81 +306,76 @@ impl Process {
     }
 }
 
-/// A member's breaker, which a process's workers share: a few atomics, read on every ask
-/// and written only on failures and on the first answer after them.
+/// What a process's checks say of a pod, which its workers read before every ask of it,
+/// and only its checks write.
 #[derive(Debug, Default)]
-struct Breaker {
-    /// Failures in a row.
-    failures: AtomicU32,
-    /// Closed, 0; open, when it opened or was last probed, in the process's nanoseconds, one
-    /// more, so that a time of 0 is not taken for closed.
-    opened: AtomicU64,
-    /// How many times it opened.
-    trips: AtomicU64,
+struct Health {
+    /// Marked down: its keys go another way.
+    down: AtomicBool,
+    /// How many times it was marked down.
+    marked_down: AtomicU64,
+    /// Its checks, answered, missed and refused.
+    checks: [AtomicU64; 3],
 }
 
-impl Breaker {
-    fn is_open(&self) -> bool {
-        self.opened.load(Ordering::Relaxed) != 0
+impl Health {
+    fn is_down(&self) -> bool {
+        self.down.load(Ordering::Relaxed)
     }
 
-    /// An answer: the count of failures starts again. Read first, so that a healthy member's
-    /// answers write nothing every worker would share.
-    fn answered(&self) {
-        if self.failures.load(Ordering::Relaxed) != 0 {
-            self.failures.store(0, Ordering::Relaxed);
+    /// A check came to `checked`.
+    fn count(&self, checked: Checked) {
+        self.checks[checked as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Marked down or up, as `down` says; a pod marked down from up counts once.
+    fn mark(&self, down: bool) {
+        if self.down.swap(down, Ordering::Relaxed) != down && down {
+            self.marked_down.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    /// A failure at `now`: the `threshold`th in a row opens it, once.
-    fn failed(&self, now: u64, threshold: u32) {
-        let failures = self
-            .failures
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        if failures >= threshold
-            && self
-                .opened
-                .compare_exchange(
-                    0,
-                    now.saturating_add(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            self.trips.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Probed at `now`, if it is still as `seen`, opened at that time: due again after
-    /// another period. False if it changed meanwhile — closed, or probed by another thread
-    /// sharing it across a reload — so that a stale look never opens it again.
-    fn rearm(&self, seen: u64, now: u64) -> bool {
-        self.opened
-            .compare_exchange(
-                seen,
-                now.saturating_add(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-
-    /// The member heard from: closed.
-    fn close(&self) {
-        self.failures.store(0, Ordering::Relaxed);
-        self.opened.store(0, Ordering::Relaxed);
     }
 }
 
-/// Probes the open breakers of `process`'s members, each `probe_after` after it opened or
-/// was last probed, for as long as the process is kept; tells `failed` if it panics, as
-/// the other rate-limiting threads do (03 §2). A probe opens a stream to the member and
-/// waits for its table: heard, the breaker closes; not, it waits another `probe_after`.
-/// With `when_unreachable: local`, it takes the process's own keys' turn at every look too
-/// ([`LocalKeys::turn`]), sweeping and evicting as local mode's thread does.
-fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
+/// How a check of a pod came out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Checked {
+    /// Its answer came within the check's timeout.
+    Answered = 0,
+    /// None came within it: the stream is kept, and the answer, if it comes, passed over.
+    Missed = 1,
+    /// Its stream could not be opened, or broke and could not be opened again: the pod
+    /// refuses it, or is gone.
+    Refused = 2,
+}
+
+/// The checks missed in a row of one pod, as the checking thread counts them.
+#[derive(Debug, Default)]
+struct Misses(u32);
+
+impl Misses {
+    /// What `checked` makes of the pod, `limit` misses in a row marking it down: down, up,
+    /// or as it was. A refusal marks it down at once; an answer, up.
+    fn after(&mut self, checked: Checked, limit: u32) -> Option<bool> {
+        match checked {
+            Checked::Answered => {
+                self.0 = 0;
+                Some(false)
+            }
+            Checked::Missed => {
+                self.0 = self.0.saturating_add(1);
+                (self.0 >= limit).then_some(true)
+            }
+            Checked::Refused => Some(true),
+        }
+    }
+}
+
+/// Checks every seed and member `process`'s workers have met, each on a task and a stream of
+/// its own, for as long as the process is kept; tells `failed` if it panics, as the other
+/// rate-limiting threads do (03 §2). With `when_unreachable: local`, it takes the process's
+/// own keys' turn at every look too ([`LocalKeys::turn`]), sweeping and evicting as local
+/// mode's thread does.
+fn check(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
     struct Watch(Option<Failed>);
     impl Drop for Watch {
         fn drop(&mut self) {
@@ -400,9 +394,10 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
         return;
     };
     runtime.block_on(async {
-        let mut look = tokio::time::interval(PROBE_LOOK);
+        let mut look = tokio::time::interval(LOOK);
         look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut swept = Instant::now();
+        let mut checking = HashSet::new();
         loop {
             look.tick().await;
             let Some(held) = process.upgrade() else {
@@ -411,34 +406,108 @@ fn probe(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
             if let Some(local) = &held.local {
                 swept = local.turn(swept, Instant::now());
             }
-            let probe_after = u64::try_from(held.config.probe_after.as_nanos()).unwrap_or(u64::MAX);
-            let now = held.now();
-            let members: Vec<Arc<Member>> = held.members().values().cloned().collect();
-            for member in members {
-                let opened = member.breaker.opened.load(Ordering::Relaxed);
-                if opened == 0 || now.saturating_sub(opened - 1) < probe_after {
-                    continue;
+            let met: Vec<String> = held.members().keys().cloned().collect();
+            drop(held);
+            for address in met {
+                if checking.insert(address.clone()) {
+                    tokio::spawn(check_pod(process.clone(), address));
                 }
-                // Due again only after another period, heard from or not; not this thread's to
-                // probe if another closed or probed it meanwhile.
-                if !member.breaker.rearm(opened, now) {
-                    continue;
-                }
-                let dial = held.dial();
-                tokio::spawn(async move {
-                    let heard = tokio::time::timeout(PROBE_WAIT, async {
-                        let mut stream = decide_stream(&member.address, &dial).await.ok()?;
-                        let first = stream.down.message().await.ok()??;
-                        matches!(first.told, Some(wire::Told::Table(_))).then_some(())
-                    })
-                    .await;
-                    if let Ok(Some(())) = heard {
-                        member.breaker.close();
-                    }
-                });
             }
         }
     });
+}
+
+/// Checks the pod at `address` every `check_interval` for as long as `process` is kept,
+/// marking the one there down or up as [`Misses`] says. A check waits `check_timeout` at
+/// most, opening the stream first if there is none, or again at once if it broke.
+async fn check_pod(process: std::sync::Weak<Process>, address: String) {
+    let Some(every) = process.upgrade().map(|held| held.config.check_interval) else {
+        return;
+    };
+    let mut every = tokio::time::interval(every);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stream = None;
+    let mut misses = Misses::default();
+    let mut next = 0_u64;
+    // The pod whose misses these are: another at the address, restarted, counts afresh.
+    let mut of: Option<Arc<Health>> = None;
+    loop {
+        every.tick().await;
+        let Some((dial, timeout, limit)) = process.upgrade().map(|held| {
+            (
+                held.dial(),
+                held.config.check_timeout,
+                held.config.check_misses,
+            )
+        }) else {
+            return;
+        };
+        next = next.wrapping_add(1);
+        let checked = check_once(&mut stream, &address, &dial, timeout, next).await;
+        let Some(held) = process.upgrade() else {
+            return;
+        };
+        let Some(member) = held.members().get(&address).cloned() else {
+            continue;
+        };
+        if !of
+            .as_ref()
+            .is_some_and(|health| Arc::ptr_eq(health, &member.health))
+        {
+            misses = Misses::default();
+            of = Some(Arc::clone(&member.health));
+        }
+        member.health.count(checked);
+        if let Some(down) = misses.after(checked, limit) {
+            member.health.mark(down);
+        }
+    }
+}
+
+/// One check, `id`, of the pod at `address` on `stream`, opened first if there is none and
+/// again at once if it breaks, all within `timeout`.
+async fn check_once(
+    stream: &mut Option<DecideStream>,
+    address: &str,
+    dial: &Dial,
+    timeout: Duration,
+    id: u64,
+) -> Checked {
+    let until = tokio::time::Instant::now() + timeout;
+    // A stream that broke is opened again once, at once: broken again, the check is refused.
+    for _ in 0..2 {
+        if stream.is_none() {
+            match tokio::time::timeout_at(until, decide_stream(address, dial)).await {
+                Ok(Ok(opened)) => *stream = Some(opened),
+                Ok(Err(_)) => return Checked::Refused,
+                Err(_) => return Checked::Missed,
+            }
+        }
+        let Some(open) = stream.as_mut() else {
+            return Checked::Refused;
+        };
+        match tokio::time::timeout_at(until, answered(open, id)).await {
+            Ok(true) => return Checked::Answered,
+            Ok(false) => *stream = None,
+            Err(_) => return Checked::Missed,
+        }
+    }
+    Checked::Refused
+}
+
+/// Sends check `id` up `stream` and reads until its answer: true once it comes, false if the
+/// stream breaks first. Tables, and answers to checks missed before, are passed over.
+async fn answered(stream: &mut DecideStream, id: u64) -> bool {
+    if stream.up.send(wire::asking_check(id)).await.is_err() {
+        return false;
+    }
+    loop {
+        match stream.down.message().await {
+            Ok(Some(told)) if wire::told_checked(&told) == Some(id) => return true,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return false,
+        }
+    }
 }
 
 /// An owner's answer, or why there is none.
@@ -568,8 +637,8 @@ impl Stream {
         }
     }
 
-    /// Lets go of the stream, if it is open or opening, and of what waits on it: its pod's
-    /// breaker is open.
+    /// Lets go of the stream, if it is open or opening, and of what waits on it: its pod is
+    /// marked down.
     fn shut(&self) {
         let was = std::mem::replace(&mut *self.link.borrow_mut(), Link::Down);
         let generation = match &was {
@@ -911,26 +980,26 @@ impl SyncLimiter {
         Some(member)
     }
 
-    /// Whether member `id`'s breaker is open: its keys go another way.
+    /// Whether member `id` is marked down: its keys go another way.
     fn shut_out(&self, id: NodeId) -> bool {
         self.member(id)
             .is_some_and(|member| self.passed_over(&member))
     }
 
-    /// Whether `member`'s breaker is open: its keys go another way, and the worker lets go of
+    /// Whether `member` is marked down: its keys go another way, and the worker lets go of
     /// its stream to it, which may be hung, so that the next it opens there is afresh.
     fn passed_over(&self, member: &Member) -> bool {
-        let open = member.breaker.is_open();
-        if open && let Some(stream) = self.streams.borrow().get(&member.address) {
+        let down = member.health.is_down();
+        if down && let Some(stream) = self.streams.borrow().get(&member.address) {
             stream.shut();
         }
-        open
+        down
     }
 
-    /// Whom to send `key` to and where it is reached: its owner unless `avoid` names it or its
-    /// breaker is open, else another member chosen by the key; with no table yet, a seed chosen
-    /// by the key among those not in `avoid_seeds` and with their breakers closed. None when
-    /// none is left.
+    /// Whom to send `key` to and where it is reached: its owner unless `avoid` names it or it
+    /// is marked down, else another member chosen by the key; with no table yet, a seed chosen
+    /// by the key among those not in `avoid_seeds` and not marked down. None when none is
+    /// left.
     fn route(&self, key: Key, avoid: &[NodeId], avoid_seeds: &[usize]) -> Option<(To, String)> {
         let plane = self.plane.borrow();
         if plane.table().is_none() {
@@ -959,7 +1028,7 @@ impl SyncLimiter {
             To::Seed(at) => self.seeds.get(at).cloned(),
         };
         if let Some(member) = member {
-            self.process.asked(&member, how);
+            Process::asked(&member, how);
         }
     }
 
@@ -1059,13 +1128,8 @@ impl SyncLimiter {
                     .waiting
                     .borrow_mut()
                     .insert(id, (generation, Waiter::Asked(answered)));
-                let forwarded = matches!(
-                    to,
-                    To::Member(member) if self.plane.borrow().owner(part.key) != Some(member)
-                );
                 part.sent = Some(Sent {
                     to,
-                    forwarded,
                     stream,
                     id,
                     generation,
@@ -1226,8 +1290,6 @@ struct Part {
 /// Where a key was sent, and its answer to come.
 struct Sent {
     to: To,
-    /// Whether it went to a member that is not the key's owner, only to be forwarded.
-    forwarded: bool,
     stream: Rc<Stream>,
     id: u64,
     generation: u64,
@@ -1299,17 +1361,10 @@ impl Asked {
                     unreached = Some(Undecided::Unavailable);
                     out_of_reach.push(part);
                 }
-                // A timeout says nothing of a pod that was only to forward the ask: its owner
-                // may be the one gone, failing over (decided). Counted, but not against its
-                // breaker; a pod truly hung opens its breaker by its own keys' timeouts. A
-                // seed's counts: before a table, nothing says it is not the owner.
+                // Counted, and decided by `when_unreachable` alone: only the checks mark a pod
+                // down, as a timeout may be the worker's own, too far behind to read the answer.
                 Err(_) => {
-                    let how = if sent.forwarded {
-                        Ended::ForwardedTimedOut
-                    } else {
-                        Ended::TimedOut
-                    };
-                    self.limiter.asked(sent.to, how);
+                    self.limiter.asked(sent.to, Ended::TimedOut);
                     let config = &self.limiter.process.config;
                     if sent.stream.timed_out(
                         sent.generation,
@@ -1440,7 +1495,7 @@ impl Asked {
     }
 }
 
-/// How an answer ends an ask, for its member's breaker.
+/// How an answer ends an ask, as its pod's asks are counted.
 const fn ended_by(answer: &Answer) -> Ended {
     match answer {
         Answer::NotServing => Ended::NotServing,
@@ -1450,12 +1505,13 @@ const fn ended_by(answer: &Answer) -> Ended {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answered, Breaker, Gone, Process, giving_back};
+    use super::{Answered, Checked, Gone, Health, Misses, Process, giving_back};
     use edgerush_config::{CompiledSynchronous, KeySecret, WhenUnreachable};
     use edgerush_ratelimit_service::cluster::plane::{
         Answer, GIVE_BACK_AGAIN, GIVE_BACK_LATER, GIVE_BACK_SENDS,
     };
     use std::num::NonZeroUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -1466,45 +1522,36 @@ mod tests {
             timeout: Duration::from_millis(timeout_ms),
             when_unreachable: WhenUnreachable::Deny,
             timeouts_before_reconnect: 2,
-            breaker_failures: 1,
-            probe_after: Duration::from_secs(60),
+            check_interval: Duration::from_millis(100),
+            check_timeout: Duration::from_millis(100),
+            check_misses: 3,
             max_key_bytes: 1 << 20,
             tls: None,
         }
     }
 
-    /// A process that carries another's breakers carries the clock their times were read
-    /// by, and every member met: a breaker opened before the reload is probed when it is
-    /// due, not as late again as the old process had run.
+    /// A reload carries every member met across, marked down or up as its checks last said.
     #[test]
-    fn breakers_carried_across_keep_their_clock() {
+    fn a_reload_carries_what_the_checks_said() {
         let one = NonZeroUsize::MIN;
-        let before = Process::start(config(20), one, None, None, None).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        let member = before.member_at("rl-0:7000", Some(7));
-        member.breaker.failed(before.now(), 1);
-        let after = Process::start(config(30), one, None, Some(&before), None).unwrap();
-        assert!(
-            after.member_at("rl-0:7000", Some(7)).breaker.is_open(),
-            "carried"
-        );
-        assert!(
-            after.now() >= 50_000_000,
-            "read by the same clock: {}",
-            after.now()
-        );
+        let before = Process::new(config(20), one, None, None);
+        before.member_at("rl-0:7000", Some(7)).health.mark(true);
+        before.member_at("rl-1:7000", Some(8));
+        let after = Process::new(config(30), one, Some(&before), None);
+        assert!(after.member_at("rl-0:7000", Some(7)).health.is_down());
+        assert!(!after.member_at("rl-1:7000", Some(8)).health.is_down());
     }
 
     /// A member met is the same handle for every worker, and its metrics are labelled by its
-    /// address. A seed's pod, once a table names it, keeps the seed's breaker; another member
-    /// at the address, its pod restarted, starts with a breaker of its own.
+    /// address. A seed's pod, once a table names it, keeps what the seed's checks said;
+    /// another member at the address, its pod restarted, starts up.
     #[test]
     fn a_member_is_shared_and_shown_by_its_address() {
-        let process = Process::start(config(20), NonZeroUsize::MIN, None, None, None).unwrap();
+        let process = Process::new(config(20), NonZeroUsize::MIN, None, None);
         let seed = process.member_at("rl-0:7000", None);
-        seed.breaker.failed(process.now(), 1);
+        seed.health.mark(true);
         let named = process.member_at("rl-0:7000", Some(7));
-        assert!(named.breaker.is_open(), "the seed's breaker, its pod named");
+        assert!(named.health.is_down(), "the seed's, its pod named");
         let again = process.member_at("rl-0:7000", Some(7));
         assert!(std::sync::Arc::ptr_eq(&named, &again));
         assert!(std::sync::Arc::ptr_eq(
@@ -1513,52 +1560,76 @@ mod tests {
         ));
         let stats = process.render_stats();
         assert!(
-            stats.contains("edgerush_rate_limit_owner_breaker_open{pod=\"rl-0:7000\"} 1\n"),
+            stats.contains(
+                "edgerush_rate_limit_pod_down{pod=\"rl-0:7000\"} 1
+"
+            ),
             "{stats}"
         );
         let restarted = process.member_at("rl-0:7000", Some(8));
-        assert!(!restarted.breaker.is_open(), "a breaker of its own");
+        assert!(!restarted.health.is_down(), "starts up");
         let stats = process.render_stats();
         assert!(
-            stats.contains("edgerush_rate_limit_owner_breaker_open{pod=\"rl-0:7000\"} 0\n"),
+            stats.contains(
+                "edgerush_rate_limit_pod_down{pod=\"rl-0:7000\"} 0
+"
+            ),
             "{stats}"
         );
     }
 
-    /// Failures in a row open it, once however many follow; an answer between them starts
-    /// the count again; closing it starts it again too.
+    /// Misses in a row mark a pod down, an answer between them starting the count again; a
+    /// refusal marks it down at once; one answer marks it up.
     #[test]
-    fn a_breaker_opens_on_failures_in_a_row_only() {
-        let breaker = Breaker::default();
-        breaker.failed(10, 3);
-        breaker.failed(20, 3);
-        breaker.answered();
-        breaker.failed(30, 3);
-        breaker.failed(40, 3);
-        assert!(!breaker.is_open(), "an answer between");
-        breaker.failed(50, 3);
-        assert!(breaker.is_open());
-        breaker.failed(60, 3);
-        assert_eq!(breaker.trips.load(std::sync::atomic::Ordering::Relaxed), 1);
-        breaker.close();
-        assert!(!breaker.is_open());
-        breaker.failed(70, 3);
-        assert!(!breaker.is_open(), "counted afresh");
+    fn misses_in_a_row_mark_a_pod_down_and_an_answer_up() {
+        let mut misses = Misses::default();
+        assert_eq!(misses.after(Checked::Missed, 3), None);
+        assert_eq!(misses.after(Checked::Missed, 3), None);
+        assert_eq!(misses.after(Checked::Answered, 3), Some(false));
+        assert_eq!(misses.after(Checked::Missed, 3), None);
+        assert_eq!(misses.after(Checked::Missed, 3), None);
+        assert_eq!(
+            misses.after(Checked::Missed, 3),
+            Some(true),
+            "three in a row"
+        );
+        assert_eq!(misses.after(Checked::Missed, 3), Some(true), "still");
+        assert_eq!(
+            misses.after(Checked::Answered, 3),
+            Some(false),
+            "one answer"
+        );
+        assert_eq!(misses.after(Checked::Refused, 3), Some(true), "at once");
+        assert_eq!(misses.after(Checked::Missed, 1), Some(true));
     }
 
-    /// A probe that looked before the breaker was closed does not open it again.
+    /// A pod marked down counts once each time it goes down from up, and every check counts
+    /// by how it came out.
     #[test]
-    fn a_stale_probe_does_not_open_a_closed_breaker() {
-        let breaker = Breaker::default();
-        breaker.failed(10, 1);
-        let seen = breaker.opened.load(std::sync::atomic::Ordering::Relaxed);
-        breaker.close();
-        assert!(!breaker.rearm(seen, 20));
-        assert!(!breaker.is_open());
-        breaker.failed(30, 1);
-        let seen = breaker.opened.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(breaker.rearm(seen, 40), "as it was seen");
-        assert!(breaker.is_open());
+    fn a_pod_marked_down_counts_once_a_time() {
+        let health = Health::default();
+        health.mark(false);
+        health.mark(true);
+        health.mark(true);
+        assert!(health.is_down());
+        health.mark(false);
+        assert!(!health.is_down());
+        health.mark(true);
+        assert_eq!(health.marked_down.load(Ordering::Relaxed), 2);
+        for checked in [
+            Checked::Answered,
+            Checked::Missed,
+            Checked::Missed,
+            Checked::Refused,
+        ] {
+            health.count(checked);
+        }
+        let checks: Vec<u64> = health
+            .checks
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(checks, [1, 2, 1]);
     }
 
     /// A stream to a pod, open on a connection of generation `generation`, with what that
@@ -1642,14 +1713,6 @@ mod tests {
                 assert_eq!(second.try_recv(), empty, "and read");
             })
             .await;
-    }
-
-    /// A failure at time 0 still opens it: a time of 0 is not taken for closed.
-    #[test]
-    fn a_breaker_opened_at_the_start_is_open() {
-        let breaker = Breaker::default();
-        breaker.failed(0, 1);
-        assert!(breaker.is_open());
     }
 
     /// Each model goes to the store as its own rule, at the limit's numbers, with local

@@ -860,7 +860,7 @@ fn rate_limits_need_native_128_bit_atomics() {
         let mut synchronous = config.clone();
         synchronous.rate_limiting = Some(
             serde_saphyr::from_str(&format!(
-                "{{ mode: synchronous, service: {{ addresses: [\"127.0.0.1:1\"], key_secret: {SECRET} }}, synchronous: {{ timeout_ms: 100, when_unreachable: {when_unreachable}, breaker: {{ failures: 5, probe_after_ms: 1000 }} }} }}"
+                "{{ mode: synchronous, service: {{ addresses: [\"127.0.0.1:1\"], key_secret: {SECRET} }}, synchronous: {{ timeout_ms: 100, when_unreachable: {when_unreachable}, health_check: {{ interval_ms: 100, timeout_ms: 1000, misses: 3 }} }} }}"
             ))
             .unwrap(),
         );
