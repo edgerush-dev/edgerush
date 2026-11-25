@@ -465,6 +465,17 @@ async fn send_round(
     answers
 }
 
+/// A client's connection to each worker listening at `fronts`, made now: after a wait on a
+/// pod's checks, as a worker closes a connection that waits long for its first or next
+/// request.
+async fn connected(fronts: &[SocketAddr]) -> Vec<::h2::client::SendRequest<Bytes>> {
+    let mut sends = Vec::new();
+    for front in fronts {
+        sends.push(h2_library_client(*front, &::h2::client::Builder::new()).await);
+    }
+    sends
+}
+
 fn statuses(answers: &[Response<::h2::RecvStream>]) -> Vec<u16> {
     answers.iter().map(|a| a.status().as_u16()).collect()
 }
@@ -790,9 +801,10 @@ async fn a_replica_decides_the_keys_of_an_owner_gone_unheard_with_the_store_set_
         .await;
 }
 
-/// A pod that accepts and answers nothing is marked down by its checks alone, within about
-/// (misses - 1) x interval + timeout: from then on its requests go to `when_unreachable` at
-/// once, with no wait. Before that, a request waits its timeout and marks nothing.
+/// A pod that accepts and answers nothing is marked down by its checks alone, one at a time,
+/// within about misses x (timeout + interval): from then on its requests go to
+/// `when_unreachable` at once, with no wait. Before that, a request waits its timeout and
+/// marks nothing.
 #[tokio::test]
 async fn a_pod_that_answers_nothing_is_marked_down_by_its_checks() {
     let local = tokio::task::LocalSet::new();
@@ -815,8 +827,9 @@ async fn a_pod_that_answers_nothing_is_marked_down_by_its_checks() {
                 200,
                 "deny",
             ));
-            let (proxy, mut sends) = serving(&config, 1).await;
+            let (proxy, _, fronts) = serving_at(&config, 1).await;
             let took = marked(&proxy, &address, true).await;
+            let mut sends = connected(&fronts).await;
             assert!(took < Duration::from_secs(1), "marked down after {took:?}");
             let began = Instant::now();
             assert_eq!(
@@ -840,6 +853,52 @@ async fn a_pod_that_answers_nothing_is_marked_down_by_its_checks() {
                 line(r#"edgerush_rate_limit_unreachable_total{action="deny"}"#),
                 Some(5)
             );
+        })
+        .await;
+}
+
+/// One check at a time: the next starts an interval after the last ended, as Envoy's do,
+/// not on a fixed beat. Each check of a pod that accepts and says nothing opens a connection
+/// of its own, its stream never opened, so the connections accepted show when each began.
+#[tokio::test]
+async fn a_check_begins_an_interval_after_the_last_ended() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = silent.local_addr().unwrap().to_string();
+            let began = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let held_began = Arc::clone(&began);
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = silent.accept().await {
+                    held_began.lock().unwrap().push(Instant::now());
+                    held.push(socket);
+                }
+            });
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    std::slice::from_ref(&address),
+                    200,
+                    "deny",
+                ),
+                200,
+                200,
+                100,
+            );
+            // No request: only the checks connect.
+            let _serving = serving(&config, 1).await;
+            tokio::time::sleep(Duration::from_millis(1_400)).await;
+            let began = began.lock().unwrap().clone();
+            assert!(began.len() >= 3, "{} checks", began.len());
+            for pair in began.windows(2) {
+                let gap = pair[1] - pair[0];
+                // Timeout and interval, a timer's tick short at most; on a beat, 200 ms.
+                assert!(gap >= Duration::from_millis(380), "{gap:?} between checks");
+            }
         })
         .await;
 }
@@ -1173,11 +1232,13 @@ async fn a_pod_marked_down_is_marked_up_once_a_check_is_answered() {
                     let shown = authority.issue(&["plane", PLANE_ID]);
                     config = service_tls(config, &authority.pem(), POD_ID, shown);
                 }
-                let (proxy, mut sends) = serving(&config, 1).await;
+                let (proxy, _, fronts) = serving_at(&config, 1).await;
                 marked(&proxy, &relay.address, true).await;
+                let mut sends = connected(&fronts).await;
                 assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
                 relay.open_all();
                 let took = marked(&proxy, &relay.address, false).await;
+                let mut sends = connected(&fronts).await;
                 assert!(
                     took < Duration::from_secs(1),
                     "up after {took:?}, secured {secured}"
@@ -1389,10 +1450,15 @@ async fn with_local_an_owner_out_of_reach_is_decided_by_the_process_buckets() {
                 100,
                 "local",
             ));
-            let (proxy, mut sends) = serving(&config, 2).await;
+            let (proxy, _, fronts) = serving_at(&config, 2).await;
             // Marked down first, so that no request waits for it and the buckets' waits are
-            // exact.
+            // exact; the clients connect only then, as a connection waiting that long for its
+            // first request is closed.
             marked(&proxy, &closed, true).await;
+            let mut sends = Vec::new();
+            for front in fronts {
+                sends.push(h2_library_client(front, &::h2::client::Builder::new()).await);
+            }
             let answers = send_round(&mut sends, 16).await;
             let statuses = statuses(&answers);
             assert_eq!(
@@ -1511,12 +1577,13 @@ async fn local_buckets_carry_over_from_one_outage_to_the_next() {
                 100,
                 "local",
             ));
-            let (proxy, mut sends) = serving(&config, 1).await;
+            let (proxy, mut sends, fronts) = serving_at(&config, 1).await;
             let first = statuses(&send_round(&mut sends, 11).await);
             assert_eq!(first[..10], [200; 10], "{first:?}");
             assert_eq!(first[10], 429, "the local bucket spent");
             relay.open_all();
             marked(&proxy, &relay.address, false).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(
                 statuses(&send_round(&mut sends, 1).await),
                 [200],
@@ -1731,8 +1798,9 @@ async fn a_reload_mid_outage_keeps_the_pods_down_and_the_local_buckets() {
                     when,
                 ))
             };
-            let (proxy, mut sends) = serving(&in_mode(200, "local"), 1).await;
+            let (proxy, _, fronts) = serving_at(&in_mode(200, "local"), 1).await;
             marked(&proxy, &address, true).await;
+            let mut sends = connected(&fronts).await;
             let first = statuses(&send_round(&mut sends, 11).await);
             assert_eq!(first[..10], [200; 10], "{first:?}");
             assert_eq!(first[10], 429);
@@ -1762,6 +1830,7 @@ async fn a_reload_mid_outage_keeps_the_pods_down_and_the_local_buckets() {
             proxy
                 .reload(compile(&in_mode(300, "deny")).unwrap())
                 .unwrap();
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
         })
         .await;
@@ -1784,7 +1853,7 @@ async fn a_stream_let_go_of_ends_without_touching_the_one_that_replaced_it() {
                 300,
                 "deny",
             ));
-            let (proxy, mut sends, _) = serving_behind(&config, 1, &relay).await;
+            let (proxy, mut sends, fronts) = serving_behind(&config, 1, &relay).await;
             // Connection 1, opened with the limiter, answers.
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             // Then it and the checks' connection, 0, hold their answers: the pod is marked
@@ -1792,11 +1861,13 @@ async fn a_stream_let_go_of_ends_without_touching_the_one_that_replaced_it() {
             relay.gate(1, false);
             relay.gate(0, false);
             marked(&proxy, &relay.address, true).await;
+            let mut sends = connected(&fronts).await;
             // The worker lets go of connection 1, whose end the gate holds.
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
             // The checks answered again, the pod is up; a request opens connection 2.
             relay.gate(0, true);
             marked(&proxy, &relay.address, false).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             assert_eq!(
                 relay.accepted(),
@@ -1834,7 +1905,7 @@ async fn a_stream_let_go_of_while_opening_does_not_replace_the_one_after_it() {
                 300,
                 "deny",
             ));
-            let (proxy, mut sends, _) = serving_behind(&config, 1, &relay).await;
+            let (proxy, mut sends, fronts) = serving_behind(&config, 1, &relay).await;
             // The limiter is made, and connection 1 opened, at the first request; its gate
             // is shut as soon as it is accepted, so its opening hangs and the ask times out.
             let first = send_round(&mut sends, 1);
@@ -1852,9 +1923,11 @@ async fn a_stream_let_go_of_while_opening_does_not_replace_the_one_after_it() {
             // worker lets go of connection 1 while it is still opening.
             relay.gate(0, false);
             marked(&proxy, &relay.address, true).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
             relay.gate(0, true);
             marked(&proxy, &relay.address, false).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             assert_eq!(
                 relay.accepted(),
@@ -2182,12 +2255,13 @@ async fn an_owner_gone_is_marked_down_and_the_pods_forwarding_its_keys_are_not()
             ));
             let (_, key) = keys_of(&config).remove(0);
             let owner = store.owner_of(&key).await;
-            let (proxy, mut sends) = serving(&config, 1).await;
+            let (proxy, mut sends, fronts) = serving_at(&config, 1).await;
             // The worker's table in, from its first request.
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             tokio::time::sleep(Duration::from_millis(300)).await;
             store.stop(owner).await;
             marked(&proxy, &store.pods[owner].address, true).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 4).await), [503; 4]);
             let scrape = proxy.metrics();
             let forwarders: Vec<&ServedPod> = (0..3)

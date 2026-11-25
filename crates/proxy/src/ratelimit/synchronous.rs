@@ -20,10 +20,10 @@
 //! connection drains at a time. That marks the pod down for no one.
 //!
 //! A thread of the process's own checks each seed and member its workers have met, on a
-//! stream of its own: a check every `check_interval`, which the pod's task answers in its
-//! turn, behind what it was asked before, counting nothing. `check_misses` missed in a row
-//! mark the pod down, as does its stream broken and not opened again, and one answered marks
-//! it up; a pod starts up. Marked down, every worker sends its keys another way at once,
+//! stream of its own: one check at a time, each `check_interval` after the last ended, which
+//! the pod's task answers in its turn, behind what it was asked before, counting nothing.
+//! `check_misses` missed in a row mark the pod down, as does its stream broken and not opened
+//! again, and one answered marks it up; a pod starts up. Marked down, every worker sends its keys another way at once,
 //! letting go of its own stream to it. Only the checks mark a pod down: a worker's timeouts,
 //! the pod slow or the worker behind, decide only its own requests.
 //!
@@ -417,22 +417,18 @@ fn check(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
     });
 }
 
-/// Checks the pod at `address` every `check_interval` for as long as `process` is kept,
-/// marking the one there down or up as [`Misses`] says. A check waits `check_timeout` at
-/// most, opening the stream first if there is none, or again at once if it broke.
+/// Checks the pod at `address` for as long as `process` is kept, marking the one there down
+/// or up as [`Misses`] says: at once, then one check at a time, each `check_interval` after
+/// the last ended, as Envoy's active health checking does. A check waits `check_timeout` at
+/// most, opening the stream first if there is none, or again at once if it broke; a hung pod
+/// is marked down within about misses x (timeout + interval).
 async fn check_pod(process: std::sync::Weak<Process>, address: String) {
-    let Some(every) = process.upgrade().map(|held| held.config.check_interval) else {
-        return;
-    };
-    let mut every = tokio::time::interval(every);
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stream = None;
     let mut misses = Misses::default();
     let mut next = 0_u64;
     // The pod whose misses these are: another at the address, restarted, counts afresh.
     let mut of: Option<Arc<Health>> = None;
     loop {
-        every.tick().await;
         let Some((dial, timeout, limit)) = process.upgrade().map(|held| {
             (
                 held.dial(),
@@ -447,20 +443,22 @@ async fn check_pod(process: std::sync::Weak<Process>, address: String) {
         let Some(held) = process.upgrade() else {
             return;
         };
-        let Some(member) = held.members().get(&address).cloned() else {
-            continue;
-        };
-        if !of
-            .as_ref()
-            .is_some_and(|health| Arc::ptr_eq(health, &member.health))
-        {
-            misses = Misses::default();
-            of = Some(Arc::clone(&member.health));
+        if let Some(member) = held.members().get(&address).cloned() {
+            if !of
+                .as_ref()
+                .is_some_and(|health| Arc::ptr_eq(health, &member.health))
+            {
+                misses = Misses::default();
+                of = Some(Arc::clone(&member.health));
+            }
+            member.health.count(checked);
+            if let Some(down) = misses.after(checked, limit) {
+                member.health.mark(down);
+            }
         }
-        member.health.count(checked);
-        if let Some(down) = misses.after(checked, limit) {
-            member.health.mark(down);
-        }
+        let interval = held.config.check_interval;
+        drop(held);
+        tokio::time::sleep(interval).await;
     }
 }
 
