@@ -98,7 +98,8 @@ fn loom_two_limits_racing_never_refuse_both() {
 
 /// The sweep forgetting a full, quiet key while a worker that holds a handle to it decides
 /// a request: the request is admitted, on the old key before it closed or on its
-/// successor, and what the registry counts is what it holds.
+/// successor, and what the registry counts is what it holds — the old key freed at the next
+/// look once the worker's handles have gone.
 #[test]
 fn loom_a_key_forgotten_under_a_request_admits_it() {
     model(|| {
@@ -114,6 +115,7 @@ fn loom_a_key_forgotten_under_a_request_admits_it() {
         };
         local.sweep(2_000 * MS, 500 * MS);
         assert!(worker.join().unwrap(), "refused though full");
+        assert_eq!(local.evict(2_000 * MS), 0);
         let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", c.into());
         assert_eq!(local.holding(), local.tables() + held);
     });
@@ -160,7 +162,8 @@ fn loom_two_windows_racing_never_refuse_both() {
 }
 
 /// The sweep forgetting a window that counts none while a worker decides a request under
-/// it: the request is admitted, and what the registry counts is what it holds.
+/// it: the request is admitted, and what the registry counts is what it holds — the old key
+/// freed at the next look once the worker's handles have gone.
 #[test]
 fn loom_a_window_forgotten_under_a_request_admits_it() {
     model(|| {
@@ -176,6 +179,7 @@ fn loom_a_window_forgotten_under_a_request_admits_it() {
         };
         local.sweep(2_000 * MS, 500 * MS);
         assert!(worker.join().unwrap(), "refused though counting none");
+        assert_eq!(local.evict(2_000 * MS), 0);
         let held = u64::try_from(local.key_count()).unwrap() * key_bytes(b"k", w.into());
         assert_eq!(local.holding(), local.tables() + held);
     });

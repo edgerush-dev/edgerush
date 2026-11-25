@@ -268,9 +268,10 @@ proptest! {
     }
 }
 
-/// A key counts its own bytes as it comes and goes; the tables holding it, the registry's
-/// and the worker's handles', count as they are allocated, keep their room as keys go, and
-/// are given back with the handles.
+/// A key counts its own bytes as it comes, and as it goes until the last handle to it does:
+/// forgotten, it is freed only once the worker's handles let go of it. The tables holding
+/// it, the registry's and the worker's handles', count as they are allocated, keep their
+/// room as keys go, and are given back with the handles.
 #[test]
 fn bytes_are_counted_as_keys_come_and_go() {
     let local = local();
@@ -289,8 +290,20 @@ fn bytes_are_counted_as_keys_come_and_go() {
         tables + key_bytes(b"k1", c.into()) + key_bytes(b"k22", c.into())
     );
     local.sweep(10 * SECOND, 0);
+    assert_eq!(local.key_count(), 0, "both forgotten");
+    assert_eq!(
+        local.holding(),
+        tables + key_bytes(b"k1", c.into()) + key_bytes(b"k22", c.into()) + local.gone_room(),
+        "and counted while the worker's handles hold them"
+    );
     handles.prune();
-    assert_eq!(local.holding(), tables, "the tables keep their room");
+    assert_eq!(local.evict(10 * SECOND), 0);
+    assert_eq!(local.gone_room(), 0);
+    assert_eq!(
+        local.holding(),
+        tables,
+        "freed once let go of; the tables keep their room"
+    );
     drop(handles);
     assert_eq!(
         local.holding(),
@@ -299,10 +312,16 @@ fn bytes_are_counted_as_keys_come_and_go() {
     );
 }
 
-/// A cap whose nine tenths hold `local`'s tables and `keys` keys of `each` bytes, with half a
-/// key to spare: what eviction comes down to.
+/// A cap whose nine tenths hold `local`'s tables, the room of its list of keys let go of, and
+/// `keys` keys of `each` bytes, with half a key to spare: what eviction comes down to.
 fn room_for(local: &Local<FixedState>, keys: u64, each: u64) -> u64 {
-    (local.tables() + keys * each + each / 2) * 10 / 9
+    (local.tables() + local.gone_room() + keys * each + each / 2) * 10 / 9
+}
+
+/// A name of some 2 KB, the `n`th: keys large beside the tables of a handful of them, so
+/// that a cap's tenth is a few keys.
+fn long_name(n: u64) -> String {
+    format!("{n:03}{}", "k".repeat(2_000))
 }
 
 #[test]
@@ -327,8 +346,211 @@ fn past_its_cap_it_evicts_the_keys_full_soonest() {
         .map(|spent| local.contains(format!("k{spent}").as_bytes()))
         .collect();
     assert_eq!(kept, [false, false, false, true, true]);
-    assert_eq!(local.holding(), tables + 2 * each);
     assert_eq!(local.evicted(), 3);
+    assert_eq!(
+        local.holding(),
+        tables + 5 * each + local.gone_room(),
+        "the three evicted counted while the worker's handles hold them"
+    );
+    handles.prune();
+    assert_eq!(
+        local.evict(0),
+        0,
+        "freed once let go of, and within the cap"
+    );
+    assert_eq!(local.holding(), tables + 2 * each);
+}
+
+/// The key of `name` in `local`'s registry.
+fn registered(local: &Local<FixedState>, name: &[u8]) -> Arc<Key> {
+    let hash = local.hasher.hash_one(name);
+    let held = read(local.shard(hash)).get_hashed(hash, name).cloned();
+    held.expect("registered")
+}
+
+/// A key evicted counts until the last handle to it goes, however many workers hold it, and
+/// is freed at the next look once none does.
+#[test]
+fn an_evicted_key_counts_until_the_last_handle_to_it_goes() {
+    let local = local();
+    let mut first = Handles::new(FixedState::default());
+    let mut second = Handles::new(FixedState::default());
+    let c = contract(10, SECOND, 10);
+    assert!(one(&local, &mut first, b"k", c, 0));
+    assert!(one(&local, &mut second, b"k", c, 0));
+    let held = Arc::downgrade(&registered(&local, b"k"));
+    let tables = local.tables();
+    local.set_capacity(1);
+    assert_eq!(local.evict(0), 1);
+    assert!(!local.contains(b"k"));
+    let counted = tables + key_bytes(b"k", c.into()) + local.gone_room();
+    assert_eq!(local.holding(), counted, "held by both workers");
+    first.prune();
+    assert_eq!(local.evict(0), 0, "no key left to evict");
+    assert_eq!(local.holding(), counted, "still held by the second");
+    assert!(held.upgrade().is_some());
+    second.prune();
+    assert_eq!(local.evict(0), 0);
+    assert!(held.upgrade().is_none(), "freed");
+    assert_eq!(local.holding(), tables);
+}
+
+/// Past the cap with keys evicted earlier still held, eviction does not evict again for
+/// them: they count in what the process holds until they are freed, but the cap is held by
+/// the keys kept, so the looks while they wait evict nothing more — not a tenth more each
+/// look (#602).
+#[test]
+fn keys_evicted_and_still_held_are_not_evicted_for_again() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(20, SECOND, 20);
+    // Keys spending 1 to 12 of their bucket: full again after 50 to 600 ms.
+    for spent in 1..=12_u64 {
+        for _ in 0..spent {
+            assert!(one(&local, &mut handles, long_name(spent).as_bytes(), c, 0));
+        }
+    }
+    let each = key_bytes(long_name(1).as_bytes(), c.into());
+    let tables = local.tables();
+    let cap = room_for(&local, 8, each);
+    local.set_capacity(cap);
+    let evicted = local.evict(0);
+    assert!(evicted > 0, "past the cap");
+    let kept = 12 - evicted;
+    assert!(
+        local.holding() > cap,
+        "the evicted counted while the worker's handles hold them"
+    );
+    for look in 1..=9 {
+        assert_eq!(local.evict(look * SECOND / 10), 0, "look {look}");
+    }
+    assert_eq!(local.key_count() as u64, kept);
+    handles.prune();
+    assert_eq!(local.evict(SECOND), 0);
+    assert_eq!(local.holding(), tables + kept * each);
+}
+
+/// Eviction leaves room for the keys made over the last `HANDLES_PRUNED`, what workers may
+/// go on holding of keys let go of: keys made in a burst count at once, a process within its
+/// cap by its keys alone evicting for them.
+#[test]
+fn eviction_leaves_room_for_the_keys_made_lately() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(20, SECOND, 20);
+    for n in 0..6 {
+        assert!(one(&local, &mut handles, long_name(n).as_bytes(), c, 0));
+    }
+    let each = key_bytes(long_name(0).as_bytes(), c.into());
+    let cap = room_for(&local, 11, each);
+    local.set_capacity(cap);
+    assert_eq!(
+        local.evict(0),
+        0,
+        "the first look, which knows of none made lately"
+    );
+    for n in 6..10 {
+        assert!(one(&local, &mut handles, long_name(n).as_bytes(), c, 0));
+    }
+    assert!(local.holding() <= cap, "within the cap by the keys alone");
+    let lately = 4 * each;
+    let needed = local.holding() + lately - (cap - cap / 10);
+    assert_eq!(
+        local.evict(SECOND / 2),
+        needed.div_ceil(each),
+        "room left for the four"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|n| n.parse().ok()).unwrap_or(256)
+    ))]
+
+    /// Past the cap, eviction takes the keys full soonest, to within a 1,024th of the span of
+    /// their times until full, down to nine tenths of the cap and no key past it; within the
+    /// cap, none.
+    #[test]
+    fn eviction_takes_the_keys_full_soonest_to_within_a_step(
+        spends in proptest::collection::vec(1..=20_u64, 1..40),
+        share in 0.0..1.0_f64,
+    ) {
+        let local = local();
+        let mut handles = Handles::new(FixedState::default());
+        let c = contract(20, SECOND, 20);
+        let names: Vec<String> = (0..spends.len() as u64).map(long_name).collect();
+        for (name, spent) in names.iter().zip(&spends) {
+            for _ in 0..*spent {
+                prop_assert!(one(&local, &mut handles, name.as_bytes(), c, 0));
+            }
+        }
+        let each = key_bytes(names[0].as_bytes(), c.into());
+        let full: Vec<u64> = names
+            .iter()
+            .map(|name| registered(&local, name.as_bytes()).full_in(0))
+            .collect();
+        let room = (share * names.len() as f64) as u64;
+        let cap = room_for(&local, room, each);
+        let past = local.holding() > cap;
+        local.set_capacity(cap);
+        local.evict(0);
+        let kept: Vec<bool> = names.iter().map(|name| local.contains(name.as_bytes())).collect();
+        let expected = if past { room } else { names.len() as u64 };
+        prop_assert_eq!(kept.iter().filter(|k| **k).count() as u64, expected);
+        // A range's step over the span of when the keys will be full: 1,024 of them.
+        let spread = full.iter().max().unwrap_or(&0) - full.iter().min().unwrap_or(&0);
+        let step = spread / 1_024 + 1;
+        let fulls = |want: bool| {
+            full.iter()
+                .zip(&kept)
+                .filter(move |(_, k)| **k == want)
+                .map(|(full, _)| *full)
+        };
+        if let (Some(last), Some(first)) = (fulls(false).max(), fulls(true).min()) {
+            prop_assert!(last < first + step, "evicted up to {}, kept from {}", last, first);
+        }
+    }
+}
+
+/// With many keys, eviction finds where to stop from a sample of the shards, each key read
+/// counted for the shards not read: it still takes the keys full soonest, and as many as the
+/// cap needs to within a twentieth.
+#[test]
+fn eviction_from_a_sample_takes_the_keys_full_soonest_and_about_as_many() {
+    let local = local();
+    let mut handles = Handles::new(FixedState::default());
+    let c = contract(20, SECOND, 20);
+    let keys = cutoff::SAMPLED_FROM as u64;
+    let name = |n: u64| format!("key{n:08}");
+    // Odd spends of 1 to 15, mixed over the keys: full again after 50 to 750 ms.
+    let spent = |n: u64| (n.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59) & 15 | 1;
+    for n in 0..keys {
+        for _ in 0..spent(n) {
+            assert!(one(&local, &mut handles, name(n).as_bytes(), c, 0));
+        }
+    }
+    assert!(cutoff::stride(local.key_count()) > 1, "read from a sample");
+    let each = key_bytes(name(0).as_bytes(), c.into());
+    let room = keys / 2;
+    local.set_capacity(room_for(&local, room, each));
+    let evicted = local.evict(0);
+    let kept = keys - evicted;
+    assert!(
+        kept.abs_diff(room) <= room / 20,
+        "kept {kept} keys, room for {room}"
+    );
+    let local = &local;
+    let spends = |kept: bool| {
+        (0..keys)
+            .filter(move |n| local.contains(name(*n).as_bytes()) == kept)
+            .map(spent)
+    };
+    // Full soonest: those that spent least, every one evicted before any that spent more.
+    let (most_evicted, least_kept) = (spends(false).max(), spends(true).min());
+    assert!(
+        most_evicted <= least_kept,
+        "evicted keys that spent up to {most_evicted:?}, kept from {least_kept:?}"
+    );
 }
 
 /// Eviction alone, as the sweep's thread takes it between sweeps: past the cap it evicts the
@@ -358,8 +580,19 @@ fn eviction_alone_evicts_past_the_cap_and_forgets_nothing() {
         .map(|spent| local.contains(format!("k{spent}").as_bytes()))
         .collect();
     assert_eq!(kept, [false, false, false, true, true]);
-    assert_eq!(local.holding(), tables + 2 * each);
     assert_eq!(local.evicted(), 3);
+    assert_eq!(
+        local.holding(),
+        tables + 5 * each + local.gone_room(),
+        "the three evicted counted while the worker's handles hold them"
+    );
+    handles.prune();
+    assert_eq!(
+        local.evict(0),
+        0,
+        "freed once let go of, and within the cap"
+    );
+    assert_eq!(local.holding(), tables + 2 * each);
 }
 
 #[test]
