@@ -11,6 +11,7 @@
     reason = "a file that cannot be read fails the test"
 )]
 
+use edgerush_planes::objects::ratelimit::{ratelimit_name, ratelimit_peers};
 use edgerush_planes::objects::{
     CONTROL_PLANE_GENERATED_ROLE, CONTROL_PLANE_LABEL, CONTROL_PLANE_NAMESPACE_LABEL,
     DATA_PLANE_LABEL, GATEWAY_CONTROLLER, INGRESS_CONTROLLER, NAMESPACE_LABEL, ROLES,
@@ -41,16 +42,22 @@ fn longest_name(file: &str) -> usize {
         .expect("the CRD bounds the name")
 }
 
-/// A Service's name is a DNS-1035 label: what each kind's Service is named must fit, for
+/// A Service's name is a DNS-1035 label: what each kind's Services are named must fit, for
 /// the longest name its CRD admits, and the CRD must admit every name that fits, or a
-/// resource is admitted whose Service the API server then refuses (05 §1).
+/// resource is admitted whose Service the API server then refuses (05 §1). A ControlPlane's
+/// are its controller's and its rate-limiting service's two.
 #[test]
 fn the_longest_names_admitted_name_services_of_63_characters() {
-    let control_plane = longest_name("gateway.edgerush.dev_controlplanes.yaml");
+    let control_plane = "a".repeat(longest_name("gateway.edgerush.dev_controlplanes.yaml"));
+    let services = [
+        controller_name(&control_plane),
+        ratelimit_name(&control_plane),
+        ratelimit_peers(&control_plane),
+    ];
     assert_eq!(
-        controller_name(&"a".repeat(control_plane)).len(),
-        63,
-        "a ControlPlane's controller's Service"
+        services.iter().map(String::len).max(),
+        Some(63),
+        "a ControlPlane's Services: {services:?}"
     );
     let data_plane = longest_name("gateway.edgerush.dev_dataplanes.yaml");
     assert_eq!(
@@ -544,7 +551,8 @@ fn the_operator_binds_the_five_roles_alone_and_reads_no_secret() {
         Some(&ROLES.map(str::to_owned)[..])
     );
     // It grants rights by binding alone: it makes no role, and holds none of what the
-    // planes read.
+    // planes read but ConfigMaps, as it writes the rate-limiting service's file in one
+    // (05 §2).
     for rule in &rules {
         for resource in rule.resources.iter().flatten() {
             assert!(
@@ -553,8 +561,7 @@ fn the_operator_binds_the_five_roles_alone_and_reads_no_secret() {
                     "roles",
                     "clusterroles",
                     "ingresses",
-                    "httproutes",
-                    "configmaps"
+                    "httproutes"
                 ]
                 .contains(&resource.as_str())
                     || rule.verbs == ["bind"],

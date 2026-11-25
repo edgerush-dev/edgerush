@@ -16,8 +16,9 @@
 //! ControlPlane is not accepted, every right beyond its own namespace, so that an allowance
 //! narrowed takes back what it granted (05 §4); and so is a webhook registration no longer
 //! asked for, its webhook turned off or its ControlPlane not accepted, a DataPlane's
-//! IngressClass or Gateway once its `ingress` or `gateway` is taken away, and its
-//! HorizontalPodAutoscaler once it no longer autoscales. One being deleted
+//! IngressClass or Gateway once its `ingress` or `gateway` is taken away, its
+//! HorizontalPodAutoscaler once it no longer autoscales, and every object of a
+//! ControlPlane's rate-limiting service once it no longer declares one. One being deleted
 //! has what no owner reference reaches deleted by its labels, then its finalizer taken
 //! away. Then each GatewayClass naming EdgeRush's controller that no ControlPlane made has
 //! its refusal written, where its status does not say it yet ([`classes`](crate::classes)).
@@ -42,16 +43,17 @@ use edgerush_gateway_api::gateway_class::GatewayClass;
 use edgerush_kubernetes::{ApiError, ApiServer, Kind, Scope};
 use edgerush_planes::control_plane::{ControlPlane, ControlPlaneWatchNamespaces};
 use edgerush_planes::data_plane::DataPlane;
+use edgerush_planes::objects::ratelimit::{RATE_LIMITING_COMPONENT, rate_limiting_labels};
 use edgerush_planes::objects::{
-    self, Install, Object, authority_bundle, control_plane_labels, controller_name,
-    data_plane_labels, proxy_name, registration_name,
+    self, COMPONENT_LABEL, Install, Object, authority_bundle, control_plane_labels,
+    controller_name, data_plane_labels, proxy_name, registration_name,
 };
 use edgerush_planes::platform_defaults::PlatformDefaults;
 use k8s_openapi::Resource;
 use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
-use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{ConfigMap, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::IngressClass;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
@@ -175,6 +177,9 @@ struct Plane<'a> {
     conditions: &'a [Condition],
     /// What its objects carry, and are found by.
     labels: BTreeMap<String, String>,
+    /// For a ControlPlane, what its rate-limiting service's objects carry, and are found
+    /// by, in place of `labels`: their pods are none of its controller's.
+    service_labels: Option<BTreeMap<String, String>>,
     /// Its Deployment's name.
     workload: String,
     accepted: Result<(), Refused>,
@@ -195,27 +200,48 @@ struct Plane<'a> {
     waits_for_bundle: bool,
 }
 
+impl Plane<'_> {
+    /// Each set of labels one of its objects is found by.
+    fn families(&self) -> Vec<&BTreeMap<String, String>> {
+        std::iter::once(&self.labels)
+            .chain(self.service_labels.as_ref())
+            .collect()
+    }
+
+    /// Whether an object labelled `labels` was made for it.
+    fn made(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.families()
+            .into_iter()
+            .any(|family| carries(labels, family))
+    }
+}
+
 /// An object deleted once it is no longer asked for, as `(kind, namespace, name)`: a
-/// binding, a webhook registration, an IngressClass, a Gateway or a HorizontalPodAutoscaler,
-/// the namespace empty for one of the cluster's.
+/// binding, a webhook registration, an IngressClass, a Gateway, a HorizontalPodAutoscaler
+/// or an object of a rate-limiting service, the namespace empty for one of the cluster's.
 type Withdrawn = (&'static str, String, String);
 
-/// Whether `kind` is of the objects deleted once no longer asked for: those a resource
-/// asks for or not as its spec and its allowance say. The rest it always has while it is.
-fn withdrawable(kind: &str) -> bool {
+/// Whether an object of `kind` labelled `labels` is of those deleted once no longer asked
+/// for: those a resource asks for or not as its spec and its allowance say, a ControlPlane's
+/// rate-limiting service whole among them. The rest it always has while it is.
+fn withdrawable(kind: &str, labels: &BTreeMap<String, String>) -> bool {
     kind == RoleBinding::KIND
         || kind == ClusterRoleBinding::KIND
         || kind == ValidatingWebhookConfiguration::KIND
         || kind == IngressClass::KIND
         || kind == Gateway::KIND
         || kind == HorizontalPodAutoscaler::KIND
+        || labels.get(COMPONENT_LABEL).map(String::as_str) == Some(RATE_LIMITING_COMPONENT)
 }
 
 /// Those of `objects` deleted once no longer asked for.
 fn withdrawable_of(objects: &[Object]) -> BTreeSet<Withdrawn> {
     objects
         .iter()
-        .filter(|object| withdrawable(object.kind()))
+        .filter(|object| {
+            let labels = object.metadata().labels.clone().unwrap_or_default();
+            withdrawable(object.kind(), &labels)
+        })
         .map(|object| {
             let metadata = object.metadata();
             (
@@ -262,7 +288,7 @@ impl Applied {
         let mut children: Vec<_> = seen
             .children
             .iter()
-            .filter(|child| carries(&child.labels, &plane.labels))
+            .filter(|child| plane.made(&child.labels))
             .map(|child| {
                 (
                     child.kind,
@@ -370,6 +396,7 @@ impl Operator {
                 metadata: &control_plane.metadata,
                 conditions: conditions(control_plane.status.as_ref().map(|s| &s.conditions)),
                 labels: control_plane_labels(namespace, name),
+                service_labels: Some(rate_limiting_labels(namespace, name)),
                 workload: controller_name(name),
                 accepted: verdict.clone(),
                 objects,
@@ -420,6 +447,7 @@ impl Operator {
                 metadata: &data_plane.metadata,
                 conditions: conditions(data_plane.status.as_ref().map(|s| &s.conditions)),
                 labels: data_plane_labels(namespace, of, name),
+                service_labels: None,
                 workload: proxy_name(name),
                 accepted: verdict.as_ref().map(|_| ()).map_err(Clone::clone),
                 objects,
@@ -660,7 +688,7 @@ impl Operator {
                 let made = if self.applied.get(uid) == Some(&applied) {
                     Made::Applied
                 } else {
-                    let made = apply_all(api, &objects, &plane.labels, uid).await;
+                    let made = apply_all(api, &objects, &plane.families(), uid).await;
                     match &made {
                         Made::Applied => {
                             self.applied.insert(uid.to_owned(), applied);
@@ -827,7 +855,7 @@ async fn withdraw(
     let kept =
         |child: &Child| keep.contains(&(child.kind, child.namespace.clone(), child.name.clone()));
     for child in seen.children.iter().filter(|child| {
-        withdrawable(child.kind) && carries(&child.labels, &plane.labels) && !kept(child)
+        withdrawable(child.kind, &child.labels) && plane.made(&child.labels) && !kept(child)
     }) {
         let (namespace, name) = (child.namespace.as_str(), child.name.as_str());
         let (deleted, why) = match child.kind {
@@ -851,11 +879,33 @@ async fn withdraw(
                 api.delete::<HorizontalPodAutoscaler>(namespace, name).await,
                 "no longer asked for",
             ),
-            // A ValidatingWebhookConfiguration, the last of `withdrawable`'s.
-            _ => (
+            ValidatingWebhookConfiguration::KIND => (
                 api.delete::<ValidatingWebhookConfiguration>("", name).await,
                 "no longer asked for",
             ),
+            // The rate-limiting service's, no longer declared.
+            ServiceAccount::KIND => (
+                api.delete::<ServiceAccount>(namespace, name).await,
+                "no longer declared",
+            ),
+            ConfigMap::KIND => (
+                api.delete::<ConfigMap>(namespace, name).await,
+                "no longer declared",
+            ),
+            Deployment::KIND => (
+                api.delete::<Deployment>(namespace, name).await,
+                "no longer declared",
+            ),
+            PodDisruptionBudget::KIND => (
+                api.delete::<PodDisruptionBudget>(namespace, name).await,
+                "no longer declared",
+            ),
+            Service::KIND => (
+                api.delete::<Service>(namespace, name).await,
+                "no longer declared",
+            ),
+            // No other kind is withdrawable.
+            _ => continue,
         };
         let deleted = deleted.map(drop);
         let object = if child.namespace.is_empty() {
@@ -882,12 +932,12 @@ fn carries(labels: &BTreeMap<String, String>, wanted: &BTreeMap<String, String>)
 }
 
 /// Whether an object is the operator's, made for the resource of UID `uid` that labels
-/// what it makes with `labels`: it carries them, or that resource owns it.
-fn ours(metadata: &ObjectMeta, labels: &BTreeMap<String, String>, uid: &str) -> bool {
+/// what it makes with one of `families`: it carries one, or that resource owns it.
+fn ours(metadata: &ObjectMeta, families: &[&BTreeMap<String, String>], uid: &str) -> bool {
     metadata
         .labels
         .as_ref()
-        .is_some_and(|held| carries(held, labels))
+        .is_some_and(|held| families.iter().any(|labels| carries(held, labels)))
         || metadata
             .owner_references
             .iter()
@@ -909,7 +959,7 @@ fn described(object: &Object) -> String {
 async fn apply_all(
     api: &ApiServer,
     objects: &[&Object],
-    labels: &BTreeMap<String, String>,
+    labels: &[&BTreeMap<String, String>],
     uid: &str,
 ) -> Made {
     let mut not_ours = Vec::new();
@@ -924,6 +974,7 @@ async fn apply_all(
                 apply_deployment(api, deployment, object, labels, uid).await
             }
             Object::Service(_) => apply::<Service>(api, object, labels, uid).await,
+            Object::ConfigMap(_) => apply::<ConfigMap>(api, object, labels, uid).await,
             Object::HorizontalPodAutoscaler(_) => {
                 apply::<HorizontalPodAutoscaler>(api, object, labels, uid).await
             }
@@ -956,7 +1007,7 @@ async fn apply_all(
 async fn apply<K: Kind>(
     api: &ApiServer,
     object: &Object,
-    labels: &BTreeMap<String, String>,
+    labels: &[&BTreeMap<String, String>],
     uid: &str,
 ) -> Result<bool, ApiError> {
     let metadata = object.metadata();
@@ -991,7 +1042,7 @@ async fn apply_deployment(
     api: &ApiServer,
     deployment: &Deployment,
     object: &Object,
-    labels: &BTreeMap<String, String>,
+    labels: &[&BTreeMap<String, String>],
     uid: &str,
 ) -> Result<bool, ApiError> {
     let namespace = deployment.metadata.namespace.as_deref().unwrap_or_default();

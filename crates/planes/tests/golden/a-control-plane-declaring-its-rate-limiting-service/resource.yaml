@@ -1,0 +1,15 @@
+# A rate-limiting service declared, its webhook off: its objects beside the controller's,
+# each of its settings in its file, its cap none declared: half its memory limit.
+apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: { name: payments, namespace: payments-edge, uid: 6f1c2b8e-0000-4000-8000-000000000007 }
+spec:
+  watch: { namespaces: { from: Same } }
+  webhook: { enabled: false }
+  rateLimiting:
+    service:
+      replicas: 5
+      resources: { requests: { cpu: "2", memory: 8Gi }, limits: { memory: 16Gi } }
+      shards: 512
+      copies: 1
+      forwarderDecides: false

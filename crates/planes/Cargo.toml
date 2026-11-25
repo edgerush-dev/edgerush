@@ -14,6 +14,8 @@ k8s-openapi.workspace = true
 serde.workspace = true
 # The DataPlane's `gateway`, of the Gateway's schema, read as the Gateway's spec.
 serde_json.workspace = true
+# The rate-limiting service's config file, YAML as the service reads it.
+serde-saphyr = { workspace = true, features = ["serialize"] }
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -21,9 +23,6 @@ edgerush-crdgen = { path = "../crdgen" }
 # The classes made name the controllers translation serves.
 edgerush-translate.workspace = true
 proptest.workspace = true
-# The CRDs are YAML, as the install ships them, and the Gateway's own fields are written
-# into the DataPlane's as YAML.
-serde-saphyr = { workspace = true, features = ["serialize"] }
 
 [lints]
 workspace = true

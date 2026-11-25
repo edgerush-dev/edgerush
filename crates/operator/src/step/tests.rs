@@ -113,6 +113,7 @@ fn object_at(path: &str) -> String {
         "deployments" => ("apps/v1", "Deployment", String::new()),
         "horizontalpodautoscalers" => ("autoscaling/v2", "HorizontalPodAutoscaler", String::new()),
         "poddisruptionbudgets" => ("policy/v1", "PodDisruptionBudget", String::new()),
+        "configmaps" => ("v1", "ConfigMap", String::new()),
         "gatewayclasses" => (
             "gateway.networking.k8s.io/v1",
             "GatewayClass",
@@ -231,6 +232,7 @@ fn path_of(object: &Object) -> String {
         "Service" => "services",
         "HorizontalPodAutoscaler" => "horizontalpodautoscalers",
         "PodDisruptionBudget" => "poddisruptionbudgets",
+        "ConfigMap" => "configmaps",
         "GatewayClass" => "gatewayclasses",
         "IngressClass" => "ingressclasses",
         "Gateway" => "gateways",
@@ -2426,4 +2428,175 @@ async fn a_generated_data_plane_whose_gateway_moved_class_is_deleted() {
         "{:?}",
         said.0
     );
+}
+
+/// [`control_plane`] watching its own namespace, declaring a rate-limiting service of
+/// every default.
+fn declaring_service() -> ControlPlane {
+    let mut control_plane = control_plane("Same");
+    control_plane.spec.rate_limiting = Some(
+        serde_json::from_value(serde_json::json!({
+            "service": {},
+        }))
+        .unwrap(),
+    );
+    control_plane
+}
+
+/// Where each object of ControlPlane `edge`'s rate-limiting service is applied.
+fn service_paths() -> BTreeSet<String> {
+    let name = "edgerush-ratelimit-edge";
+    BTreeSet::from([
+        format!("/api/v1/namespaces/edge/serviceaccounts/{name}"),
+        format!("/api/v1/namespaces/edge/configmaps/{name}"),
+        format!("/apis/apps/v1/namespaces/edge/deployments/{name}"),
+        format!("/apis/policy/v1/namespaces/edge/poddisruptionbudgets/{name}"),
+        format!("/api/v1/namespaces/edge/services/{name}"),
+        format!("/api/v1/namespaces/edge/services/{name}-peers"),
+    ])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rate_limiting_service_declared_is_made_with_its_control_plane() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let mut seen = after_first("1", 1);
+    seen.control_planes[0].spec = declaring_service().spec;
+    seen.control_planes[0].metadata.generation = Some(2);
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    let applied = written(&asked, "PATCH");
+    for path in service_paths() {
+        assert!(applied.contains(&path), "{path} not applied: {applied:?}");
+    }
+    // What is applied is what edgerush-planes makes, whole.
+    let config_map = objects::for_control_plane(
+        &published(declaring_service(), BUNDLE),
+        &BTreeSet::new(),
+        &install(),
+    )
+    .unwrap()
+    .into_iter()
+    .find(|object| object.kind() == "ConfigMap")
+    .unwrap();
+    let body = asked
+        .iter()
+        .find(|asked| asked.path == format!("{}{APPLY}", path_of(&config_map)))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body.body).unwrap(),
+        serde_json::to_value(&config_map).unwrap()
+    );
+    assert_eq!(written(&asked, "DELETE"), BTreeSet::new());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rate_limiting_service_no_longer_declared_is_deleted_whole_and_the_rest_kept() {
+    let (fake, api) = cluster(|_, _| None).await;
+    let declared = published(declaring_service(), BUNDLE);
+    let undeclared = published(control_plane("Same"), BUNDLE);
+    let mut seen = made_then(&declared, &BTreeSet::new(), &undeclared, None);
+    seen.control_planes[0].metadata.generation = Some(2);
+    assert!(
+        seen.children
+            .iter()
+            .any(|child| child.name == "edgerush-ratelimit-edge")
+    );
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let asked = fake.seen();
+    assert_eq!(written(&asked, "DELETE"), service_paths());
+    assert!(
+        said.any("ConfigMap edge/edgerush-ratelimit-edge deleted, no longer declared"),
+        "{:?}",
+        said.0
+    );
+    // The controller's own objects, of the same kinds, applied and not deleted.
+    let applied = written(&asked, "PATCH");
+    for path in [
+        "/apis/apps/v1/namespaces/edge/deployments/edgerush-controller-edge",
+        "/api/v1/namespaces/edge/services/edgerush-controller-edge",
+        "/api/v1/namespaces/edge/serviceaccounts/edgerush-controller-edge",
+    ] {
+        assert!(applied.contains(path), "{path} not applied: {applied:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_control_plane_not_accepted_keeps_its_rate_limiting_service() {
+    let (fake, api) = cluster(|_, _| None).await;
+    // Made while All was allowed; now no allowance is for it. Its rights beyond its own
+    // namespace are taken back, and its service kept, as what it declares.
+    let mut all = control_plane("All");
+    all.spec.rate_limiting = declaring_service().spec.rate_limiting;
+    let seen = made_then(&all, &BTreeSet::new(), &all, None);
+    let said = Said::default();
+    let mut operator = Operator::new(install());
+    assert!(
+        operator.step(&api, &seen, &time(10), &said.say()).await,
+        "{:?}",
+        said.0
+    );
+    let deleted = written(&fake.seen(), "DELETE");
+    assert!(
+        deleted
+            .iter()
+            .any(|path| path.starts_with(CLUSTER_ROLE_BINDINGS)),
+        "{deleted:?}"
+    );
+    assert!(deleted.is_disjoint(&service_paths()), "{deleted:?}");
+}
+
+const SERVICE_CONFIG_MAP: &str = "/api/v1/namespaces/edge/configmaps/edgerush-ratelimit-edge";
+
+/// A ConfigMap of the service's name, as a read of it answers, labelled `labels`.
+fn config_map_there(labels: serde_json::Value) -> String {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": { "name": "edgerush-ratelimit-edge", "namespace": "edge", "labels": labels },
+    })
+    .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_object_of_the_services_name_and_labels_is_the_operators_one_without_them_not() {
+    let rate_limiting =
+        serde_json::to_value(objects::ratelimit::rate_limiting_labels("edge", "edge")).unwrap();
+    for (labels, ours) in [(rate_limiting, true), (serde_json::json!({}), false)] {
+        let there = config_map_there(labels.clone());
+        let (fake, api) = cluster(move |method, path| {
+            (method == "GET" && path == SERVICE_CONFIG_MAP).then(|| answer(200, &there))
+        })
+        .await;
+        let mut seen = after_first("1", 1);
+        seen.control_planes[0].spec = declaring_service().spec;
+        seen.control_planes[0].metadata.generation = Some(2);
+        let said = Said::default();
+        let mut operator = Operator::new(install());
+        assert_eq!(
+            operator.step(&api, &seen, &time(10), &said.say()).await,
+            ours,
+            "{labels}: {:?}",
+            said.0
+        );
+        let applied = written(&fake.seen(), "PATCH").contains(SERVICE_CONFIG_MAP);
+        assert_eq!(applied, ours, "{labels}");
+        assert_eq!(
+            said.any("not the operator's, so left alone: ConfigMap edge/edgerush-ratelimit-edge"),
+            !ours,
+            "{labels}: {:?}",
+            said.0
+        );
+    }
 }

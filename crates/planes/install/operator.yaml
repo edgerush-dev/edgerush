@@ -4,8 +4,8 @@
 # ControlPlane and DataPlane, read before each is applied and followed by its label; `bind`
 # on the five shipped ClusterRoles by name, the only rights it grants, and no role made;
 # `deletecollection` on the kinds no owner reference reaches, deleted by label; `delete` on
-# what a plane may stop asking for, deleted by name; and no Secrets, routes or Ingresses
-# (05 §2).
+# what a plane may stop asking for, deleted by name, a ControlPlane's rate-limiting service
+# among it; and no Secrets, routes or Ingresses (05 §2).
 #
 # Until images are published (docs/12 item 6), the image is built and loaded by hand, as
 # the kind runs do: its name is in two places below, the container's and --image, which
@@ -55,20 +55,22 @@ rules:
     resources: [namespaces]
     verbs: [get, list, watch]
   # What it makes in a plane's own namespace, which goes with the plane by its owner
-  # reference. Applied: `create` for one not there yet, `patch` for one that is.
+  # reference. Applied: `create` for one not there yet, `patch` for one that is. Deleted by
+  # name too, as a ControlPlane's rate-limiting service once it no longer declares one,
+  # whose config file is a ConfigMap (05 §2).
   - apiGroups: [""]
-    resources: [serviceaccounts, services]
-    verbs: [get, list, watch, create, patch]
+    resources: [serviceaccounts, services, configmaps]
+    verbs: [get, list, watch, create, patch, delete]
   - apiGroups: [apps]
     resources: [deployments]
-    verbs: [get, list, watch, create, patch]
+    verbs: [get, list, watch, create, patch, delete]
   # A DataPlane's autoscaler, also deleted by name once it no longer autoscales (05 §5).
   - apiGroups: [autoscaling]
     resources: [horizontalpodautoscalers]
     verbs: [get, list, watch, create, patch, delete]
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
-    verbs: [get, list, watch, create, patch]
+    verbs: [get, list, watch, create, patch, delete]
   # A DataPlane's Gateway, also deleted by name once its `gateway` is taken away (05 §3).
   # Every Gateway is read, as one written alone may get a DataPlane generated: one that
   # sets parameters is refused in its status, its Accepted and Programmed alone, applied;

@@ -64,11 +64,11 @@ condition_is() {
     return 1
 }
 
-echo "== building the binary and its image"
-cargo build -q --release --locked -p edgerush
+echo "== building the binaries and their image"
+cargo build -q --release --locked -p edgerush -p edgerush-ratelimit-service
 image=target/kind/image
 rm -rf "$image" && mkdir -p "$image"
-cp target/release/edgerush "$image/"
+cp target/release/edgerush target/release/edgerush-ratelimit-service "$image/"
 sed "s|BASE|$BASE|" kind/discovery/Dockerfile > "$image/Dockerfile"
 docker build -q -t edgerush:dev "$image" >/dev/null
 kind load docker-image edgerush:dev --name "$name" >/dev/null

@@ -74,8 +74,8 @@ proptest! {
     #[test]
     fn every_name_is_a_dns_label_of_at_most_48_characters(
         gateway in gateway_name(),
-        // A ControlPlane's name, which its class has: a DNS label of at most 43.
-        class in "[a-z0-9]([-a-z0-9]{0,41}[a-z0-9])?",
+        // A ControlPlane's name, which its class has: a DNS label of at most 38.
+        class in "[a-z0-9]([-a-z0-9]{0,36}[a-z0-9])?",
     ) {
         let name = data_plane_name(&gateway, &class);
         prop_assert!(name.len() <= LONGEST, "{name}");

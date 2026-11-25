@@ -246,4 +246,71 @@ store: {}
             assert!(tls(&given).is_err(), "{given:?}");
         }
     }
+
+    /// The file the operator writes for a ControlPlane's service, `service` as it declares
+    /// it, as the pod at `10.1.2.3` runs it.
+    fn the_operators(service: &str) -> PodSettings {
+        use edgerush_planes::objects::{Install, Object, for_control_plane};
+        let control_plane = serde_saphyr::from_str(&format!(
+            "apiVersion: gateway.edgerush.dev/v1alpha1
+kind: ControlPlane
+metadata: {{ name: payments, namespace: edge, uid: uid-of-payments }}
+spec:
+  watch: {{ namespaces: {{ from: Same }} }}
+  rateLimiting: {{ service: {service} }}
+"
+        ))
+        .unwrap();
+        let install = Install {
+            image: "edgerush:test".to_owned(),
+            cluster_domain: "cluster.local".to_owned(),
+        };
+        let objects = for_control_plane(&control_plane, &Default::default(), &install).unwrap();
+        let file = objects
+            .iter()
+            .find_map(|object| match object {
+                Object::ConfigMap(config_map) => config_map.data.as_ref()?.get("service.yaml"),
+                _ => None,
+            })
+            .unwrap();
+        let own = Some("10.1.2.3".parse().unwrap());
+        parsed(file.as_bytes(), Path::new("/etc/edgerush/ratelimit"), own).unwrap()
+    }
+
+    /// What the operator writes is a file a pod runs, as the ControlPlane declares it: each
+    /// pod at its own address, finding the others through their headless Service, its
+    /// certificate the one the control plane writes.
+    #[test]
+    fn a_pod_runs_the_file_the_operator_writes() {
+        let settings = the_operators("{ shards: 64, copies: 1, maxKeyBytes: 1048576 }");
+        assert_eq!(settings.listen, "0.0.0.0:7000".parse().unwrap());
+        assert_eq!(settings.metrics, Some("0.0.0.0:9090".parse().unwrap()));
+        assert_eq!(settings.store.address, "10.1.2.3:7000");
+        assert_eq!(
+            settings.store.seeds,
+            ["edgerush-ratelimit-payments-peers.edge.svc:7000"]
+        );
+        assert_eq!(settings.store.config.shards, 64);
+        assert_eq!(settings.store.config.replicas, 1);
+        assert_eq!(settings.store.config.max_key_bytes, Some(1 << 20));
+        assert!(settings.store.forwarder_decides);
+        assert_eq!(
+            settings.tls,
+            Some(PodFiles {
+                certificate: "/etc/edgerush/identity/tls.crt".into(),
+                key: "/etc/edgerush/identity/tls.key".into(),
+                authorities: "/etc/edgerush/identity/ca.crt".into(),
+                trust_domain: "payments.cluster.local".to_owned(),
+            })
+        );
+        let defaults = the_operators("{}");
+        assert_eq!(defaults.store.config.shards, 256);
+        assert_eq!(defaults.store.config.replicas, 2);
+        assert_eq!(defaults.store.config.max_key_bytes, Some(MAX_KEY_BYTES));
+        assert!(
+            !the_operators("{ forwarderDecides: false }")
+                .store
+                .forwarder_decides
+        );
+    }
 }
