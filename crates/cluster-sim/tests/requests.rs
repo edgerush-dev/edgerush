@@ -187,12 +187,18 @@ fn answers_however_late_are_given_back() {
 
 /// Answers arriving 5 s late, long after a give-back's last send: each is sent three times,
 /// not once every interval until its answer comes, so that one charge is credited three
-/// times at most however late its answers.
+/// times at most however late its answers. The clients' checks wait longer than that, so
+/// that their late answers keep the pods up.
 #[test]
 fn a_give_back_is_sent_three_times_at_most() {
+    use edgerush_cluster_sim::client::Checks;
     use edgerush_cluster_sim::world::Link;
     for seed in SEEDS {
         let (mut world, pods) = scenario::cluster(seed, shape());
+        world.set_checks(Checks {
+            timeout: ms(10_000),
+            ..Checks::default()
+        });
         let late = Link {
             delay: ms(5_000),
             ..Link::lan()
@@ -278,18 +284,18 @@ fn parts_a_gathering_pod_counted_for_requests_refused_are_given_back() {
     }
 }
 
-/// Clients cut off from a pod, both ways: a client whose request could not reach it asks
-/// nothing of it while its stream is down, by any path — sent there again and again, each
-/// coming back unreachable, it would flood the others with its requests sent another way.
+/// Clients cut off from a pod, both ways: their checks of it refused, they ask nothing of it,
+/// by any path, while it stays cut off — sent there again and again, each coming back
+/// unreachable, they would flood the others with their requests sent another way.
 #[test]
-fn a_pod_a_client_cannot_reach_is_left_alone_while_its_stream_is_down() {
+fn a_pod_a_client_cannot_reach_is_left_alone_while_its_checks_are_refused() {
     for seed in SEEDS {
         let (mut world, _) = scenario::cluster(seed, shape());
         let pod = world.leader().unwrap();
         world.cut_clients_from(pod);
         world.run_for(ms(3_000));
-        // About once a client each time its stream is taken to be down again, 500 ms on, and
-        // whatever each had in flight to it then.
+        // What each client sent it before its first check there was refused, a millisecond
+        // or two, and whatever each had in flight to it then.
         let bound = shape().clients * 10;
         assert!(
             world.stats.unreachable <= bound,
@@ -299,45 +305,13 @@ fn a_pod_a_client_cannot_reach_is_left_alone_while_its_stream_is_down() {
     }
 }
 
-/// A data plane whose stream to a pod is down — a request sent there could not reach it — and
-/// a "counted" for an earlier request coming from that pod late: the breaker starts again, but
-/// the stream is still down, and the next request under the pod's keys goes elsewhere.
+/// A request that could not reach its key's owner is sent another way, it alone: the next
+/// under the owner's keys goes to the owner again, as a data plane's worker marks nothing
+/// down. A check of the owner refused marks it down for every request; one answered, up.
 #[test]
-fn a_late_answer_does_not_open_a_stream_that_is_down() {
+fn a_request_that_cannot_reach_its_pod_marks_it_down_for_no_other() {
     use edgerush_cluster::table;
     use edgerush_cluster_sim::client::{Client, Message};
-    use edgerush_cluster_synchronous::Answer;
-    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
-    let first = table::first(&members, 16, 2, 1);
-    // A key of pod 1's, asked three times in turn.
-    let Some(key) = (0..).find(|key| first.owner(table::shard_of(*key, 16)) == Some(1)) else {
-        panic!("pod 1 owns nothing");
-    };
-    let mut client = Client::new(1_000_000, vec![key], ms(5), ms(20), 16);
-    client.learn(first);
-    let pods = [1, 2, 3];
-    let id_of = |send: &(NodeId, Message)| match send.1 {
-        Message::Request { id, .. } => id,
-        _ => u64::MAX,
-    };
-    let early = client.send(ms(1), &pods).unwrap();
-    let cut = client.send(ms(2), &pods).unwrap();
-    assert_eq!((early.0, cut.0), (1, 1), "sent to the owner");
-    let _ = client.unreachable(id_of(&cut), 1, ms(3), &pods);
-    let _ = client.answered(id_of(&early), Answer::Counted(1), ms(4), &pods);
-    let next = client.send(ms(5), &pods).unwrap();
-    assert_ne!(next.0, 1, "sent to a pod its stream to is down");
-}
-
-/// A data plane whose stream to a key's owner is down sends the key through another pod, to be
-/// forwarded: attempts there left unanswered — the owner perhaps the one gone and failing over
-/// — say nothing of that pod, so it is not avoided for them, as a data plane's breaker does not
-/// count them, and the key goes on through it.
-#[test]
-fn a_pod_only_forwarding_is_not_avoided_for_answers_missing() {
-    use edgerush_cluster::table;
-    use edgerush_cluster_sim::client::{Client, Message};
-    use edgerush_cluster_synchronous::Answer;
     let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
     let first = table::first(&members, 16, 2, 1);
     let Some(key) = (0..).find(|key| first.owner(table::shard_of(*key, 16)) == Some(1)) else {
@@ -352,35 +326,110 @@ fn a_pod_only_forwarding_is_not_avoided_for_answers_missing() {
     };
     let cut = client.send(ms(1), &pods).unwrap();
     assert_eq!(cut.0, 1, "sent to the owner");
-    // Its stream to the owner down: sent through another pod, and more after it, each sent
-    // elsewhere answered, so that only the pod forwarding could be avoided.
-    let (through, _) = client.unreachable(id_of(&cut), 1, ms(2), &pods).unwrap();
-    let mut at = ms(2);
-    let mut unanswered = 1;
-    while unanswered < 3 {
-        at += ms(1);
-        let send = client.send(at, &pods).unwrap();
-        if send.0 == through {
-            unanswered += 1;
+    let (elsewhere, _) = client.unreachable(id_of(&cut), 1, ms(2), &pods).unwrap();
+    assert_ne!(elsewhere, 1, "sent another way");
+    assert_eq!(
+        client.send(ms(3), &pods).unwrap().0,
+        1,
+        "the next to the owner"
+    );
+    // Checked: the owner's refused, the others' answered.
+    let checks = client.checks_due(ms(4), &pods);
+    assert_eq!(checks.len(), 3, "each pod checked at once");
+    for (pod, id) in checks {
+        if pod == 1 {
+            client.check_refused(pod, id, ms(5));
         } else {
-            let _ = client.answered(id_of(&send), Answer::Counted(1), at, &pods);
+            client.check_answered(pod, id, ms(5));
         }
     }
-    // Every attempt through it past its time unanswered.
-    at += ms(6);
-    let _ = client.check(at, &pods);
-    let later: Vec<NodeId> = (1..=20)
-        .map(|n| client.send(at + n * ms(1), &pods).unwrap().0)
-        .collect();
-    assert!(
-        later.contains(&through),
-        "{through} avoided for answers missing: {later:?}"
-    );
+    assert!(client.is_down(1));
+    assert_ne!(client.send(ms(6), &pods).unwrap().0, 1, "marked down");
+    // Its next check, an interval after the last, answered: up.
+    assert!(client.checks_due(ms(50), &pods).is_empty(), "not yet due");
+    let again = client.checks_due(ms(105), &pods);
+    let (_, id) = again.iter().find(|(pod, _)| *pod == 1).copied().unwrap();
+    client.check_answered(1, id, ms(106));
+    assert!(!client.is_down(1));
+    assert_eq!(client.send(ms(107), &pods).unwrap().0, 1, "up again");
 }
 
-/// Clients cut off from every pod: with no pod to send to, a request waits — tried again as
-/// a stream comes back, left to `when_unreachable` at its deadline — rather than sent at once
-/// to every pod in turn, each sending coming back unreachable.
+/// Requests unanswered mark no pod down, however many, as a data plane's timeouts decide only
+/// their own requests: the owner is asked still. Its checks missed in a row do, past each
+/// one's timeout, one check at a time; an answer between starts the count again.
+#[test]
+fn requests_unanswered_mark_no_pod_down_and_checks_missed_do() {
+    use edgerush_cluster::table;
+    use edgerush_cluster_sim::client::{Checks, Client, Outcome};
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let first = table::first(&members, 16, 2, 1);
+    let Some(key) = (0..).find(|key| first.owner(table::shard_of(*key, 16)) == Some(1)) else {
+        panic!("pod 1 owns nothing");
+    };
+    let mut client = Client::new(1_000_000, vec![key], ms(5), ms(20), 16);
+    client.checking = Checks {
+        interval: ms(10),
+        timeout: ms(20),
+        misses: 2,
+    };
+    client.learn(first);
+    let pods = [1, 2, 3];
+    for at in 1..=5 {
+        assert_eq!(client.send(ms(at), &pods).unwrap().0, 1);
+    }
+    let (ended, _) = client.check(ms(40), &pods);
+    assert_eq!(ended.len(), 5);
+    assert!(
+        ended
+            .iter()
+            .all(|(_, outcome)| *outcome == Outcome::Refused)
+    );
+    assert_eq!(client.send(ms(41), &pods).unwrap().0, 1, "asked still");
+    // Pod 1's checks go unanswered; the others' are answered.
+    let mut at = ms(42);
+    let checked = |client: &mut Client, at: u64| {
+        let mut out = None;
+        for (pod, id) in client.checks_due(at, &pods) {
+            if pod == 1 {
+                out = Some(id);
+            } else {
+                client.check_answered(pod, id, at);
+            }
+        }
+        out
+    };
+    let first_check = checked(&mut client, at).unwrap();
+    at += ms(20);
+    assert_eq!(
+        checked(&mut client, at),
+        None,
+        "missed, the next an interval on"
+    );
+    assert!(!client.is_down(1), "one miss");
+    at += ms(10);
+    let second = checked(&mut client, at).unwrap();
+    assert_ne!(second, first_check);
+    // Answered, the count starts again.
+    client.check_answered(1, second, at + ms(1));
+    at += ms(11);
+    let third = checked(&mut client, at).unwrap();
+    at += ms(20);
+    assert_eq!(checked(&mut client, at), None);
+    assert!(!client.is_down(1), "one miss since the answer");
+    at += ms(10);
+    let _fourth = checked(&mut client, at).unwrap();
+    at += ms(20);
+    let _ = checked(&mut client, at);
+    assert!(client.is_down(1), "two in a row");
+    assert_ne!(client.send(at, &pods).unwrap().0, 1, "marked down");
+    // A late answer to a check missed before brings nothing back.
+    client.check_answered(1, third, at);
+    assert!(client.is_down(1));
+}
+
+/// Clients cut off from every pod: with every pod marked down by its checks, a request
+/// waits — tried again each millisecond, left to `when_unreachable` at its deadline — rather
+/// than sent at once to every pod in turn, each sending coming back unreachable.
 #[test]
 fn with_every_pod_out_of_reach_a_request_waits() {
     for seed in SEEDS {
@@ -389,8 +438,8 @@ fn with_every_pod_out_of_reach_a_request_waits() {
             world.cut_clients_from(pod);
         }
         world.run_for(ms(1_000));
-        // Each pod found down about once a client, and again 500 ms on, with what each
-        // client had in flight to it.
+        // Each pod's requests unreachable until its first check is refused, about once a
+        // client, with what each client had in flight to it.
         let bound = shape().clients * 3 * 10;
         assert!(
             world.stats.unreachable <= bound,
