@@ -98,8 +98,11 @@ pub struct RateLimiting {
     pub mode: RateLimitMode,
     /// Bytes the rate limits' keys may take in memory on this data plane, which its process
     /// holds once for all its workers, worked out from what each key keeps: past it, keys are
-    /// evicted, and start again full ([06 §8](../../../docs/06-rate-limiting.md)). 268,435,456 (256 MiB)
-    /// when left out. Not for `off`, which keeps no keys.
+    /// evicted, and start again full ([06 §8](../../../docs/06-rate-limiting.md)). Left out,
+    /// the data plane works it out from its memory limit as it starts: a quarter of it, or
+    /// what its workers could never use, less half again, whichever is more; 268,435,456
+    /// (256 MiB) with no limit ([`crate::memory`]). A control plane always states it. Not
+    /// for `off`, which keeps no keys.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub max_key_bytes: Option<u64>,

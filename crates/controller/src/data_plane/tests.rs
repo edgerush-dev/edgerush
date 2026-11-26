@@ -304,6 +304,54 @@ fn a_data_planes_rate_limiting_is_its_planes() {
     );
 }
 
+/// A cap left out is stated all the same where keys are kept: worked out from the pods'
+/// memory limit and workers as the proxy would from its cgroup (06 §8), 256 MiB with no
+/// limit; so that a pod whose real limit differs still runs the DataPlane's.
+#[test]
+fn a_key_cap_left_out_is_worked_out_from_the_pods() {
+    const MIB: u64 = 1024 * 1024;
+    let cap = |resources: &str| {
+        plane(
+            &web(
+                1,
+                &format!(
+                    "  ingress: {{ httpPort: 80, httpsPort: 443 }}
+  rateLimiting: {{ mode: Local }}
+{resources}"
+                ),
+                "",
+            ),
+            &own(),
+        )
+        .unwrap()
+        .rate_limiting
+        .unwrap()
+        .max_key_bytes
+    };
+    assert_eq!(cap(""), Some(256 * MIB));
+    // 512 MiB on 4 workers: a quarter.
+    assert_eq!(
+        cap("  resources: { requests: { cpu: 4 }, limits: { memory: 512Mi } }\n"),
+        Some(128 * MIB)
+    );
+    // 8 GiB on 4: two thirds of what the workers' 3,840 MiB leave, as a quantity or as
+    // bytes written as one.
+    for memory in ["8Gi", "\"8589934592\""] {
+        assert_eq!(
+            cap(&format!(
+                "  resources: {{ requests: {{ cpu: \"4\" }}, limits: {{ memory: {memory} }} }}\n"
+            )),
+            Some(4352 * MIB * 2 / 3),
+            "{memory}"
+        );
+    }
+    // The same memory on 8 workers leaves the keys less.
+    assert_eq!(
+        cap("  resources: { requests: { cpu: 8 }, limits: { memory: 8Gi } }\n"),
+        Some(2048 * MIB)
+    );
+}
+
 /// What a DataPlane's rate limiting holds that its schema let through and the data plane
 /// cannot take is said by its field, a limit by its name.
 #[test]

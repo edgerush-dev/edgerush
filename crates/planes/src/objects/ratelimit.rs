@@ -30,7 +30,7 @@ use super::{
     port, requirements,
 };
 use crate::control_plane::ControlPlaneRateLimitingService;
-use crate::workers::millis;
+use crate::workers::memory_limit;
 
 #[cfg(test)]
 mod tests;
@@ -148,19 +148,12 @@ fn max_key_bytes(service: &ControlPlaneRateLimitingService) -> Result<Option<i64
     if let Some(declared) = service.max_key_bytes {
         return Ok(Some(declared));
     }
-    let limit = service
+    let limits = service
         .resources
         .as_ref()
-        .and_then(|resources| resources.limits.as_ref())
-        .and_then(|limits| limits.get("memory"));
-    let bytes = match limit {
-        None => return Ok(None),
-        Some(IntOrString::Int(bytes)) => {
-            u64::try_from(*bytes).map_err(|_| Error::Memory(bytes.to_string()))?
-        }
-        Some(IntOrString::String(written)) => millis(written)
-            .map(|millis| millis / 1000)
-            .ok_or_else(|| Error::Memory(written.clone()))?,
+        .and_then(|resources| resources.limits.as_ref());
+    let Some(bytes) = memory_limit(limits).map_err(Error::Memory)? else {
+        return Ok(None);
     };
     Ok(Some(i64::try_from(bytes / 2).unwrap_or(i64::MAX).max(1)))
 }

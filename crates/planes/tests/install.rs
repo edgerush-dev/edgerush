@@ -1,9 +1,9 @@
 //! What `install/` ships: the CRDs' bound on a name, as the code names Services by it; the
 //! five ClusterRoles the operator binds, the control plane's rights on RateLimitPolicies
 //! among them, the admission policies on a control plane's
-//! Services, as the code names them, and on generated DataPlanes, as `operator.yaml` names
-//! the operator's ServiceAccount; and the operator itself, which grants by binding those
-//! five alone.
+//! Services, as the code names them, on generated DataPlanes, as `operator.yaml` names
+//! the operator's ServiceAccount, and on a DataPlane's key cap; and the operator itself,
+//! which grants by binding those five alone.
 
 #![allow(
     clippy::unwrap_used,
@@ -305,6 +305,48 @@ fn the_data_plane_status_policy_judges_the_control_planes_status_writes_and_is_b
         Some(&["dataplanes/status".to_owned()][..])
     );
     assert_eq!(rule.operations.as_deref(), Some(&["UPDATE".to_owned()][..]));
+}
+
+/// The key cap's policy judges every DataPlane written that states a cap beside a memory
+/// limit, by whomever: what a team writes is what it guards against.
+#[test]
+fn the_key_cap_policy_judges_every_data_plane_stating_a_cap_and_a_limit_and_is_bound() {
+    let policies = admission_policies();
+    let (_, conditions) = policies
+        .iter()
+        .find(|(name, _)| name == "edgerush-data-plane-key-cap")
+        .expect("the policy on a DataPlane's key cap");
+    let [condition] = conditions.as_slice() else {
+        panic!("one condition: {conditions:?}");
+    };
+    assert!(
+        condition.contains("maxKeyBytes") && condition.contains("limits.memory"),
+        "{condition}"
+    );
+    assert!(!condition.contains("userInfo"), "whoever writes it");
+    let shipped: Vec<Admission> = serde_saphyr::from_multiple(&read("admission.yaml")).unwrap();
+    let rules = shipped
+        .into_iter()
+        .find_map(|object| match object {
+            Admission::ValidatingAdmissionPolicy(policy)
+                if policy.metadata.name.as_deref() == Some("edgerush-data-plane-key-cap") =>
+            {
+                policy.spec?.match_constraints?.resource_rules
+            }
+            _ => None,
+        })
+        .expect("its rules");
+    let [rule] = rules.as_slice() else {
+        panic!("one rule: {rules:?}");
+    };
+    assert_eq!(
+        rule.resources.as_deref(),
+        Some(&["dataplanes".to_owned()][..])
+    );
+    assert_eq!(
+        rule.operations.as_deref(),
+        Some(&["CREATE".to_owned(), "UPDATE".to_owned()][..])
+    );
 }
 
 #[test]

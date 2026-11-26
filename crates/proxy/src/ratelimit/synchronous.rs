@@ -120,8 +120,10 @@ impl Ended {
 }
 
 impl Process {
-    /// The process's synchronous mode for `config`, with `workers` workers, and the thread
-    /// that probes its members' open breakers, which calls `failed` if it panics.
+    /// The process's synchronous mode for `config`, with `workers` workers, its own keys
+    /// (with `when_unreachable: local`) within `max_key_bytes`, the cap the data plane runs
+    /// the config at, and the thread that probes its members' open breakers, which calls
+    /// `failed` if it panics.
     ///
     /// A reload carries an outage's state across from the `running` one: every member met,
     /// its breaker with it, whatever else changed, and the process's own keys while
@@ -129,6 +131,7 @@ impl Process {
     /// mid-outage neither closes the breakers nor hands out fresh buckets.
     pub(crate) fn start(
         config: CompiledSynchronous,
+        max_key_bytes: u64,
         workers: NonZeroUsize,
         failed: Option<Failed>,
         running: Option<&Self>,
@@ -138,10 +141,10 @@ impl Process {
         let local = (config.when_unreachable == WhenUnreachable::Local).then(|| {
             match running.and_then(|running| running.local.as_ref()) {
                 Some(local) => {
-                    local.set_capacity(config.max_key_bytes);
+                    local.set_capacity(max_key_bytes);
                     Arc::clone(local)
                 }
-                None => LocalKeys::unswept(config.max_key_bytes),
+                None => LocalKeys::unswept(max_key_bytes),
             }
         });
         let process = Arc::new(Self {
@@ -1306,7 +1309,7 @@ mod tests {
             when_unreachable: WhenUnreachable::Deny,
             breaker_failures: 1,
             probe_after: Duration::from_secs(60),
-            max_key_bytes: 1 << 20,
+            max_key_bytes: Some(1 << 20),
             tls: None,
         }
     }
@@ -1317,11 +1320,11 @@ mod tests {
     #[test]
     fn breakers_carried_across_keep_their_clock() {
         let one = NonZeroUsize::MIN;
-        let before = Process::start(config(20), one, None, None, None).unwrap();
+        let before = Process::start(config(20), 1 << 20, one, None, None, None).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let member = before.member_at("rl-0:7000", Some(7));
         member.breaker.failed(before.now(), 1);
-        let after = Process::start(config(30), one, None, Some(&before), None).unwrap();
+        let after = Process::start(config(30), 1 << 20, one, None, Some(&before), None).unwrap();
         assert!(
             after.member_at("rl-0:7000", Some(7)).breaker.is_open(),
             "carried"
@@ -1338,7 +1341,8 @@ mod tests {
     /// at the address, its pod restarted, starts with a breaker of its own.
     #[test]
     fn a_member_is_shared_and_shown_by_its_address() {
-        let process = Process::start(config(20), NonZeroUsize::MIN, None, None, None).unwrap();
+        let process =
+            Process::start(config(20), 1 << 20, NonZeroUsize::MIN, None, None, None).unwrap();
         let seed = process.member_at("rl-0:7000", None);
         seed.breaker.failed(process.now(), 1);
         let named = process.member_at("rl-0:7000", Some(7));

@@ -16,7 +16,9 @@
 
 use edgerush_config::{AccessLog, Forwarding, Http3, ListenerProxyProtocol, RequestId};
 use edgerush_kubernetes::{ApiServer, Scope};
-use edgerush_planes::data_plane::{DataPlane, DataPlanePorts, DataPlaneRateLimiting};
+use edgerush_planes::data_plane::{
+    DataPlane, DataPlanePorts, DataPlaneRateLimiting, DataPlaneResources,
+};
 use edgerush_planes::objects::{ProxyService, data_plane_id, proxy_name};
 use edgerush_translate::{
     GatewayName, IpFamily, Plane, PlaneRateLimitMode, PlaneRateLimiting, PortSettings,
@@ -481,12 +483,22 @@ pub fn plane(data_plane: &DataPlane, own: &Own) -> Result<Plane, Unusable> {
             port_settings(settings).map_err(|(field, why)| unusable(at(&field), why))?,
         );
     }
-    let rate_limiting = spec
+    let mut rate_limiting = spec
         .rate_limiting
         .as_ref()
         .map(rate_limiting)
         .transpose()
         .map_err(|(field, why)| unusable(format!("rateLimiting.{field}"), why))?;
+    // Always stated where keys are kept, so that the proxy's own default, which knows only
+    // the limit its cgroup has, never decides it (06 §8).
+    if let Some(limiting) = rate_limiting.as_mut()
+        && limiting.mode != PlaneRateLimitMode::Off
+        && limiting.max_key_bytes.is_none()
+    {
+        let cap = default_max_key_bytes(spec.resources.as_ref())
+            .map_err(|(field, why)| unusable(format!("resources.{field}"), why))?;
+        limiting.max_key_bytes = Some(cap);
+    }
     let ingress = spec.ingress.as_ref();
     let (http_port, https_port) = match ingress {
         Some(ingress) => {
@@ -594,6 +606,26 @@ fn rate_limiting(limiting: &DataPlaneRateLimiting) -> Result<PlaneRateLimiting, 
         max_key_bytes,
         global,
     })
+}
+
+/// The key cap of a DataPlane whose `rateLimiting` leaves it out: worked out from its pods'
+/// memory limit and workers as its proxies would from their cgroup
+/// ([`edgerush_config::memory`]), 256 MiB with no limit; or the field, below `resources`,
+/// and why it cannot be.
+fn default_max_key_bytes(resources: Option<&DataPlaneResources>) -> Result<u64, (String, String)> {
+    let limits = resources.and_then(|r| r.limits.as_ref());
+    let workers = edgerush_planes::workers(resources.and_then(|r| r.requests.as_ref()), limits)
+        .map_err(|cpu| ("cpu".to_owned(), format!("{cpu} is not a number of CPUs")))?;
+    let limit = edgerush_planes::memory_limit(limits).map_err(|memory| {
+        (
+            "limits.memory".to_owned(),
+            format!("{memory} is not a number of bytes"),
+        )
+    })?;
+    let workers = std::num::NonZeroU64::new(workers).unwrap_or(std::num::NonZeroU64::MIN);
+    Ok(edgerush_config::memory::default_max_key_bytes(
+        limit, workers,
+    ))
 }
 
 /// `value` as a number of `T`, if it is one and no less than `least`.

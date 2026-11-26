@@ -27,12 +27,11 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::LocalSet;
 
-/// The most connections a worker holds before it stops accepting ([14 §8]): open ones,
-/// ones on their way to it and ones lingering to their close. Past it, connections wait in
-/// the kernel's backlog. Fewer where the open files are fewer ([`crate::limits`]).
-///
-/// [14 §8]: ../../../docs/14-downstream-server.md
-pub(crate) const CONNECTIONS_PER_WORKER: usize = 32_768;
+/// The most connections a worker holds before it stops accepting
+/// ([`edgerush_config::memory::CONNECTIONS_PER_WORKER`]). Past it, connections wait in the
+/// kernel's backlog. Fewer where the open files or the memory allow fewer
+/// ([`crate::limits`]).
+pub(crate) const CONNECTIONS_PER_WORKER: usize = edgerush_config::memory::CONNECTIONS_PER_WORKER;
 
 /// How many connections can be on their way to a worker that is busy with something else.
 /// With more than that, a connection stays with the worker that accepted it.

@@ -6,8 +6,9 @@
 //! `install/` holds what is applied as the operator is installed: the four CRDs; the five
 //! ClusterRoles, the only rights the operator ever grants, by `bind` (05 §2); the
 //! admission policies, that refuse `externalIPs` on a Service a control plane writes, any
-//! Service or Secret it writes beyond its own namespace that is not its own, and a
-//! generated DataPlane written by anyone but the operator; and the operator itself, its
+//! Service or Secret it writes beyond its own namespace that is not its own, a
+//! generated DataPlane written by anyone but the operator, and a DataPlane whose key cap
+//! its memory limit cannot hold; and the operator itself, its
 //! rights and its Deployment. The
 //! CRDs are written by hand, and the types here are written from them by `edgerush-crdgen`,
 //! as Gateway API's are ([02 §7](../../../docs/02-architecture.md)); the DataPlane's
@@ -35,3 +36,5 @@ pub mod platform_defaults;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod rate_limit_policy;
 mod workers;
+
+pub use workers::{memory_limit, workers};

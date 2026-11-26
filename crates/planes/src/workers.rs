@@ -1,6 +1,8 @@
 //! How many request workers a data plane's proxy runs: its CPU request rounded up, no more
 //! than its CPU limit rounded down, and at least one ([05 §5](../../../docs/05-operator.md)).
-//! Never left to the process, which without a limit would count the node's CPUs.
+//! Never left to the process, which without a limit would count the node's CPUs. And a
+//! pod's memory limit, which, with the workers, a key cap left out is worked out from
+//! (06 §8).
 
 use std::collections::BTreeMap;
 
@@ -11,7 +13,11 @@ mod tests;
 
 /// The workers for a pod of these `requests` and `limits`, or the quantity that could not
 /// be read. Kubernetes takes a limit alone as the request too, and so does this.
-pub(crate) fn workers(
+///
+/// # Errors
+///
+/// The CPU quantity, as written, if it is not one a number can be read from.
+pub fn workers(
     requests: Option<&BTreeMap<String, IntOrString>>,
     limits: Option<&BTreeMap<String, IntOrString>>,
 ) -> Result<u64, String> {
@@ -20,6 +26,23 @@ pub(crate) fn workers(
     let wanted = request.or(limit).map_or(1, |millis| millis.div_ceil(1000));
     let ceiling = limit.map_or(u64::MAX, |millis| millis / 1000);
     Ok(wanted.min(ceiling).max(1))
+}
+
+/// The `memory` of a pod's `limits`, in bytes, rounded down; none where it has none.
+///
+/// # Errors
+///
+/// The quantity, as written, if it is not one a number of bytes can be read from.
+pub fn memory_limit(limits: Option<&BTreeMap<String, IntOrString>>) -> Result<Option<u64>, String> {
+    match limits.and_then(|l| l.get("memory")) {
+        None => Ok(None),
+        Some(IntOrString::Int(bytes)) => u64::try_from(*bytes)
+            .map(Some)
+            .map_err(|_| bytes.to_string()),
+        Some(IntOrString::String(written)) => millis(written)
+            .map(|millis| Some(millis / 1000))
+            .ok_or_else(|| written.clone()),
+    }
 }
 
 /// The `cpu` of `resources`, in thousandths of a CPU, rounded up.

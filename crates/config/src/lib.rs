@@ -13,7 +13,8 @@
 //! upstreams ([`Config`]), and their compilation ([`compile`]) into a router per listener
 //! and what each rule does and leads to ([`Compiled`]); and what the development harness
 //! reads from its file ([`HarnessFile`]); and what a pod of the rate-limiting service reads
-//! from its file ([`ServiceFile`]).
+//! from its file ([`ServiceFile`]); and how a data plane's memory limit is shared out
+//! ([`memory`]).
 
 mod backends;
 mod compile;
@@ -22,6 +23,7 @@ mod dns;
 mod harness_file;
 mod kubernetes;
 mod limits;
+pub mod memory;
 mod route;
 mod service_file;
 

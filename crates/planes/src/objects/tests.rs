@@ -10,7 +10,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use super::{Error, Install, Object, ProxyService, Transports, for_control_plane, for_data_plane};
 use crate::control_plane::{ControlPlane, ControlPlaneStatus, ControlPlaneStatusAuthority};
-use crate::data_plane::{DataPlane, DataPlaneIngress, DataPlaneResources};
+use crate::data_plane::{DataPlane, DataPlaneIngress, DataPlaneRateLimiting, DataPlaneResources};
 
 fn install() -> Install {
     Install {
@@ -92,6 +92,43 @@ fn a_data_plane_of_another_control_plane_makes_nothing() {
         for_data_plane(&dp, &control_plane(), &BTreeSet::new(), &install()),
         Err(Error::NotItsControlPlane { .. })
     ));
+}
+
+/// The annotations of the pods of the data plane `objects` are made for.
+fn pod_annotations(objects: &[Object]) -> Option<BTreeMap<String, String>> {
+    objects
+        .iter()
+        .find_map(|object| match object {
+            Object::Deployment(deployment) => deployment.spec.template.metadata.as_ref(),
+            _ => None,
+        })
+        .unwrap()
+        .annotations
+        .clone()
+}
+
+/// The mode and a stated cap are on the pods, where keys are kept, so that changing either
+/// rolls them: a proxy plans its memory beside the cap it started with (06 §8).
+#[test]
+fn a_changed_mode_or_key_cap_rolls_the_pods() {
+    let annotated = |limiting: Option<(&str, Option<i64>)>| {
+        let mut dp = data_plane();
+        dp.spec.rate_limiting = limiting.map(|(mode, max_key_bytes)| DataPlaneRateLimiting {
+            mode: mode.to_owned(),
+            max_key_bytes,
+            ..DataPlaneRateLimiting::default()
+        });
+        let objects = for_data_plane(&dp, &control_plane(), &BTreeSet::new(), &install()).unwrap();
+        pod_annotations(&objects)
+            .and_then(|annotations| annotations.get(super::RATE_LIMITING_ANNOTATION).cloned())
+    };
+    assert_eq!(annotated(None), None);
+    assert_eq!(annotated(Some(("Disabled", None))), None);
+    assert_eq!(annotated(Some(("Local", None))), Some("Local".to_owned()));
+    assert_eq!(
+        annotated(Some(("Local", Some(1_048_576)))),
+        Some("Local, maxKeyBytes 1048576".to_owned())
+    );
 }
 
 #[test]

@@ -182,8 +182,9 @@ pub struct Plane {
 pub struct PlaneRateLimiting {
     /// Which mode.
     pub mode: PlaneRateLimitMode,
-    /// Bytes the limits' keys may hold, as the config's `rate_limiting.max_key_bytes`;
-    /// the data plane's own bound when left out.
+    /// Bytes the limits' keys may hold, as the config's `rate_limiting.max_key_bytes`:
+    /// always stated by the control plane where the mode keeps keys, worked out from the
+    /// DataPlane's memory limit and workers where it leaves it out.
     #[serde(default)]
     pub max_key_bytes: Option<u64>,
     /// The limits every request the data plane forwards is under, each written as the

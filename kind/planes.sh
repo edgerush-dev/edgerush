@@ -2,7 +2,7 @@
 # What the install ships, judged by a real API server in a kind cluster (docs/05 §1, §2;
 # docs/10): the ControlPlane, DataPlane, PlatformDefaults and RateLimitPolicy CRDs, the five
 # ClusterRoles and the admission policies, on a control plane's Services, on what it writes beyond its own
-# namespace and on generated DataPlanes, applied as a user would; beside Gateway API's
+# namespace, on generated DataPlanes and on a DataPlane's key cap, applied as a user would; beside Gateway API's
 # CRDs, which the golden cases' Gateways need.
 #
 #   kind/planes.sh 1.37          make the cluster, run every check, delete the cluster
@@ -32,7 +32,8 @@
 #     cannot allow, or of an operator Kubernetes does not have; a DataPlane naming a
 #     Gateway beside a gateway or ingress of its own; a Gateway-first entry holding
 #     ingress, or two entries of one class; rate limiting of a mode the DataPlane does not
-#     take or of none, a bound on keys with it disabled, the synchronous mode without how
+#     take or of none, a bound on keys with it disabled or that, with half as much again,
+#     its memory limit cannot hold (by an admission policy), the synchronous mode without how
 #     a request waits or that given in another mode, a wait without what decides an owner
 #     unheard, that in lower case, or of no time, a breaker opened by no failure or never
 #     tried again, the asynchronous mode's settings in another or a cycle of no time, a
@@ -287,6 +288,26 @@ admitted "a DataPlane limiting asynchronously, of each setting" "$(limiting '{ m
 refused "a rate-limiting mode the DataPlane does not take" "spec.rateLimiting.mode" "$(limiting '{ mode: Off }')"
 refused "rate limiting of no mode" "spec.rateLimiting.mode" "$(limiting '{ global: [] }')"
 refused "a bound on keys with rate limiting disabled" "not Disabled" "$(limiting '{ mode: Disabled, maxKeyBytes: 1048576 }')"
+# `capped <memory> <maxKeyBytes>`: a DataPlane limiting locally within that cap, its pods'
+# memory limit that. A cap and half as much again must be below the limit (06 §8), as an
+# admission policy has it: 512 Mi holds 357,913,941 bytes so, and no more.
+capped() {
+    data_plane public "  ingress: { httpPort: 80, httpsPort: 443 }
+  resources: { limits: { memory: $1 } }
+  rateLimiting: { mode: Local, maxKeyBytes: $2 }"
+}
+# A policy is enforced some seconds after it is made: until then, the cap it refuses is let
+# through. Waited for here, at most a minute, so that what follows judges the policy itself.
+for _ in $(seq 30); do
+    k apply --dry-run=server -f - <<<"$(capped 512Mi 357913942)" >/dev/null 2>&1 || break
+    sleep 2
+done
+admitted "a bound on keys its memory limit holds with half as much again" "$(capped 512Mi 357913941)"
+admitted "a bound on keys with no memory limit" "$(limiting '{ mode: Local, maxKeyBytes: 1099511627776 }')"
+admitted "a bound on keys its memory limit, in bytes, holds with half as much again" "$(capped 536870912 357913941)"
+refused "a bound on keys its memory limit cannot hold with half as much again" "half as much again" "$(capped 512Mi 357913942)"
+refused "a bound on keys its memory limit, in bytes, cannot hold with half as much again" "half as much again" "$(capped 536870912 357913942)"
+refused "a bound on keys its memory limit, quoted bytes, cannot hold with half as much again" "half as much again" "$(capped '"536870912"' 357913942)"
 refused "the synchronous mode without how a request waits" "synchronous must be given" "$(limiting '{ mode: Synchronous }')"
 refused "how a request waits for its owner, in another mode" "synchronous must be given" "$(limiting "{ mode: Asynchronous, synchronous: $waits }")"
 refused "a synchronous wait without what decides an owner unheard" "spec.rateLimiting.synchronous.whenUnreachable" "$(limiting '{ mode: Synchronous, synchronous: { timeoutMs: 20, breaker: { failures: 5, probeAfterMs: 1000 } } }')"

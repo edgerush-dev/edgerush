@@ -51,7 +51,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::Serialize;
 
 use crate::control_plane::{ControlPlane, ControlPlaneWatchNamespacesSelector};
-use crate::data_plane::DataPlane;
+use crate::data_plane::{DataPlane, DataPlaneRateLimiting};
 use crate::gateway_first::carried;
 use crate::rate_limit_policy::RateLimitPolicy;
 use crate::workers::workers;
@@ -90,6 +90,13 @@ pub const GATEWAY_CONTROLLER: &str = "edgerush.dev/gateway-controller";
 pub const CONTROL_PLANE_LABEL: &str = "gateway.edgerush.dev/control-plane";
 /// The label naming the DataPlane an object is for, beside its ControlPlane's.
 pub const DATA_PLANE_LABEL: &str = "gateway.edgerush.dev/data-plane";
+
+/// The annotation on a data plane's pods holding its rate limiting's mode and the key cap
+/// it states, where it keeps keys. A proxy sets memory aside for its keys' cap as it starts
+/// and never raises the cap while it runs (06 §8): a change of either changes the pods'
+/// template, and so rolls them. A change of the memory limit or the CPU, which a cap left
+/// out is worked out from, rolls them already.
+pub const RATE_LIMITING_ANNOTATION: &str = "gateway.edgerush.dev/rate-limiting";
 /// The label naming the namespace of the resource an object is for: names are unique only
 /// with it, so that a resource of the same names in another namespace never selects, by
 /// label, what was made for this one (05 §2).
@@ -243,6 +250,22 @@ impl Object {
             Self::ValidatingWebhookConfiguration(object) => &mut object.metadata,
         }
     }
+}
+
+/// A data plane's [`RATE_LIMITING_ANNOTATION`]: its mode, and the cap it states, where it
+/// keeps keys; none where it keeps none.
+fn rate_limiting_annotation(
+    limiting: Option<&DataPlaneRateLimiting>,
+) -> Option<BTreeMap<String, String>> {
+    let limiting = limiting.filter(|limiting| limiting.mode != "Disabled")?;
+    let value = match limiting.max_key_bytes {
+        Some(bytes) => format!("{}, maxKeyBytes {bytes}", limiting.mode),
+        None => limiting.mode.clone(),
+    };
+    Some(BTreeMap::from([(
+        RATE_LIMITING_ANNOTATION.to_owned(),
+        value,
+    )]))
 }
 
 /// `labels` and `annotations` added to `metadata`, under what it already has, which wins.
@@ -1076,6 +1099,7 @@ pub fn for_data_plane(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(labels.clone()),
+                    annotations: rate_limiting_annotation(spec.rate_limiting.as_ref()),
                     ..ObjectMeta::default()
                 }),
                 spec: Some(PodSpec {
