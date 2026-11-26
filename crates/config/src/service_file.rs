@@ -87,7 +87,8 @@ pub struct ServiceStore {
     #[cfg_attr(feature = "schema", schemars(range(max = STORE_MOST_MS)))]
     pub stop_serving_ms: Option<u64>,
     /// Milliseconds a pod goes unheard before the leader takes it out, or a voting pod takes
-    /// its leader for gone. 600 when left out.
+    /// its leader for gone; and that one heard but not hearing the leader says it holds no
+    /// lease before the leader takes it out. 600 when left out.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(range(max = STORE_MOST_MS)))]
     pub silence_ms: Option<u64>,

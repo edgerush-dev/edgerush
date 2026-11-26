@@ -383,6 +383,113 @@ fn a_pod_heard_but_not_hearing_has_its_shards_failed_over() {
     }
 }
 
+/// A pod heard but not hearing is failed over only once its heartbeats have said so for
+/// `silence` (600 ms), not at the first: still a member 700 ms after the cuts, its lease gone
+/// within 400 ms of them; failed over a little later, and served.
+#[test]
+fn a_pod_heard_but_not_hearing_is_failed_over_once_it_has_said_so_for_silence() {
+    for seed in SEEDS {
+        let (mut world, pods) = scenario::cluster(seed, Shape { pods: 5, ..shape() });
+        let leader = world.leader().unwrap();
+        let table = world.table().unwrap().clone();
+        let deaf = world
+            .alive()
+            .find(|pod| *pod != leader && table.owned_by(*pod).next().is_some())
+            .unwrap();
+        for other in pods.iter().copied().filter(|other| *other != deaf) {
+            world.cut_one_way(other, deaf);
+        }
+        world.run_for(ms(700));
+        assert!(
+            world.table().unwrap().has_member(deaf),
+            "seed {seed}: taken out before it had said so for silence"
+        );
+        world.run_for(ms(1_300));
+        assert!(
+            !world.table().unwrap().has_member(deaf),
+            "seed {seed}: never taken out"
+        );
+        let unserved = world.unserved_now();
+        assert!(unserved.is_empty(), "seed {seed}: unserved {unserved:?}");
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}
+
+/// A new pod that hears the leader only a second late and the others not at all, asking in
+/// and heard, but holding no lease and never answering the leader's heartbeats within
+/// `silence`, is never let in, as it would vote: the `silence` the leader waits on a pod that
+/// says it holds no lease runs from its first heartbeat, and it asks in only once it hears
+/// the leader, by then too late for one that has not answered.
+#[test]
+fn a_new_pod_heard_but_not_hearing_in_time_is_never_let_in() {
+    for seed in SEEDS {
+        let (mut world, pods) = scenario::cluster(seed, shape());
+        let leader = world.leader().unwrap();
+        let new = world.add_pod();
+        for other in pods.iter().copied().filter(|other| *other != leader) {
+            world.cut_one_way(other, new);
+        }
+        world.set_link(
+            leader,
+            new,
+            Link {
+                delay: ms(1_000),
+                ..Link::lan()
+            },
+        );
+        world.run_for(ms(3_000));
+        assert!(
+            world.history().all(|table| !table.has_member(new)),
+            "seed {seed}: {new} let in"
+        );
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}
+
+/// A pod paused for longer than its lease but less than `silence`, a heartbeat and the
+/// network's delay together, stays a member, though its first heartbeats on thawing, sent
+/// before it has worked through what queued for it, say it hears nobody and holds no lease:
+/// the leader waits `silence` on that, and by then it hears the others again. Taken out, it
+/// would be copied every key it held again at each pause (#611).
+#[test]
+fn a_pod_paused_under_silence_stays_a_member_while_it_catches_up() {
+    for seed in SEEDS {
+        let (mut world, _) = scenario::cluster(seed, shape());
+        let leader = world.leader().unwrap();
+        let before = world.table().unwrap().stamp();
+        let paused = world.alive().find(|pod| *pod != leader).unwrap();
+        // Pauses at different points between its heartbeats.
+        for round in 0..6 {
+            world.run_for(ms(1_500 + 17 * round));
+            world.freeze_catching_up(paused, ms(450), ms(100));
+        }
+        world.run_for(ms(2_000));
+        let without: Vec<_> = world
+            .history()
+            .filter(|table| table.stamp() > before && !table.has_member(paused))
+            .map(|table| table.stamp())
+            .collect();
+        assert!(
+            without.is_empty(),
+            "seed {seed}: {paused} taken out in {without:?}"
+        );
+        assert!(world.settled(), "seed {seed}: not settled");
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}
+
 /// A pod that cannot hear the leader alone still holds a lease through the others, and its
 /// heartbeats say so: the leader leaves it its shards, which it goes on serving, rather than
 /// give them a second owner while it learns of the move from the others.

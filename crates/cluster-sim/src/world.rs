@@ -122,12 +122,22 @@ struct Pod {
     skew: i64,
     /// Until when it is frozen, if it is: no ticks, and what reaches it waits, in order.
     frozen_until: Option<Time>,
+    /// Until when what reaches it waits, in order, though it ticks: frozen, then working
+    /// through what queued meanwhile.
+    catching_up_until: Option<Time>,
 }
 
 impl Pod {
     /// Until when it is frozen, if it is at `now`.
     fn frozen(&self, now: Time) -> Option<Time> {
         self.frozen_until.filter(|until| *until > now)
+    }
+
+    /// Until when what reaches it waits, if it does at `now`: frozen, or catching up.
+    fn waits(&self, now: Time) -> Option<Time> {
+        self.catching_up_until
+            .filter(|until| *until > now)
+            .or_else(|| self.frozen(now))
     }
 }
 
@@ -505,6 +515,7 @@ impl World {
                 draining_since: None,
                 drained_since: None,
                 frozen_until: None,
+                catching_up_until: None,
                 skew: 0,
             },
         );
@@ -634,9 +645,18 @@ impl World {
     /// its clock runs on, but it does nothing, and what is sent to it waits, then reaches it
     /// all at once, in order.
     pub fn freeze(&mut self, id: NodeId, for_: Time) {
+        self.freeze_catching_up(id, for_, 0);
+    }
+
+    /// Freezes `id` for `for_`, as [`freeze`](Self::freeze) does, and then, thawed, has it
+    /// tick at once but take what queued meanwhile only `catch_up` later, as a process's one
+    /// task works through what waited for it: its first heartbeats go out before it has heard
+    /// any of those sent it while it was frozen.
+    pub fn freeze_catching_up(&mut self, id: NodeId, for_: Time, catch_up: Time) {
         let until = self.now + for_;
         if let Some(pod) = self.pods.get_mut(&id) {
             pod.frozen_until = Some(until);
+            pod.catching_up_until = Some(until + catch_up);
         }
     }
 
@@ -952,7 +972,7 @@ impl World {
         let Some(pod) = self.pods.get_mut(&to) else {
             return;
         };
-        if let Some(until) = pod.frozen(now) {
+        if let Some(until) = pod.waits(now) {
             self.schedule(until, Event::Deliver { from, to, message });
             return;
         }

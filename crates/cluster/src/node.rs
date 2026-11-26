@@ -204,6 +204,10 @@ pub struct Node<V> {
     /// The leader it follows in its term, itself if it leads.
     leader: Option<NodeId>,
     heard: BTreeMap<NodeId, Heard>,
+    /// For each peer whose heartbeats have said, each since, that it holds no lease, when the
+    /// first of them came: a leader fails over a pod it hears that does not hear it only once
+    /// that is `silence` old.
+    leaseless: BTreeMap<NodeId, Time>,
     /// How far each peer's wall clock is off from its own, ahead if positive, as its latest
     /// heartbeat with a round trip short enough to tell says.
     skews: BTreeMap<NodeId, i64>,
@@ -323,6 +327,7 @@ impl<V: Held> Node<V> {
             role: Role::Follower,
             leader: None,
             heard: BTreeMap::new(),
+            leaseless: BTreeMap::new(),
             skews: BTreeMap::new(),
             accepted: None,
             committed: None,
@@ -694,6 +699,7 @@ impl<V: Held> Node<V> {
         for peer in gone {
             self.peers.remove(&peer);
             self.heard.remove(&peer);
+            self.leaseless.remove(&peer);
             self.skews.remove(&peer);
             self.accepted_by.remove(&peer);
         }
@@ -1067,8 +1073,8 @@ impl<V: Held> Node<V> {
     fn lead(&mut self, now: Time, pending: Option<Time>, out: &mut Outbox<V>) {
         let silence = self.config.silence;
         // It leads only while a majority hears it, as it hears them; and it judges members the
-        // same way, so that one it hears that does not hear it, holding no lease, has its
-        // shards failed over, as a pod gone would.
+        // same way, so that one it hears that does not hear it, holding no lease for
+        // `silence`, has its shards failed over, as a pod gone would.
         let mutual: BTreeSet<NodeId> = self
             .peers
             .iter()
@@ -1081,7 +1087,16 @@ impl<V: Held> Node<V> {
             return;
         }
         // Of those it hears that do not hear it, it keeps those whose heartbeats say they hold
-        // a lease, serving through the others; one that holds none serves nothing.
+        // a lease, serving through the others; and those whose heartbeats have said they hold
+        // none for less than `silence`. One thawed from a pause longer than its lease says so
+        // until it has worked through what queued for it meanwhile, the others' heartbeats
+        // among it, and taken out for that, it would be copied all it held again (#611); one
+        // cut off one way goes on saying so, and serves nothing.
+        let leaseless_lately = |peer: NodeId| {
+            self.leaseless
+                .get(&peer)
+                .is_some_and(|since| now.saturating_sub(*since) < silence)
+        };
         let heard: BTreeSet<NodeId> = self
             .peers
             .iter()
@@ -1089,7 +1104,8 @@ impl<V: Held> Node<V> {
             .filter(|peer| {
                 mutual.contains(peer)
                     || (self.heard_within(*peer, now, silence)
-                        && self.heard.get(peer).is_some_and(|heard| heard.leased))
+                        && (self.heard.get(peer).is_some_and(|heard| heard.leased)
+                            || leaseless_lately(*peer)))
             })
             .chain(std::iter::once(self.id))
             .collect();
@@ -2486,10 +2502,16 @@ impl<V: Held> Node<V> {
             leader,
             committed,
             echo,
+            leased,
             ..
         } = heard;
         let known = self.heard_within(from, now, self.config.stop_serving);
         self.heard.insert(from, heard);
+        if leased {
+            self.leaseless.remove(&from);
+        } else {
+            self.leaseless.entry(from).or_insert(now);
+        }
         // It does not hear this pod yet, or this pod had not been hearing it: answered at once,
         // so that each knows within a round trip, not a heartbeat, that the other hears it.
         if echo.is_none() || !known {
