@@ -1,0 +1,2 @@
+Warning Ingress shop/newer Shadowed: path /api (Prefix) on shop.example.com is already Ingress shop/older's, which comes first
+Warning Ingress shop/newer Shadowed: path /static (Prefix) on shop.example.com is already an earlier rule's of its own

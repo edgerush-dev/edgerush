@@ -1,0 +1,2 @@
+Warning RateLimitPolicy edge/other-gateway LimitTargetsNoneThere: none of its targets is there, so it applies nothing and has no status
+Warning RateLimitPolicy shop/gone LimitTargetsNoneThere: none of its targets is there, so it applies nothing and has no status

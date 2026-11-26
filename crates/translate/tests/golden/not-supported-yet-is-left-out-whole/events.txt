@@ -1,0 +1,9 @@
+Warning Ingress shop/b-neither-rules-nor-default-backend Invalid: invalid: neither rules nor a default backend
+Warning Ingress shop/c-prefix-without-path Invalid: invalid: a Prefix or Exact path without a path
+Warning Ingress shop/c2-unknown-path-type Invalid: invalid: a path type Kubernetes does not have
+Warning Ingress shop/c3-rule-without-paths NotSupportedYet: not supported yet: a rule without paths
+Warning Ingress shop/c4-host-an-address Invalid: invalid: a host that is an IP address
+Warning Ingress shop/f-backend-without-port Invalid: invalid: a Service backend without a port
+Warning Ingress shop/i-resource NotSupportedYet: not supported yet: a resource backend
+Warning Ingress shop/i2-annotated NotSupportedYet: not supported yet: annotations
+Warning Ingress shop/k-class-by-annotation NotSupportedYet: not supported yet: the `kubernetes.io/ingress.class` annotation

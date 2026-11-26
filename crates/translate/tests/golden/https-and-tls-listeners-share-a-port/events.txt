@@ -1,0 +1,1 @@
+Warning Ingress shop/site TlsPassedThrough: api.example.com is passed through by Gateway shop/web's TLS listener api, which names it, and not served over TLS here

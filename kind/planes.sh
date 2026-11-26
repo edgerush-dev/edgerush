@@ -66,7 +66,10 @@
 #     in its namespace or generated for it, and is refused Served on another control
 #     plane's, and any change to the other conditions: Accepted changed or of another
 #     generation, Programmed taken away, a condition of another type added; the operator
-#     changes them as ever.
+#     changes them as ever;
+#   - where a control plane's role is bound, and in its own namespace, its ServiceAccount
+#     creates an Event shaped as the leader writes one and may patch it, and the series of
+#     a refresh is taken; where none of its roles is bound, it may not.
 # Nothing is built: no image is needed. Each check says PASS or FAIL; the first FAIL ends
 # the run with status 1. Nothing here reads or writes the user's own kubeconfig: every
 # kubectl is given the cluster's.
@@ -728,5 +731,44 @@ pass "the operator's Accepted is admitted from the operator"
 k delete dataplane -n edge ours theirs >/dev/null
 k "${as_operator[@]}" delete dataplane -n team-status web-payments >/dev/null
 k delete namespace team-status --wait=false >/dev/null
+
+# Events (docs/04 §6). Where its role is bound, a control plane's ServiceAccount creates one
+# shaped as the leader writes it, and may refresh its series by a merge patch, which the
+# API server takes; in its own namespace too, for policies on its Gateways; and nowhere
+# else.
+k create namespace team-events >/dev/null
+k create rolebinding -n team-events edgerush-controller-payments-watched     --clusterrole edgerush-control-plane     --serviceaccount edge:edgerush-controller-payments >/dev/null
+k create namespace team-elsewhere >/dev/null
+told='apiVersion: events.k8s.io/v1
+kind: Event
+metadata: { generateName: web-, namespace: team-events }
+eventTime: "2026-11-26T00:00:00.000000Z"
+type: Warning
+reason: NotSupportedYet
+action: Translate
+note: "not supported yet: annotations"
+regarding: { apiVersion: networking.k8s.io/v1, kind: Ingress, namespace: team-events, name: web, uid: 6f1c3c2e-0000-4000-8000-000000000001 }
+reportingController: edgerush.dev/control-plane
+reportingInstance: edgerush-controller-payments-0'
+for _ in $(seq 1 30); do
+    k "${as_control_plane[@]}" auth can-i create events.events.k8s.io -n team-events >/dev/null 2>&1 && break
+    sleep 1
+done
+event=$(k "${as_control_plane[@]}" create -o name -f - <<<"$told" 2>&1)     || fail "an Event is refused from the control plane's ServiceAccount where its role is bound: $event"
+pass "an Event is created from the control plane's ServiceAccount where its role is bound"
+for namespace in team-events edge; do
+    for verb in create patch; do
+        k "${as_control_plane[@]}" auth can-i "$verb" events.events.k8s.io -n "$namespace" >/dev/null             || fail "the control plane's ServiceAccount may not $verb Events in $namespace"
+    done
+done
+pass "the control plane's ServiceAccount may create and patch Events where it reads, and in its own namespace"
+k "${as_control_plane[@]}" auth can-i create events.events.k8s.io -n team-elsewhere >/dev/null     && fail "the control plane's ServiceAccount may create Events where no role of it is bound"
+pass "the control plane's ServiceAccount may not create Events where no role of it is bound"
+# kubectl patch reads what it patches, which the control plane has no right to: patched
+# here as the cluster's admin, as the API server's judgement of the series is what is
+# checked.
+out=$(k patch -n team-events "$event" --type merge     -p '{"series":{"count":2,"lastObservedTime":"2026-11-26T00:30:00.000000Z"}}' 2>&1)     || fail "an Event's series refreshed by a merge patch is refused: $out"
+pass "an Event's series is refreshed by a merge patch"
+k delete namespace team-events team-elsewhere --wait=false >/dev/null
 
 echo "every check passed"

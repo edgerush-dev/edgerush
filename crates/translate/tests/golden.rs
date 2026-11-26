@@ -19,7 +19,9 @@
 //! BackendTLSPolicy of it as an ancestor is to say, then each RateLimitPolicy's of the
 //! ancestors it reaches, a line each; and, where the case says,
 //! `accepted.txt`, the version of each RateLimitPolicy that applies, a line each. The
-//! report's last lines are the hosts a claim of one API takes from the other's.
+//! report's last lines are the hosts a claim of one API takes from the other's. And
+//! `events.txt`, what the control plane tells in Events of the objects with no status to
+//! say it in, a line each (none otherwise).
 //! The data plane's settings are `tests/golden/plane.yaml`, unless the case has its own, and
 //! the control plane's system trusts no authority, unless the case has `system.pem`, the
 //! certificates it does; the objects of `tests/golden/shared.yaml` go with every case's. Every namespace is
@@ -219,6 +221,14 @@ fn every_case_translates_to_its_config_and_report() {
             .map(str::to_owned)
             .collect();
         assert_eq!(report, expected, "{name}: report");
+        let listed = case.join("events.txt");
+        let told: Vec<String> = translation.told().iter().map(ToString::to_string).collect();
+        let expected: Vec<String> = if listed.exists() {
+            read(&listed).lines().map(str::to_owned).collect()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(told, expected, "{name}: what Events tell");
         let listed = case.join("gateway.txt");
         let listeners: Option<Vec<String>> = translation
             .gateway

@@ -1,0 +1,1 @@
+Warning Ingress shop/away NeverServed: never served: an ExternalName Service, whose name can lead anywhere

@@ -1,0 +1,4 @@
+Warning Ingress shop/kept TlsUnsecured: d.example.com is served over HTTP only: Secret shop/gone does not exist
+Warning Ingress shop/web TlsUnsecured: a.example.com is refused over HTTPS and redirected there over plain HTTP: Secret shop/gone does not exist
+Warning Ingress shop/web TlsUnsecured: b.example.com is refused over HTTPS and redirected there over plain HTTP: its TLS entry names no Secret
+Warning Ingress shop/web TlsUnsecured: c.example.com is refused over HTTPS and redirected there over plain HTTP: Secret shop/shop-tls does not cover c.example.com

@@ -1,0 +1,1 @@
+Warning Ingress shop/web TlsUnsecured: broken.example.com is refused over HTTPS and redirected there over plain HTTP: Secret shop/gone does not exist

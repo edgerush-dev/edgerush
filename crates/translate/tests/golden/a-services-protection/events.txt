@@ -1,0 +1,2 @@
+Warning Service shop/broken Unprotected: served unprotected, as its backend protection annotations do not read: `gateway.edgerush.dev/max-in-flight-per-pod` is `lots`, not a whole number from 1 to 4294967295; `gateway.edgerush.dev/queue-size` is stated without `gateway.edgerush.dev/queue-timeout`; a queue takes both
+Warning Service shop/typo Unprotected: served unprotected, as its backend protection annotations do not read: `gateway.edgerush.dev/max-inflight-per-pod` is not an annotation EdgeRush reads on a Service

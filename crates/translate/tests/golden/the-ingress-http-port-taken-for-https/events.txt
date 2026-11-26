@@ -1,0 +1,1 @@
+Warning Ingress shop/web HttpPortTaken: port 80, where Ingress is served over plain HTTP, is bound for HTTPS

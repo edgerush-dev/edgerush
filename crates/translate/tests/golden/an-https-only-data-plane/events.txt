@@ -1,0 +1,2 @@
+Warning Ingress shop/plain HttpPortTaken: port 443, where Ingress is served over plain HTTP, is bound for HTTPS
+Warning Ingress shop/web2 TlsUnsecured: gone.example.com is not served: Secret shop/gone does not exist

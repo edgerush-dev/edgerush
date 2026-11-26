@@ -55,6 +55,11 @@ rules:
   - apiGroups: [gateway.edgerush.dev]
     resources: [ratelimitpolicies/status]
     verbs: [update]
+  # Events on its objects with no status to say what translation finds in them: created,
+  # and their series refreshed by a merge patch (04 §6).
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
 ---
 # The control plane's reads of cluster-scoped kinds. Bound by a ClusterRoleBinding.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -138,6 +143,10 @@ rules:
   - apiGroups: [gateway.edgerush.dev]
     resources: [ratelimitpolicies/status]
     verbs: [update]
+  # Events on those of the policies none of whose targets is there (04 §6).
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
   # Its DataPlanes, which it reads itself (05 §3), and their `Served` (05 §1), applied
   # under a field manager of its own.
   - apiGroups: [gateway.edgerush.dev]
