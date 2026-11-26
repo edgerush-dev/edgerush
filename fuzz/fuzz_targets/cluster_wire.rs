@@ -1,5 +1,5 @@
-//! Fuzzes the cluster store's wire: any bytes offered as a message on either stream between
-//! pods are decoded and converted without failing, whatever converts comes back the same
+//! Fuzzes the cluster store's wire: any bytes offered as a message on any stream between pods
+//! are decoded and converted without failing, whatever converts comes back the same
 //! through an encoding of its own, and any bytes offered as a run of pieces are put together
 //! without failing or holding more than the bound:
 //! `cargo fuzz run cluster_wire corpus/cluster_wire`.
@@ -19,7 +19,7 @@ const MOST: usize = 4_096;
 
 fuzz_target!(|bytes: &[u8]| {
     let again = |outgoing: Outgoing<Synchronous>| match outgoing {
-        Outgoing::Peer(sent) => wire::from_peer::<Value>(
+        Outgoing::Coordinate(sent) | Outgoing::Peer(sent) => wire::from_peer::<Value>(
             ToPeer::decode(sent.encode_to_vec().as_slice()).expect("our own encoding decodes"),
         ),
         Outgoing::Copy(sent) => wire::from_copy::<Value>(

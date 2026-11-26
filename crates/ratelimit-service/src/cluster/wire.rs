@@ -1,11 +1,13 @@
 //! The cluster store's messages on the wire (`edgerush_cluster::Message`): protobuf, derived
 //! from these structs, and the conversions both ways.
 //!
-//! Pods speak on two streams (`membership-design.md`, "Requirements it found for the real
-//! transport"): copies to replicas on one ([`ToCopy`]); everything else — heartbeats, tables,
-//! votes, handoffs, the control plane's questions, and the answers to copies — on the other
-//! ([`ToPeer`]), so that a pod joining a cluster of many keys, sent a snapshot of each shard
-//! it is to keep, holds up no heartbeat. [`wire`] says which a message goes on.
+//! Pods speak on three streams (`membership-design.md`, "Requirements it found for the real
+//! transport"): copies to replicas on one ([`ToCopy`]); what the store coordinates by —
+//! heartbeats, tables, votes, handoffs, the control plane's questions — on another; and the
+//! answers to copies, takings and lacks on the third, the last two both [`ToPeer`]. So a pod
+//! joining a cluster of many keys, sent a snapshot of each shard it is to keep, holds up no
+//! heartbeat, and nor do the answers it sends back (#618). [`wire`] says which a message goes
+//! on.
 //!
 //! A mode's value travels as a message of the mode's own, through [`Value`]. As for the
 //! service's other messages ([`crate::wire`]), a field a reader does not know is skipped, one
@@ -13,8 +15,8 @@
 //! a shard past 16 bits — is refused whole.
 //!
 //! The synchronous mode's own messages between pods — a request forwarded to its key's owner,
-//! a part of one gathered, and their answers — go on the stream apart from copies too, beside
-//! the store's ([`mode_wire`]); the asynchronous mode's — entries forwarded to their owner,
+//! a part of one gathered, and their answers — go on the third stream too, beside the copies'
+//! answers ([`mode_wire`]); the asynchronous mode's — entries forwarded to their owner,
 //! and its answers relayed back — likewise ([`asynchronous`]). A pod of both modes carries
 //! each mode's as that mode does, and its value as either mode's ([`both`]); a value of the
 //! other mode than its key's bit says is refused ([`Value::fits`]).
@@ -525,7 +527,7 @@ pub struct HandedOff {
     pub from: Option<Stamp>,
 }
 
-/// What goes on the stream apart from copies.
+/// What goes on the streams apart from copies.
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum Control<W: prost::Message + Default + Debug> {
     /// A heartbeat.
@@ -857,19 +859,42 @@ pub struct ToCopy<W: prost::Message + Default + Debug> {
     pub message: Option<Copying<W>>,
 }
 
-/// A store's message from `from`, as the wire carries it, on the stream it goes on.
+/// A store's message from `from`, as the wire carries it, on the stream it goes on (#618):
+/// each stream a connection of its own, so that what one carries waits behind nothing on
+/// another.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outgoing<W: prost::Message + Default + Debug> {
-    /// Apart from copies.
+    /// What the store coordinates by, on time or a pod heard on time is taken out: heartbeats,
+    /// votes and tables, handoffs and what they report, and the asks to join and to drain.
+    Coordinate(ToPeer<W>),
+    /// Everything else apart from copies: their answers, takings and lacks, and the modes'
+    /// messages.
     Peer(ToPeer<W>),
-    /// A copy, or an answer to one.
+    /// A copy.
     Copy(ToCopy<W>),
+}
+
+impl<W: prost::Message + Default + Debug> Outgoing<W> {
+    /// The message, if it goes on a stream that carries [`ToPeer`]: any but a copy.
+    #[must_use]
+    pub fn to_peer(self) -> Option<ToPeer<W>> {
+        match self {
+            Self::Coordinate(message) | Self::Peer(message) => Some(message),
+            Self::Copy(_) => None,
+        }
+    }
 }
 
 /// `message`, from `from`, as the wire carries it.
 pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
     let peer = |message| {
         Outgoing::Peer(ToPeer {
+            from,
+            message: Some(message),
+        })
+    };
+    let coordinate = |message| {
+        Outgoing::Coordinate(ToPeer {
             from,
             message: Some(message),
         })
@@ -921,7 +946,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             wall,
             hears,
             leased,
-        } => peer(Control::Heartbeat(Heartbeat {
+        } => coordinate(Control::Heartbeat(Heartbeat {
             term,
             leader,
             committed: Some(stamp(committed)),
@@ -934,23 +959,23 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             leased,
             wall,
         })),
-        Message::TableRequest => peer(Control::TableRequest(Empty {})),
-        Message::TableReply { table } => peer(Control::TableReply(table_to_wire(table))),
-        Message::PreVote { term, accepted } => peer(Control::PreVote(Candidacy {
+        Message::TableRequest => coordinate(Control::TableRequest(Empty {})),
+        Message::TableReply { table } => coordinate(Control::TableReply(table_to_wire(table))),
+        Message::PreVote { term, accepted } => coordinate(Control::PreVote(Candidacy {
             term,
             accepted: Some(stamp(accepted)),
         })),
         Message::PreVoteReply { term, granted } => {
-            peer(Control::PreVoteReply(PreVoteReply { term, granted }))
+            coordinate(Control::PreVoteReply(PreVoteReply { term, granted }))
         }
-        Message::StartJoin { term, accepted } => peer(Control::StartJoin(Candidacy {
+        Message::StartJoin { term, accepted } => coordinate(Control::StartJoin(Candidacy {
             term,
             accepted: Some(stamp(accepted)),
         })),
-        Message::Join { term } => peer(Control::Join(Join { term })),
-        Message::Publish { table } => peer(Control::Publish(table_to_wire(table))),
+        Message::Join { term } => coordinate(Control::Join(Join { term })),
+        Message::Publish { table } => coordinate(Control::Publish(table_to_wire(table))),
         Message::PublishChanges { base, changes } => {
-            peer(Control::PublishChanges(PublishChanges {
+            coordinate(Control::PublishChanges(PublishChanges {
                 base: Some(stamp(base)),
                 changes: Some(Changes {
                     term: changes.term,
@@ -970,16 +995,18 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
                 }),
             }))
         }
-        Message::PublishAck { stamp: acked } => peer(Control::PublishAck(stamp(acked))),
-        Message::Commit { stamp: committed } => peer(Control::Commit(stamp(committed))),
-        Message::JoinCluster { address } => peer(Control::JoinCluster(JoinCluster { address })),
-        Message::Probe { life, round } => peer(Control::Probe(Probe { life, round })),
+        Message::PublishAck { stamp: acked } => coordinate(Control::PublishAck(stamp(acked))),
+        Message::Commit { stamp: committed } => coordinate(Control::Commit(stamp(committed))),
+        Message::JoinCluster { address } => {
+            coordinate(Control::JoinCluster(JoinCluster { address }))
+        }
+        Message::Probe { life, round } => coordinate(Control::Probe(Probe { life, round })),
         Message::Report {
             life,
             round,
             committed,
             voting,
-        } => peer(Control::Report(Report {
+        } => coordinate(Control::Report(Report {
             life,
             round,
             committed: Some(stamp(committed)),
@@ -989,12 +1016,12 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             generation,
             voters,
             latest,
-        } => peer(Control::Form(Form {
+        } => coordinate(Control::Form(Form {
             generation,
             voters: members_to_wire(voters),
             latest: Some(stamp(latest)),
         })),
-        Message::Drain => peer(Control::Drain(Empty {})),
+        Message::Drain => coordinate(Control::Drain(Empty {})),
         Message::Took {
             shard,
             term,
@@ -1021,7 +1048,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             dropped,
             part,
             more,
-        } => peer(Control::Handoff(Handoff {
+        } => coordinate(Control::Handoff(Handoff {
             shard: u32::from(shard),
             term,
             entries: entries_to_wire(entries),
@@ -1032,7 +1059,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
         Message::CaughtUp {
             shard,
             from: planned,
-        } => peer(Control::CaughtUp(CaughtUp {
+        } => coordinate(Control::CaughtUp(CaughtUp {
             shard: u32::from(shard),
             from: Some(stamp(planned)),
         })),
@@ -1040,7 +1067,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
             shard,
             to,
             from: planned,
-        } => peer(Control::HandedOff(HandedOff {
+        } => coordinate(Control::HandedOff(HandedOff {
             shard: u32::from(shard),
             to,
             from: Some(stamp(planned)),
@@ -1048,7 +1075,7 @@ pub fn wire<V: Value>(from: NodeId, message: Message<V>) -> Outgoing<V::Wire> {
     }
 }
 
-/// The sender and the store's message, from the stream apart from copies.
+/// The sender and the store's message, from a stream apart from copies.
 ///
 /// # Errors
 ///
@@ -1204,7 +1231,7 @@ pub fn from_copy<V: Value>(sent: ToCopy<V::Wire>) -> Result<(NodeId, Message<V>)
 }
 
 /// The synchronous mode's `message`, from `from`, as the wire carries it between pods: the
-/// store's as [`wire`] has it, the mode's own on the stream apart from copies. None for a
+/// store's as [`wire`] has it, the mode's own on the stream with copies' answers. None for a
 /// request to gather, which a client alone asks, of the pod it reaches. Whatever the store's
 /// value: the mode's own messages carry none.
 pub fn mode_wire<V: Value>(from: NodeId, message: SyncMessage<V>) -> Option<Outgoing<V::Wire>> {
@@ -2081,7 +2108,7 @@ mod tests {
     /// `message` from `from` through the wire: encoded, decoded, and taken back.
     fn through(from: NodeId, message: Message<SyncValue>) -> (NodeId, Message<SyncValue>) {
         match wire(from, message) {
-            Outgoing::Peer(sent) => {
+            Outgoing::Coordinate(sent) | Outgoing::Peer(sent) => {
                 let decoded = ToPeer::decode(sent.encode_to_vec().as_slice()).unwrap();
                 from_peer(decoded).unwrap()
             }
@@ -2153,7 +2180,7 @@ mod tests {
 
     fn mode_through(from: NodeId, message: SyncMessage) -> (NodeId, SyncMessage) {
         match mode_wire(from, message).unwrap() {
-            Outgoing::Peer(sent) => {
+            Outgoing::Coordinate(sent) | Outgoing::Peer(sent) => {
                 let decoded = ToPeer::decode(sent.encode_to_vec().as_slice()).unwrap();
                 mode_from_peer(decoded).unwrap()
             }
@@ -2301,14 +2328,38 @@ mod tests {
             }
         }
 
-        /// Copies go on the copy stream, everything else — their answers too — on the other.
+        /// Copies go on the copy stream, everything else — their answers too — on the others.
         #[test]
         fn copies_alone_go_on_the_copy_stream(message in message()) {
             let copy = matches!(message, Message::Replicate { .. });
             prop_assert_eq!(matches!(wire(1, message), Outgoing::Copy(_)), copy);
         }
 
-        /// Any bytes, as either stream's message, are refused or taken without a panic; and
+        /// What the store coordinates by goes on the coordination stream, and nothing else:
+        /// copies' answers, takings and lacks wait on the stream apart from it (#618).
+        #[test]
+        fn coordination_alone_goes_on_the_coordination_stream(message in message()) {
+            let rest = matches!(
+                message,
+                Message::Replicated { .. } | Message::Took { .. } | Message::Lacking { .. }
+            );
+            let copy = matches!(message, Message::Replicate { .. });
+            prop_assert_eq!(
+                matches!(wire(1, message), Outgoing::Coordinate(_)),
+                !rest && !copy
+            );
+        }
+
+        /// The modes' own messages wait on the stream apart from coordination.
+        #[test]
+        fn the_modes_messages_go_apart_from_coordination(message in mode_message()) {
+            if matches!(message, SyncMessage::Store(_)) {
+                return Ok(());
+            }
+            prop_assert!(matches!(mode_wire(1, message), Some(Outgoing::Peer(_)) | None));
+        }
+
+        /// Any bytes, as either kind of stream's message, are refused or taken without a panic; and
         /// what is taken comes back the same through an encoding of its own.
         #[test]
         fn any_bytes_are_refused_or_taken_without_a_panic(bytes in prop::collection::vec(any::<u8>(), 0..300)) {

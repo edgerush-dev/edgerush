@@ -130,7 +130,7 @@ mod tests {
     /// `message` from pod 1, through the wire and back.
     fn again(message: Message) -> Result<(NodeId, Message), Invalid> {
         match mode_wire(1, message).expect("a message between pods") {
-            Outgoing::Peer(sent) => mode_from_peer(sent),
+            Outgoing::Coordinate(sent) | Outgoing::Peer(sent) => mode_from_peer(sent),
             Outgoing::Copy(sent) => mode_from_copy(sent),
         }
     }

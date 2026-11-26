@@ -308,3 +308,52 @@ fn slow_links_refuse_no_one_within_the_rate() {
         assert_eq!(figures.refused, 0, "{figures:?}");
     }
 }
+
+/// Every data plane cut off from a pod, their batches for it forwarded by the others over
+/// slow links to and from it, as a busy receiver reads a stream slowly: the batches and their
+/// answers never hold up the pods' heartbeats, votes and tables, which go on a stream of their
+/// own, so no pod is taken out and the leader keeps its lead (#618). Sharing a stream with
+/// them, heartbeats waited behind them, and the pod, heard late and hearing late, was taken
+/// out, its store emptied to be copied again.
+#[test]
+fn forwarded_batches_never_hold_up_the_heartbeats() {
+    for seed in 1..=5 {
+        let (mut world, victim) = world(seed, 400);
+        let pods = world.pods();
+        let before = world.table().unwrap().stamp();
+        let (terms, full, forwarded_before) =
+            (world.stats.terms, world.stats.full, forwarded(&world));
+        // 40 kB/s each way: the forwarded batches fill their stream, 256 KiB of them waiting.
+        let slow = Link {
+            bandwidth: 40_000,
+            waiting: Some((1 << 20, 256 << 10)),
+            ..Link::lan()
+        };
+        world.cut_clients_from(victim);
+        for other in pods.iter().copied().filter(|other| *other != victim) {
+            world.set_link(other, victim, slow);
+            world.set_link(victim, other, slow);
+        }
+        world.run_for(ms(3_000));
+        assert!(
+            forwarded(&world) > forwarded_before && world.stats.full > full,
+            "seed {seed}: the batches never filled their stream"
+        );
+        let without: Vec<_> = world
+            .history()
+            .filter(|table| table.stamp() > before)
+            .filter(|table| pods.iter().any(|pod| !table.has_member(*pod)))
+            .map(|table| table.stamp())
+            .collect();
+        assert!(
+            without.is_empty(),
+            "seed {seed}: a pod taken out in {without:?}"
+        );
+        assert_eq!(world.stats.terms, terms, "seed {seed}: a leader lost");
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}

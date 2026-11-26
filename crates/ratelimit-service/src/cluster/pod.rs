@@ -36,7 +36,7 @@ use super::link::{
 use super::mode::{BothCounted, EXCHANGE, Served, Stream, asks_as, counted, plane};
 use super::wire::both::Both;
 use super::wire::{
-    self, Asking, Empty, Hello, Invalid, Joining, Outgoing, Piece, Telling, ToCopy, ToPeer, Value,
+    self, Asking, Empty, Hello, Invalid, Joining, Piece, Telling, ToCopy, ToPeer, Value,
     asynchronous, both,
 };
 use crate::grpc::{Boxed, Client, MAX_MESSAGE, Prost, limited};
@@ -900,7 +900,7 @@ pub async fn ask<V: Value>(
 where
     V::Wire: Send + 'static,
 {
-    let Outgoing::Peer(asked) = wire::wire(CONTROL_PLANE, message) else {
+    let Some(asked) = wire::wire(CONTROL_PLANE, message).to_peer() else {
         return Err(Status::invalid_argument("not the control plane's").into());
     };
     let answer: ToPeer<V::Wire> = client.call(asked, CONTROL).await?;
@@ -1221,10 +1221,9 @@ impl tonic::server::UnaryService<ToPeer<Both>> for ControlCall {
                 return Err(Status::invalid_argument("not the control plane's"));
             }
             let message = match pod.control(message).await {
-                Some(answer) => match wire::wire(pod.id, answer) {
-                    Outgoing::Peer(answer) => answer.message,
-                    Outgoing::Copy(_) => None,
-                },
+                Some(answer) => wire::wire(pod.id, answer)
+                    .to_peer()
+                    .and_then(|answer| answer.message),
                 None => None,
             };
             Ok(Response::new(ToPeer {
@@ -1264,7 +1263,7 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for StoreServer {
                 return Ok(serve(pod, request).await);
             }
             Ok(match request.uri().path() {
-                super::link::PEER => {
+                super::link::COORDINATE | super::link::PEER => {
                     let mut grpc = limited(Prost::<Empty, Piece>::default());
                     let call = StreamCall {
                         pod,

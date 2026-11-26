@@ -432,7 +432,7 @@ pub fn answers_from(answers: Answers) -> Result<AsyncAnswers, Invalid> {
 }
 
 /// The asynchronous mode's `message`, from `from`, as the wire carries it between pods: the
-/// store's as [`wire`] has it, the mode's own on the stream apart from copies. None for a
+/// store's as [`wire`] has it, the mode's own on the stream with copies' answers. None for a
 /// batch or its answers, which go between a data plane and a pod alone.
 #[must_use]
 pub fn mode_wire<V: Value>(from: NodeId, message: AsyncMessage<V>) -> Option<Outgoing<V::Wire>> {
@@ -692,7 +692,7 @@ mod tests {
 
     fn mode_through(from: NodeId, message: AsyncMessage) -> (NodeId, AsyncMessage) {
         match mode_wire(from, message).unwrap() {
-            Outgoing::Peer(sent) => {
+            Outgoing::Coordinate(sent) | Outgoing::Peer(sent) => {
                 let decoded = ToPeer::decode(sent.encode_to_vec().as_slice()).unwrap();
                 mode_from_peer(decoded).unwrap()
             }
