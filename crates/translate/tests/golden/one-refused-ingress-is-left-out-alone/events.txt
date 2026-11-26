@@ -1,0 +1,1 @@
+Warning Ingress other/bad Refused: the data plane would refuse it: route `ingress/other/bad/other.example.com`, rules[0], matches[0]: path: path contains a `.` or `..` segment

@@ -167,6 +167,43 @@ fn the_control_plane_reads_rate_limit_policies_and_writes_their_status_alone() {
 }
 
 #[test]
+fn the_control_plane_writes_events_where_it_reads_what_they_tell_of() {
+    // Created, and their series refreshed by a merge patch, never read back (04 §6): where
+    // it reads the Ingresses, Services and RateLimitPolicies told of, the watch scope, and
+    // its own namespace, where policies on its Gateways are.
+    let roles: Vec<ClusterRole> = serde_saphyr::from_multiple(&read("roles.yaml")).unwrap();
+    let mut granted = Vec::new();
+    for role in roles {
+        let name = role.metadata.name.unwrap_or_default();
+        for rule in role.rules.unwrap_or_default() {
+            for resource in rule.resources.unwrap_or_default() {
+                if resource == "events" {
+                    granted.push((
+                        name.clone(),
+                        rule.api_groups.clone().unwrap_or_default(),
+                        rule.verbs.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    let grant = |role: &str| {
+        (
+            role.to_owned(),
+            vec!["events.k8s.io".to_owned()],
+            vec!["create".to_owned(), "patch".to_owned()],
+        )
+    };
+    assert_eq!(
+        granted,
+        [
+            grant("edgerush-control-plane"),
+            grant("edgerush-control-plane-own")
+        ]
+    );
+}
+
+#[test]
 fn the_control_plane_reads_data_planes_and_applies_their_status_alone() {
     // Its own DataPlanes, in its namespace, and those generated for Gateways of its class,
     // in the watch scope (05 §3): read, and their `Served` applied under a field manager of

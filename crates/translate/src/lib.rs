@@ -66,6 +66,7 @@ use std::collections::btree_map::Entry;
 use std::fmt;
 
 mod backend_tls;
+mod events;
 pub mod gateway;
 mod grpc_route;
 pub mod http_route;
@@ -77,6 +78,7 @@ mod tcp_route;
 mod tls_route;
 mod udp_route;
 
+pub use events::Told;
 pub use gateway::{
     Allowed, GatewayOutcome, ListenerOutcome, ListenerProblem, Namespaces, Requirement, Selector,
     SetOutcome,

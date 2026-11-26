@@ -1,0 +1,3 @@
+Warning Ingress blog/late Shadowed: path /docs (Exact) on docs.example.com is already HTTPRoute blog/early's, which comes first
+Warning Ingress deep/one Shadowed: path /y (Prefix) on *.deep.example.com is already HTTPRoute deep/any's, which comes first
+Warning Ingress tie/web Shadowed: path / (Prefix) on tie.example.com is already HTTPRoute tie/web's, which comes first

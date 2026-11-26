@@ -4,7 +4,8 @@
 //! Lease its replicas elect a leader by ([02 §3](../../../docs/02-architecture.md)); and the
 //! ControlPlanes and DataPlanes the operator makes its objects for, and those objects, a
 //! ControlPlane's webhook registration among them ([05 §2](../../../docs/05-operator.md)); the DataPlanes a control plane reads its data
-//! plane's settings from (05 §3).
+//! plane's settings from (05 §3); and the Events the control plane writes on objects with
+//! no status to say what it finds in them (04 §6).
 
 use crate::ApiError;
 use edgerush_gateway_api::backend_tls_policy::BackendTLSPolicy;
@@ -27,6 +28,7 @@ use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service, ServiceAccount};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
@@ -64,6 +66,10 @@ impl Kind for EndpointSlice {
 }
 
 impl Kind for Lease {
+    const NAMESPACED: bool = true;
+}
+
+impl Kind for Event {
     const NAMESPACED: bool = true;
 }
 

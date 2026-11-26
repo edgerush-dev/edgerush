@@ -1,0 +1,1 @@
+Warning Ingress shop/spare Shadowed: path / (Prefix) on * is also Ingress shop/catch-all's; which takes it depends on which the cluster made first

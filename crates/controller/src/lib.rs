@@ -42,7 +42,7 @@ use edgerush_planes::objects::{
 use edgerush_planes::rate_limit_policy::RateLimitPolicy;
 use edgerush_translate::{
     AcceptedPolicy, Cluster, GATEWAY_CONTROLLER, GatewayStatus, LimitPolicyStatus, Object, Plane,
-    PolicyStatus, Problem, RouteStatus, Translation, translate_from,
+    PolicyStatus, Problem, RouteStatus, Told, Translation, translate_from,
 };
 use gateway_status::Programmed;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
@@ -66,6 +66,7 @@ pub mod acks;
 pub mod across;
 pub mod admission;
 pub mod data_plane;
+pub mod events;
 pub mod expiry;
 mod gateway_status;
 pub mod issuing;
@@ -299,6 +300,20 @@ pub enum Said<'a> {
         /// Whether it says it now.
         written: Result<(), &'a ApiError>,
     },
+    /// An Event written on an object of what a translation tells of it (04 §6); or why it
+    /// could not be, tried again a minute later.
+    Event {
+        /// What it tells.
+        told: &'a Told,
+        /// What was written of it.
+        written: Result<events::Written, &'a ApiError>,
+        /// Whether it was refused for want of the rights to write it, which is said apart,
+        /// as [`Said::EventsForbidden`].
+        forbidden: bool,
+    },
+    /// Events refused for want of the rights to write them, said as it starts, with the
+    /// refusal; and with none as one is written again.
+    EventsForbidden(Option<&'a ApiError>),
 }
 
 /// What became of the data plane's Service.
@@ -370,6 +385,9 @@ pub enum Membership {
 /// needed started or stopped; an edit is translated and written again as any change is,
 /// and one of another ID begins its data plane's translation afresh
 /// ([05 §3](../../../docs/05-operator.md)).
+/// What the translations tell of the objects with no status to say it in, an Ingress, a
+/// Service, a RateLimitPolicy none of whose targets is there, it writes as Events on them,
+/// as far as `leading` says, reported by `instance`, the pod's name ([`events`], 04 §6).
 /// Runs for as long as it is polled, its follows ended with it. For a thread and runtime of
 /// its own, in a `LocalSet`.
 #[allow(clippy::too_many_arguments)]
@@ -382,10 +400,22 @@ pub async fn control(
     leading: Option<watch::Receiver<bool>>,
     acks: Acks,
     snapshots: Option<Snapshots>,
+    instance: String,
     said: impl Fn(Said<'_>) + 'static,
 ) {
     let api = Rc::new(api);
     let said: Rc<dyn Fn(Said<'_>)> = Rc::new(said);
+    // The Events, on a task of their own, so that a slow API server holds up no status or
+    // config; ended with this.
+    let (wanting, wanted) = watch::channel(BTreeSet::new());
+    let mut writing = JoinSet::new();
+    writing.spawn_local(events::write(
+        Rc::clone(&api),
+        instance,
+        wanted,
+        leading.clone(),
+        Rc::clone(&said),
+    ));
     loop {
         if planes.borrow_and_update().is_empty() && classes.is_none() {
             // Settings that will never come are nothing to serve.
@@ -403,6 +433,7 @@ pub async fn control(
             leading.as_ref(),
             &acks,
             snapshots.as_ref(),
+            &wanting,
             &said,
         )
         .await;
@@ -707,6 +738,7 @@ async fn serve(
     leading: Option<&watch::Receiver<bool>>,
     acks: &Acks,
     snapshots: Option<&Snapshots>,
+    wanting: &watch::Sender<BTreeSet<events::Wanted>>,
     said: &Rc<dyn Fn(Said<'_>)>,
 ) {
     let changed = Rc::new(Notify::new());
@@ -1060,6 +1092,27 @@ async fn serve(
         // is followed: an Ingress is an ancestor too (04 §6).
         if leads {
             write_limit_policies(api, &followed, &serving, &**said).await;
+        }
+        // What every data plane's last translation tells of the objects with no status to
+        // say it in, each once, for the Events written of it (04 §6); an object no longer
+        // followed is told nothing.
+        if leads {
+            let wanted: BTreeSet<events::Wanted> = serving
+                .values()
+                .filter_map(|served| served.translator.last.as_ref())
+                .flat_map(Translation::told)
+                .filter_map(|told| {
+                    let uid = followed.uid(&told.object)?;
+                    Some(events::Wanted { told, uid })
+                })
+                .collect();
+            wanting.send_if_modified(|now| {
+                let changed = *now != wanted;
+                if changed {
+                    *now = wanted;
+                }
+                changed
+            });
         }
         // Until a change comes, or the bound a data plane's pods are waited on to run its
         // Gateway's generation, and then until its moment is over.
@@ -2358,6 +2411,17 @@ impl Followed {
         objects(&self.ingresses)
     }
 
+    /// The uid of `object`, an Ingress, a Service or a RateLimitPolicy followed; none for
+    /// one not followed, or of another kind.
+    fn uid(&self, object: &Object) -> Option<String> {
+        match object.kind {
+            "Ingress" => uid_in(&self.ingresses, object),
+            "Service" => uid_in(&self.services, object),
+            "RateLimitPolicy" => uid_in(&self.rate_limit_policies, object),
+            _ => None,
+        }
+    }
+
     /// Every object followed, as translation takes them.
     fn cluster(&self) -> Cluster {
         let gateway_api = self.gateway_api.as_ref();
@@ -2550,6 +2614,22 @@ fn own_service(plane: &Plane) -> Option<ServiceName> {
 
 /// The objects of `follows`, as they last published them, but for those held out until
 /// their namespace joins.
+/// The uid of `object` among `follows`' objects, if it is there.
+fn uid_in<K: Kind>(follows: &[Follow<K>], object: &Object) -> Option<String> {
+    follows
+        .iter()
+        .filter(|follow| !follow.joining)
+        .find_map(|follow| {
+            follow.objects.borrow().objects.iter().find_map(|followed| {
+                let metadata = followed.metadata();
+                (metadata.namespace.as_deref() == Some(object.namespace.as_str())
+                    && metadata.name.as_deref() == Some(object.name.as_str()))
+                .then(|| metadata.uid.clone())
+                .flatten()
+            })
+        })
+}
+
 fn objects<K: Clone>(follows: &[Follow<K>]) -> Vec<K> {
     follows
         .iter()

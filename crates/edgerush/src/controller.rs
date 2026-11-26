@@ -18,6 +18,7 @@ use edgerush_control_stream::{Offer, OfferError, Versions};
 use edgerush_controller::acks::{Pods, Reporter, Runs};
 use edgerush_controller::admission::{self, Asked};
 use edgerush_controller::data_plane::{self, follow_data_planes};
+use edgerush_controller::events::{EventsWritten, Written as EventWritten};
 use edgerush_controller::expiry::Expiry;
 use edgerush_controller::issuing::{self, Issuer};
 use edgerush_controller::own_pods::{Replica, follow_own_pods};
@@ -912,11 +913,16 @@ struct Elector {
     timing: lease::Timing,
 }
 
-/// This replica, as a Lease names its holder: its pod's name, which the environment gives
-/// as its host name, and when it started, so that a pod started again is another.
+/// This replica, as a Lease names its holder: its pod's name, and when it started, so that
+/// a pod started again is another.
 pub(crate) fn identity() -> String {
-    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "edgerush".to_owned());
-    format!("{host}_{}", started_at())
+    format!("{}_{}", pod_name(), started_at())
+}
+
+/// The pod's name, which the environment gives as its host name, as the Events it writes
+/// name their reporting instance (04 §6).
+fn pod_name() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "edgerush".to_owned())
 }
 
 /// The admission webhook, ready to be served.
@@ -1152,15 +1158,24 @@ async fn control_until(
     // The Services each data plane serves unprotected, their protection annotations not
     // read (25 §2): served beside them.
     let unprotected = RefCell::new(Unprotected::new());
+    // The Events the leader writes (04 §6, 08 §1), by outcome.
+    let events_written = RefCell::new(EventsWritten::new());
     let exposed_text = |expiry: &Expiry,
                         unimplementable: &Unimplementable,
-                        unprotected: &Unprotected| {
-        Bytes::from(expiry.exposition() + &unimplementable.exposition() + &unprotected.exposition())
+                        unprotected: &Unprotected,
+                        events_written: &EventsWritten| {
+        Bytes::from(
+            expiry.exposition()
+                + &unimplementable.exposition()
+                + &unprotected.exposition()
+                + &events_written.exposition(),
+        )
     };
     let (exposed, exposition) = watch::channel(exposed_text(
         &expiry.borrow(),
         &unimplementable.borrow(),
         &unprotected.borrow(),
+        &events_written.borrow(),
     ));
     // Whether this replica is ready, for its readiness probe: once the stream serves, with
     // its first certificate, or at once where it serves none.
@@ -1466,7 +1481,22 @@ async fn control_until(
                 .clone()
                 .zip(settings_of)
                 .map(|(snapshot, settings)| Snapshots { snapshot, settings }),
+            pod_name(),
             move |said| {
+                // An Event written, or not, is counted; one refused for want of the rights
+                // is said once, as that starts, not at every try.
+                if let Said::Event { forbidden, .. } = &said {
+                    events_written.borrow_mut().take(&said);
+                    exposed.send_replace(exposed_text(
+                        &expiry.borrow(),
+                        &unimplementable.borrow(),
+                        &unprotected.borrow(),
+                        &events_written.borrow(),
+                    ));
+                    if *forbidden {
+                        return;
+                    }
+                }
                 let mut text = told(&said, write_config.as_deref());
                 let offered = match (&said, &offering) {
                     (
@@ -1513,6 +1543,7 @@ async fn control_until(
                         &expiry.borrow(),
                         &unimplementable.borrow(),
                         &unprotected.borrow(),
+                        &events_written.borrow(),
                     ));
                     for line in out_of_date {
                         telling(&line);
@@ -2091,6 +2122,25 @@ fn told(said: &Said<'_>, write_config: Option<&Path>) -> String {
                 Err(error) => format!("status of {ingress} cannot be written ({said}): {error}"),
             }
         }
+        Said::Event { told, written, .. } => {
+            let kind = if told.warning { "Warning" } else { "Normal" };
+            let (object, reason) = (&told.object, told.reason);
+            match written {
+                Ok(EventWritten::Created) => format!("{kind} Event on {object} created: {reason}"),
+                Ok(EventWritten::Refreshed) => {
+                    format!("{kind} Event on {object} refreshed: {reason}")
+                }
+                Err(error) => format!(
+                    "{kind} Event on {object} cannot be written ({reason}), tried again in a minute: {error}"
+                ),
+            }
+        }
+        Said::EventsForbidden(refused) => match refused {
+            Some(error) => format!(
+                "Events cannot be written, for want of the rights, until a write succeeds: {error}"
+            ),
+            None => "Events are written again".to_owned(),
+        },
         Said::Translated {
             data_plane,
             translation,

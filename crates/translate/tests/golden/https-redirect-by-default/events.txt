@@ -1,0 +1,2 @@
+Warning Ingress shop/mixed NotSupportedYet: not supported yet: annotations
+Warning Ingress shop/odd NotBoolean: annotation `gateway.edgerush.dev/https-redirect` is neither "true" nor "false"

@@ -309,6 +309,14 @@ fn hear(heard: &Rc<RefCell<Heard>>) -> impl Fn(Said<'_>) + 'static {
                     Err(error) => format!("status of {ingress} not written: {error}"),
                 }
             }
+            Said::Event { told, written, .. } => match written {
+                Ok(written) => format!("event on {} {}: {written:?}", told.object, told.reason),
+                Err(error) => format!("event on {} not written: {error}", told.object),
+            },
+            Said::EventsForbidden(refused) => match refused {
+                Some(error) => format!("events forbidden: {error}"),
+                None => "events written again".to_owned(),
+            },
         };
         heard.lines.push(line);
     }
@@ -785,6 +793,7 @@ async fn the_gateway_apis_kinds_are_followed_as_their_crds_say() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -1191,6 +1200,7 @@ async fn the_cluster_is_translated_once_every_kind_is_listed_and_again_when_it_c
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -1379,6 +1389,7 @@ async fn held_back_then_taken_on(snapshots: bool) {
                             snapshot: watch::channel(None).0,
                             settings: Rc::new(|_| None),
                         }),
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -1525,6 +1536,7 @@ async fn a_data_planes_served_says_which_generation_is_served_and_why_one_is_hel
                         Some(leading),
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -1733,6 +1745,7 @@ async fn the_settings_are_followed_as_they_change() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -1839,6 +1852,7 @@ async fn secrets_are_followed_in_the_gateways_namespace_beside_the_scope() {
                     None,
                     acks(),
                     None,
+                    "replica".to_owned(),
                     |_| {},
                 )
                 .await;
@@ -1910,6 +1924,7 @@ async fn each_namespace_of_the_scope_is_followed_and_all_are_translated_together
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -2172,6 +2187,7 @@ async fn each_ingress_status_is_written_as_the_config_handed_on_serves_it() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -2274,6 +2290,7 @@ async fn a_rate_limit_policys_status_is_written_of_the_ingress_it_reaches_and_on
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -2379,6 +2396,7 @@ async fn a_config_is_not_held_up_by_its_status() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -2465,6 +2483,7 @@ async fn only_the_leader_writes_status_and_it_does_as_it_comes_to_lead() {
                         Some(leading),
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3116,6 +3135,7 @@ async fn a_selectors_namespaces_are_followed_and_each_that_comes_to_match_taken_
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3271,6 +3291,7 @@ async fn a_selectors_first_namespaces_are_waited_on_as_the_start_is() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3508,6 +3529,7 @@ async fn the_data_planes_service_is_written_as_wanted_and_not_again_until_that_c
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3577,6 +3599,7 @@ async fn a_service_of_its_name_not_its_data_planes_is_left_alone() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3623,6 +3646,7 @@ async fn a_service_refused_is_said() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3737,6 +3761,7 @@ async fn each_data_plane_is_translated_and_its_statuses_written_on_its_own() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3872,6 +3897,7 @@ async fn the_last_data_planes_ingresses_lose_their_address_once_it_is_let_go_of(
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -3954,6 +3980,7 @@ async fn a_control_plane_serving_no_data_plane_lets_go_of_its_classes_once_they_
                         Some(leading),
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -4043,6 +4070,7 @@ async fn a_data_plane_added_refused_or_let_go_of_leaves_the_others_as_they_were(
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -4139,6 +4167,7 @@ async fn a_data_plane_of_ingress_alone_does_not_wait_on_the_gateway_apis_kinds()
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -4523,6 +4552,7 @@ async fn a_control_plane_serving_no_gateway_follows_the_classes_alone() {
                         None,
                         acks(),
                         None,
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -4755,6 +4785,7 @@ async fn the_records_are_taken_into_the_snapshot_each_round() {
                             snapshot: snapshots,
                             settings: Rc::new(|_| None),
                         }),
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -4953,6 +4984,7 @@ async fn a_follower_translates_from_the_snapshot_and_counts_on_from_it_once_it_l
                             snapshot,
                             settings: Rc::new(|_| None),
                         }),
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -5068,6 +5100,7 @@ async fn a_replica_coming_to_lead_leads_from_the_snapshot_it_took() {
                             snapshot,
                             settings: Rc::new(|_| None),
                         }),
+                        "replica".to_owned(),
                         said,
                     )
                     .await;
@@ -5091,6 +5124,155 @@ async fn a_replica_coming_to_lead_leads_from_the_snapshot_it_took() {
                 "a snapshot of its own taken over the one it took"
             );
             assert_eq!(held.planes[""], Record::default());
+            controlling.abort();
+        })
+        .await;
+}
+
+/// The leader alone writes an Event of each thing translation tells of an object with no
+/// status to say it in, once however many data planes tell it, reported by its pod
+/// (04 §6): an Ingress left out for its annotations, and a Service its routes reach whose
+/// protection does not read. A replica that follows writes none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_leader_writes_an_event_of_each_thing_told_once_for_every_data_plane() {
+    const EVENTS: &str = "/apis/events.k8s.io/v1/namespaces/shop/events";
+    let annotated: Ingress = serde_saphyr::from_str(
+        "metadata: { name: annotated, namespace: shop, uid: uid-annotated, annotations: { example.com/anything: x } }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: other.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+",
+    )
+    .unwrap();
+    let web: Ingress = serde_saphyr::from_str(
+        "metadata: { name: web, namespace: shop, uid: uid-web }
+spec:
+  ingressClassName: edge
+  rules:
+    - host: shop.example
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+",
+    )
+    .unwrap();
+    let typo: Service = serde_saphyr::from_str(
+        "{ metadata: { name: web, namespace: shop, uid: uid-service, annotations: { gateway.edgerush.dev/max-inflight-per-pod: '3' } }, spec: { ports: [{ name: http, port: 80 }] } }",
+    )
+    .unwrap();
+    let fake = Fake::start_by_method(&["127.0.0.1"], move |method, path| {
+        if method == "POST" && path == EVENTS {
+            return answer(
+                201,
+                r#"{"apiVersion":"events.k8s.io/v1","kind":"Event","metadata":{"name":"made.1","namespace":"shop"}}"#,
+            );
+        }
+        if path.contains("watch=true") {
+            return open();
+        }
+        if path.starts_with("/apis/networking.k8s.io/v1/ingressclasses?") {
+            page(&[class()])
+        } else if path.starts_with("/apis/networking.k8s.io/v1/ingresses?") {
+            page(&[annotated.clone(), web.clone()])
+        } else if path.starts_with("/api/v1/services?") {
+            page(std::slice::from_ref(&typo))
+        } else if path.starts_with("/api/v1/secrets?") {
+            page::<Secret>(&[])
+        } else {
+            otherwise(path)
+        }
+    })
+    .await;
+    let posted = |fake: &Fake| -> Vec<serde_json::Value> {
+        fake.seen()
+            .into_iter()
+            .filter(|seen| seen.method == "POST" && seen.path == EVENTS)
+            .map(|seen| serde_json::from_str(&seen.body).unwrap())
+            .collect()
+    };
+    let api = fake.client(&token("controller-events", "secret"), Timing::default());
+    let heard: Rc<RefCell<Heard>> = Rc::default();
+    let (leading, leads) = watch::channel(false);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let plane = plane();
+            let planes = watch::channel(Planes::from([
+                ("a".to_owned(), harness(&plane)),
+                ("b".to_owned(), harness(&plane)),
+            ]))
+            .1;
+            let controlling = tokio::task::spawn_local({
+                let said = hear(&heard);
+                async move {
+                    control(
+                        api,
+                        &WatchScope::Parts(vec![Scope::Cluster]),
+                        planes,
+                        None,
+                        Debounce::default(),
+                        Some(leads),
+                        acks(),
+                        None,
+                        "replica".to_owned(),
+                        said,
+                    )
+                    .await;
+                }
+            });
+            until("both translated", || heard.borrow().translations.len() >= 2).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(posted(&fake), Vec::<serde_json::Value>::new(), "following");
+            leading.send_replace(true);
+            until("two Events", || posted(&fake).len() >= 2).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut told: Vec<(String, String, String, String)> = posted(&fake)
+                .iter()
+                .map(|event| {
+                    assert_eq!(event["type"], "Warning", "{event}");
+                    assert_eq!(event["action"], "Translate", "{event}");
+                    assert_eq!(event["reportingController"], "edgerush.dev/control-plane");
+                    assert_eq!(event["reportingInstance"], "replica", "{event}");
+                    let regarding = &event["regarding"];
+                    (
+                        regarding["kind"].as_str().unwrap().to_owned(),
+                        regarding["name"].as_str().unwrap().to_owned(),
+                        regarding["uid"].as_str().unwrap().to_owned(),
+                        event["reason"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            told.sort();
+            let owned = |kind: &str, name: &str, uid: &str, reason: &str| {
+                (
+                    kind.to_owned(),
+                    name.to_owned(),
+                    uid.to_owned(),
+                    reason.to_owned(),
+                )
+            };
+            assert_eq!(
+                told,
+                [
+                    owned("Ingress", "annotated", "uid-annotated", "NotSupportedYet"),
+                    owned("Service", "web", "uid-service", "Unprotected"),
+                ],
+                "{:?}",
+                heard.borrow().lines
+            );
+            // Following again, it writes nothing, and forgets what it wrote: leading once
+            // more, it writes its own afresh, as a new leader does (04 §6).
+            leading.send_replace(false);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(posted(&fake).len(), 2, "following again");
+            leading.send_replace(true);
+            until("two Events more", || posted(&fake).len() >= 4).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(posted(&fake).len(), 4, "{:?}", heard.borrow().lines);
             controlling.abort();
         })
         .await;
