@@ -158,6 +158,12 @@ fn answers_however_late_are_given_back() {
             delay: ms(1_200),
             ..Link::lan()
         };
+        // The clients' checks wait longer than the answers are late, so that the pods stay up
+        // for them.
+        world.set_checks(edgerush_cluster_sim::client::Checks {
+            timeout: ms(2_000),
+            ..edgerush_cluster_sim::client::Checks::default()
+        });
         let clients: Vec<NodeId> = world.client_ids().collect();
         for pod in &pods {
             for client in &clients {
@@ -355,8 +361,8 @@ fn a_request_that_cannot_reach_its_pod_marks_it_down_for_no_other() {
 }
 
 /// Requests unanswered mark no pod down, however many, as a data plane's timeouts decide only
-/// their own requests: the owner is asked still. Its checks missed in a row do, past each
-/// one's timeout, one check at a time; an answer between starts the count again.
+/// their own requests: the owner is asked still. Its checks missed in a row do, each checked
+/// again at once after a miss; an answer between starts the count again.
 #[test]
 fn requests_unanswered_mark_no_pod_down_and_checks_missed_do() {
     use edgerush_cluster::table;
@@ -386,7 +392,6 @@ fn requests_unanswered_mark_no_pod_down_and_checks_missed_do() {
     );
     assert_eq!(client.send(ms(41), &pods).unwrap().0, 1, "asked still");
     // Pod 1's checks go unanswered; the others' are answered.
-    let mut at = ms(42);
     let checked = |client: &mut Client, at: u64| {
         let mut out = None;
         for (pod, id) in client.checks_due(at, &pods) {
@@ -398,33 +403,73 @@ fn requests_unanswered_mark_no_pod_down_and_checks_missed_do() {
         }
         out
     };
-    let first_check = checked(&mut client, at).unwrap();
-    at += ms(20);
-    assert_eq!(
-        checked(&mut client, at),
-        None,
-        "missed, the next an interval on"
-    );
-    assert!(!client.is_down(1), "one miss");
-    at += ms(10);
-    let second = checked(&mut client, at).unwrap();
+    let first_check = checked(&mut client, ms(42)).unwrap();
+    let second = checked(&mut client, ms(62)).expect("missed: checked again at once");
     assert_ne!(second, first_check);
+    assert!(!client.is_down(1), "one miss");
     // Answered, the count starts again.
-    client.check_answered(1, second, at + ms(1));
-    at += ms(11);
-    let third = checked(&mut client, at).unwrap();
-    at += ms(20);
-    assert_eq!(checked(&mut client, at), None);
+    client.check_answered(1, second, ms(63));
+    assert_eq!(
+        checked(&mut client, ms(70)),
+        None,
+        "an interval after an answer"
+    );
+    let third = checked(&mut client, ms(73)).unwrap();
+    let _fourth = checked(&mut client, ms(93)).expect("missed: checked again at once");
     assert!(!client.is_down(1), "one miss since the answer");
-    at += ms(10);
-    let _fourth = checked(&mut client, at).unwrap();
-    at += ms(20);
-    let _ = checked(&mut client, at);
+    assert_eq!(
+        checked(&mut client, ms(113)),
+        None,
+        "two in a row: an interval on"
+    );
     assert!(client.is_down(1), "two in a row");
-    assert_ne!(client.send(at, &pods).unwrap().0, 1, "marked down");
+    assert_ne!(client.send(ms(113), &pods).unwrap().0, 1, "marked down");
     // A late answer to a check missed before brings nothing back.
-    client.check_answered(1, third, at);
+    client.check_answered(1, third, ms(114));
     assert!(client.is_down(1));
+}
+
+/// A request left unanswered at its deadline has its pod checked at once, before the
+/// interval is out; another soon after, no sooner than an interval after the check it asked
+/// for, so that requests going wrong on a pod that answers do not have it checked back to back.
+#[test]
+fn a_request_gone_wrong_has_its_pod_checked_at_once_once_each_interval() {
+    use edgerush_cluster::table;
+    use edgerush_cluster_sim::client::{Checks, Client};
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let first = table::first(&members, 16, 2, 1);
+    let Some(key) = (0..).find(|key| first.owner(table::shard_of(*key, 16)) == Some(1)) else {
+        panic!("pod 1 owns nothing");
+    };
+    let mut client = Client::new(1_000_000, vec![key], ms(50), ms(20), 16);
+    client.checking = Checks {
+        interval: ms(100),
+        timeout: ms(50),
+        misses: 3,
+    };
+    client.learn(first);
+    let pods = [1, 2, 3];
+    let of_1 = |checks: Vec<(NodeId, u64)>| checks.into_iter().find(|(pod, _)| *pod == 1);
+    for (pod, id) in client.checks_due(ms(1), &pods) {
+        client.check_answered(pod, id, ms(2));
+    }
+    // Unanswered past its deadline: pod 1 checked at once, its interval not out.
+    assert_eq!(client.send(ms(3), &pods).unwrap().0, 1);
+    let _ = client.check(ms(23), &pods);
+    let (_, asked) = of_1(client.checks_due(ms(23), &pods)).expect("checked at once");
+    client.check_answered(1, asked, ms(24));
+    // Another soon after: an interval after the one it asked for, not at once.
+    assert_eq!(client.send(ms(25), &pods).unwrap().0, 1);
+    let _ = client.check(ms(45), &pods);
+    assert!(
+        of_1(client.checks_due(ms(50), &pods)).is_none(),
+        "not again so soon"
+    );
+    assert!(of_1(client.checks_due(ms(122), &pods)).is_none());
+    assert!(
+        of_1(client.checks_due(ms(123), &pods)).is_some(),
+        "an interval after"
+    );
 }
 
 /// Clients cut off from every pod: with every pod marked down by its checks, a request

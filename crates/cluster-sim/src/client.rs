@@ -5,10 +5,11 @@
 //! client sends a key the same way.
 //!
 //! It checks every pod it may ask, as a data plane's checking thread does (docs/06 §4): one
-//! check at a time, each an interval after the last ended. Checks missed in a row, or one
-//! refused, its link cut or its pod gone, mark the pod down, and its keys go another way
-//! until a check is answered. Nothing else marks a pod down: a request unanswered in time, or
-//! one that could not reach its pod, decides only itself.
+//! check at a time, each an interval after the last ended, but at once after a miss, and at
+//! once — at most once each interval — when a request to the pod goes unanswered in time or
+//! cannot reach it. Checks missed in a row, or one refused, its link cut or its pod gone,
+//! mark the pod down, and its keys go another way until a check is answered. Nothing else
+//! marks a pod down: such a request decides only itself, and asks for a check.
 
 use edgerush_cluster::table::{Table, shard_of};
 use edgerush_cluster::{Key, NodeId, Time};
@@ -148,11 +149,11 @@ pub struct Checks {
 }
 
 impl Default for Checks {
-    /// The bench's: every 100 ms, a second each, three in a row.
+    /// The bench's: every 100 ms, 200 ms each, three in a row.
     fn default() -> Self {
         Self {
             interval: 100_000_000,
-            timeout: 1_000_000_000,
+            timeout: 200_000_000,
             misses: 3,
         }
     }
@@ -167,6 +168,27 @@ struct Checking {
     due: Time,
     /// Checks missed in a row.
     misses: u32,
+    /// A request to the pod went wrong since the last check began: a check asked for.
+    wanted: bool,
+    /// When the last check asked for so was due.
+    asked_at: Option<Time>,
+}
+
+impl Checking {
+    /// The next check brought forward for a request gone wrong, if one was: to `now`, but no
+    /// sooner than an interval after the last asked for so.
+    fn bring_forward(&mut self, now: Time, interval: Time) {
+        if !self.wanted || self.out.is_some() {
+            return;
+        }
+        let at = self
+            .asked_at
+            .map_or(now, |asked| asked.saturating_add(interval).max(now));
+        if at < self.due {
+            self.due = at;
+            self.asked_at = Some(at);
+        }
+    }
 }
 
 /// A request split by key.
@@ -642,6 +664,7 @@ impl Client {
         {
             return None;
         }
+        self.trouble(pod, now);
         self.retry_anywhere(id, now, pods, pod, false)
     }
 
@@ -662,15 +685,20 @@ impl Client {
                 && now.saturating_sub(sent) >= checks.timeout
             {
                 checking.out = None;
-                checking.due = now + checks.interval;
                 checking.misses = checking.misses.saturating_add(1);
-                if checking.misses >= checks.misses {
+                // Missed: checked again at once, but an interval on once marked down.
+                checking.due = if checking.misses >= checks.misses {
                     self.down.insert(*pod);
-                }
+                    now + checks.interval
+                } else {
+                    now
+                };
+                checking.bring_forward(now, checks.interval);
             }
             if checking.out.is_none() && now >= checking.due {
                 self.checked += 1;
                 checking.out = Some((self.checked, now));
+                checking.wanted = false;
                 due.push((*pod, self.checked));
             }
             self.checks.insert(*pod, checking);
@@ -688,8 +716,21 @@ impl Client {
             checking.out = None;
             checking.due = now + interval;
             checking.misses = 0;
+            checking.bring_forward(now, interval);
             self.down.remove(&pod);
         }
+    }
+
+    /// A request to `pod` went wrong at `now` — unanswered by its deadline, or unable to reach
+    /// it — which asks for its pod to be checked at once, at most once each interval.
+    fn trouble(&mut self, pod: NodeId, now: Time) {
+        let interval = self.checking.interval;
+        let checking = self.checks.entry(pod).or_insert(Checking {
+            due: now,
+            ..Checking::default()
+        });
+        checking.wanted = true;
+        checking.bring_forward(now, interval);
     }
 
     /// Check `id` of `pod` refused at `now`, its link cut or the pod gone: if it is the check
@@ -702,6 +743,7 @@ impl Client {
         {
             checking.out = None;
             checking.due = now + interval;
+            checking.bring_forward(now, interval);
             self.down.insert(pod);
         }
     }
@@ -741,6 +783,9 @@ impl Client {
             }
             if now.saturating_sub(inflight.started) >= self.deadline {
                 self.inflight.remove(&id);
+                if inflight.to != NOBODY {
+                    self.trouble(inflight.to, now);
+                }
                 let keys = if inflight.keys.is_empty() {
                     vec![inflight.key]
                 } else {
