@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 #[cfg(test)]
 mod tests;
@@ -18,8 +18,8 @@ mod tests;
 ///
 /// The CPU quantity, as written, if it is not one a number can be read from.
 pub fn workers(
-    requests: Option<&BTreeMap<String, IntOrString>>,
-    limits: Option<&BTreeMap<String, IntOrString>>,
+    requests: Option<&BTreeMap<String, Quantity>>,
+    limits: Option<&BTreeMap<String, Quantity>>,
 ) -> Result<u64, String> {
     let request = cpu(requests)?;
     let limit = cpu(limits)?;
@@ -33,30 +33,20 @@ pub fn workers(
 /// # Errors
 ///
 /// The quantity, as written, if it is not one a number of bytes can be read from.
-pub fn memory_limit(limits: Option<&BTreeMap<String, IntOrString>>) -> Result<Option<u64>, String> {
+pub fn memory_limit(limits: Option<&BTreeMap<String, Quantity>>) -> Result<Option<u64>, String> {
     match limits.and_then(|l| l.get("memory")) {
         None => Ok(None),
-        Some(IntOrString::Int(bytes)) => u64::try_from(*bytes)
-            .map(Some)
-            .map_err(|_| bytes.to_string()),
-        Some(IntOrString::String(written)) => millis(written)
+        Some(Quantity(written)) => millis(written)
             .map(|millis| Some(millis / 1000))
             .ok_or_else(|| written.clone()),
     }
 }
 
 /// The `cpu` of `resources`, in thousandths of a CPU, rounded up.
-fn cpu(resources: Option<&BTreeMap<String, IntOrString>>) -> Result<Option<u64>, String> {
+fn cpu(resources: Option<&BTreeMap<String, Quantity>>) -> Result<Option<u64>, String> {
     match resources.and_then(|r| r.get("cpu")) {
         None => Ok(None),
-        Some(IntOrString::Int(cpus)) => u64::try_from(*cpus)
-            .ok()
-            .and_then(|cpus| cpus.checked_mul(1000))
-            .map(Some)
-            .ok_or_else(|| cpus.to_string()),
-        Some(IntOrString::String(written)) => {
-            millis(written).map(Some).ok_or_else(|| written.clone())
-        }
+        Some(Quantity(written)) => millis(written).map(Some).ok_or_else(|| written.clone()),
     }
 }
 

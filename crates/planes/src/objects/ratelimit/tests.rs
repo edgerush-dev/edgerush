@@ -243,6 +243,8 @@ fn a_cap_not_declared_is_half_the_memory_limit() {
     assert_eq!(cap_of(serde_json::json!("16Gi")), 8_589_934_592);
     assert_eq!(cap_of(serde_json::json!("1G")), 500_000_000);
     assert_eq!(cap_of(serde_json::json!(1001)), 500);
+    // An integer over 32 bits, as the schema lets through.
+    assert_eq!(cap_of(serde_json::json!(17_179_869_184_u64)), 8_589_934_592);
     // Never none: the file takes no cap under one byte.
     assert_eq!(cap_of(serde_json::json!(1)), 1);
 }

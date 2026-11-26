@@ -13,9 +13,11 @@
 //! judge, where an enum would fail the object and, with it, the whole list it came in. A
 //! field the types do not have is passed over, and one they require but the object lacks
 //! is read as its empty value, as Go's types read it, for the same reason. Kubernetes' standard
-//! conditions and object references are k8s-openapi's types. **A field the schema gives a
-//! default holds it** when the object leaves the field out, as the API server would have
-//! stored it, nested defaults with it; such a field is not optional. The status is left as
+//! conditions, object references and quantities (an int-or-string of the quantity pattern,
+//! as a pod's resources have, whose integer may be of any size) are k8s-openapi's types.
+//! **A field the schema gives a default holds it** when the object leaves the field out,
+//! as the API server would have stored it, nested defaults with it; such a field is not
+//! optional. The status is left as
 //! it is, a controller's to write. The kind's own struct holds
 //! its `metadata` and implements k8s-openapi's `Resource`, `ListableResource` and
 //! `Metadata`, as the list and watch client asks.
@@ -195,6 +197,9 @@ fn write_uses(src: &mut String, root: &Container, structs: &[Container]) {
     } else {
         format!("{{{}}}", meta.join(", "))
     };
+    if uses("Quantity") {
+        src.push_str("use k8s_openapi::apimachinery::pkg::api::resource::Quantity;\n");
+    }
     let _ = writeln!(
         src,
         "use k8s_openapi::apimachinery::pkg::apis::meta::v1::{meta};"

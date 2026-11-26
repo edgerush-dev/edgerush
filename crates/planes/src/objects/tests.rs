@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::api::admissionregistration::v1::{
     ValidatingWebhook, ValidatingWebhookConfiguration,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
     LabelSelector, LabelSelectorRequirement, ObjectMeta,
 };
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use super::{Error, Install, Object, ProxyService, Transports, for_control_plane, for_data_plane};
 use crate::control_plane::{ControlPlane, ControlPlaneStatus, ControlPlaneStatusAuthority};
@@ -137,7 +137,7 @@ fn a_cpu_quantity_not_read_makes_nothing() {
     dp.spec.resources = Some(DataPlaneResources {
         requests: Some(BTreeMap::from([(
             "cpu".to_owned(),
-            IntOrString::String("lots".to_owned()),
+            Quantity("lots".to_owned()),
         )])),
         ..DataPlaneResources::default()
     });

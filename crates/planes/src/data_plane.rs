@@ -1,8 +1,8 @@
 //! `DataPlane`, `gateway.edgerush.dev/v1alpha1`. Written by `edgerush-crdgen` from
 //! `install/gateway.edgerush.dev_dataplanes.yaml`: not to be edited (the crate's docs say how it is written again).
 
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta};
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -1546,10 +1546,10 @@ pub struct DataPlaneReplicas {
 pub struct DataPlaneResources {
     /// Limits is the most of each resource a proxy may use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limits: Option<BTreeMap<String, IntOrString>>,
+    pub limits: Option<BTreeMap<String, Quantity>>,
     /// Requests is how much of each resource a proxy is given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requests: Option<BTreeMap<String, IntOrString>>,
+    pub requests: Option<BTreeMap<String, Quantity>>,
 }
 
 /// Service is the data plane's Service, its address, which its control plane

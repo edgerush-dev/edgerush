@@ -1398,25 +1398,12 @@ impl ProxyService {
 
 /// A resource's `limits` and `requests`, as its CRD has them, as a container's.
 fn requirements(
-    limits: Option<&BTreeMap<String, IntOrString>>,
-    requests: Option<&BTreeMap<String, IntOrString>>,
+    limits: Option<&BTreeMap<String, Quantity>>,
+    requests: Option<&BTreeMap<String, Quantity>>,
 ) -> ResourceRequirements {
-    let quantities = |q: Option<&BTreeMap<String, IntOrString>>| {
-        q.map(|q| {
-            q.iter()
-                .map(|(name, amount)| {
-                    let amount = match amount {
-                        IntOrString::Int(n) => n.to_string(),
-                        IntOrString::String(s) => s.clone(),
-                    };
-                    (name.clone(), Quantity(amount))
-                })
-                .collect()
-        })
-    };
     ResourceRequirements {
-        limits: quantities(limits),
-        requests: quantities(requests),
+        limits: limits.cloned(),
+        requests: requests.cloned(),
         ..ResourceRequirements::default()
     }
 }
