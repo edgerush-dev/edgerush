@@ -183,58 +183,6 @@ it, from the same file and without running anything:
 each is expected to go and, given what its upstream answers, what its client gets. It exits
 1 when one goes elsewhere or is answered otherwise, so a config's tests can run in CI.
 
-### Checking manifests: `validate`
-
-```sh
-edgerush validate --from-manifests manifests/ --data-plane data-plane.yaml
-```
-
-translates Kubernetes manifests as the control plane would for one data plane, without a
-cluster, and compiles the config as the data plane would. The manifests are files or
-directories (`kubectl get -o yaml` output included), `--from-manifests` given once for
-each, with an IngressClass whose controller is `edgerush.dev/ingress-controller`. It
-reports, and exits 1 for:
-
-- each object left out, and why, a RateLimitPolicy refused among them;
-- each path whose backend is not there;
-- what of an Ingress's `tls` is not served as it lists it;
-- each path another Ingress already has.
-
-TLS Secrets, seldom in a repository, are taken as they will be in the cluster, unless
-`--check-secrets` asks for them to be checked. The manifests are taken as the API server
-accepted them: what their resources' schemas forbid is not checked here, and
-`kubectl apply --dry-run=server` checks it. An object written twice, of one kind, namespace
-and name, in two files or in one, stops it, as a cluster would keep one of them.
-[examples/kubernetes/rate-limits](examples/kubernetes/rate-limits/README.md)
-is a worked example.
-
-`data-plane.yaml` holds the data plane's settings, which a `DataPlane` resource states in a
-cluster:
-
-```yaml
-ingress_class: edge
-cluster_domain: cluster.local
-ingress_hosts_fall_through: false
-ingress_https_redirect: true
-ingress_https_redirect_max_age: 30
-```
-
-| Setting | What it is |
-|---|---|
-| `id` | Optional: the SPIFFE ID the data plane's certificate carries, `spiffe://<trust domain>/<path>`. The config stream serves only the data plane whose certificate carries it, refusing any other with why; left out, any data plane the stream's authorities signed is served. A `DataPlane`'s is its own, written into its certificate. |
-| `ingress_class` | The IngressClass whose Ingresses this data plane serves. |
-| `cluster_domain` | The cluster's DNS domain, which Services' names end in. |
-| `ingress_hosts_fall_through` | Whether an Ingress host stays a candidate on hosts a more specific one also covers; `false` is ingress-nginx's way. |
-| `ingress_https_redirect` | Whether plain HTTP to a host an Ingress's `tls` lists is redirected to HTTPS, as a `DataPlane` does by default. An Ingress's `gateway.edgerush.dev/https-redirect: "false"` or `"true"` overrides it for its own routes. |
-| `ingress_https_redirect_max_age` | How long, in seconds, a client may keep that redirect (30 for a `DataPlane` by default). |
-| `gateway` | Optional: the Gateway this data plane is, as `namespace/name`. Its listeners are bound: one data-plane listener for each port they state, named `port-<n>`, and one more, `port-<n>-udp`, for a port's UDP listener. Ingress binds only its own two ports, below, and only while it serves something there. |
-| `ingress_http_port` | Optional: the port an Ingress is served on over plain HTTP, 80 by default: shared with the Gateway's listener there if that is `HTTP`, bound for `http` if no listener of the Gateway is. |
-| `ingress_https_port` | Optional: the port the hosts an Ingress's `tls` lists are served on over HTTPS, 443 by default: shared with the Gateway's listener there if that is `HTTPS`, bound for `https` if no listener of the Gateway is, and named in a redirect there unless 443. |
-| `ports` | Optional: each port's settings, as a config's listener states them: `http3` (an `https` port's alone), `proxy_protocol`, `forwarding`, `request_id`, `access_log`, and `session_idle_seconds` and `session_answers` (for its UDP listener alone, which of the others takes `access_log` only). A port not listed trusts no proxy's forwarding headers, gives each request an ID and logs nothing. |
-| `ip_family` | Optional: `ipv4`, the default, binds `0.0.0.0`; `ipv6` and `dual` bind `[::]`. |
-| `backend_authorities` | Optional: certificates in PEM trusted for a Service port spoken to over TLS (`appProtocol: kubernetes.io/wss`). |
-| `data_plane` | Optional: the data plane's own settings, as a config states them, written into every config. `own_service: edgerush.edge.svc.cluster.local` names the Service of the data plane's own pods, whose EndpointSlices say its zone. |
-
 ### In a cluster: the operator
 
 `kind/operator.sh 1.37` builds the binary into an image, `edgerush:dev`, makes a kind
@@ -275,7 +223,38 @@ edgerush controller --data-plane data-plane.yaml
 run in a cluster, follows the IngressClasses, Ingresses, Services and Secrets there and
 translates them for that data plane each time they change, once all have been listed (with
 `--control-plane`, for every `DataPlane` naming it, each on its own). Each
-translation is reported on stderr as `validate` reports it. The rest is chosen by flags:
+translation is reported on stderr, a line for each finding: each object left out, and why,
+a RateLimitPolicy refused among them; each path whose backend is not there; what of an
+Ingress's `tls` is not served as it lists it; and each path another Ingress already has.
+
+`data-plane.yaml` holds the data plane's settings, which a `DataPlane` resource states in a
+cluster:
+
+```yaml
+ingress_class: edge
+cluster_domain: cluster.local
+ingress_hosts_fall_through: false
+ingress_https_redirect: true
+ingress_https_redirect_max_age: 30
+```
+
+| Setting | What it is |
+|---|---|
+| `id` | Optional: the SPIFFE ID the data plane's certificate carries, `spiffe://<trust domain>/<path>`. The config stream serves only the data plane whose certificate carries it, refusing any other with why; left out, any data plane the stream's authorities signed is served. A `DataPlane`'s is its own, written into its certificate. |
+| `ingress_class` | The IngressClass whose Ingresses this data plane serves. |
+| `cluster_domain` | The cluster's DNS domain, which Services' names end in. |
+| `ingress_hosts_fall_through` | Whether an Ingress host stays a candidate on hosts a more specific one also covers; `false` is ingress-nginx's way. |
+| `ingress_https_redirect` | Whether plain HTTP to a host an Ingress's `tls` lists is redirected to HTTPS, as a `DataPlane` does by default. An Ingress's `gateway.edgerush.dev/https-redirect: "false"` or `"true"` overrides it for its own routes. |
+| `ingress_https_redirect_max_age` | How long, in seconds, a client may keep that redirect (30 for a `DataPlane` by default). |
+| `gateway` | Optional: the Gateway this data plane is, as `namespace/name`. Its listeners are bound: one data-plane listener for each port they state, named `port-<n>`, and one more, `port-<n>-udp`, for a port's UDP listener. Ingress binds only its own two ports, below, and only while it serves something there. |
+| `ingress_http_port` | Optional: the port an Ingress is served on over plain HTTP, 80 by default: shared with the Gateway's listener there if that is `HTTP`, bound for `http` if no listener of the Gateway is. |
+| `ingress_https_port` | Optional: the port the hosts an Ingress's `tls` lists are served on over HTTPS, 443 by default: shared with the Gateway's listener there if that is `HTTPS`, bound for `https` if no listener of the Gateway is, and named in a redirect there unless 443. |
+| `ports` | Optional: each port's settings, as a config's listener states them: `http3` (an `https` port's alone), `proxy_protocol`, `forwarding`, `request_id`, `access_log`, and `session_idle_seconds` and `session_answers` (for its UDP listener alone, which of the others takes `access_log` only). A port not listed trusts no proxy's forwarding headers, gives each request an ID and logs nothing. |
+| `ip_family` | Optional: `ipv4`, the default, binds `0.0.0.0`; `ipv6` and `dual` bind `[::]`. |
+| `backend_authorities` | Optional: certificates in PEM trusted for a Service port spoken to over TLS (`appProtocol: kubernetes.io/wss`). |
+| `data_plane` | Optional: the data plane's own settings, as a config states them, written into every config. `own_service: edgerush.edge.svc.cluster.local` names the Service of the data plane's own pods, whose EndpointSlices say its zone. |
+
+The rest is chosen by flags:
 
 | Flags | What they do |
 |---|---|
@@ -381,8 +360,7 @@ crates/edgerush    the binary, one subcommand for each part: `edgerush operator`
                    makes what runs each ControlPlane and DataPlane, `edgerush proxy`, a data plane, its config from a file for development
                    (`--config file.yaml`) or from a control plane (`--control-plane`),
                    `edgerush controller`, a control plane for its data planes, `edgerush explain`,
-                   where a request would go and why, `edgerush test`, and `edgerush validate`,
-                   which translates Kubernetes manifests
+                   where a request would go and why, and `edgerush test`
 crates/certificates
                    a certificate and its key read and checked to belong together
                    (`edgerush-certificates`), by BoringSSL: what the data plane presents and what

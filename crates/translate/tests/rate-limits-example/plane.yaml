@@ -1,5 +1,5 @@
-# The settings the control plane takes from the DataPlane edge/public
-# (manifests/10-platform.yaml), for `edgerush validate --data-plane`: its IngressClass and
+# The settings the control plane takes from the DataPlane edge/public of
+# examples/kubernetes/rate-limits (manifests/10-platform.yaml): its IngressClass and
 # Gateway, the defaults of its `ingress`, and its `rateLimiting`.
 ingress_class: edge.public
 gateway: edge/public

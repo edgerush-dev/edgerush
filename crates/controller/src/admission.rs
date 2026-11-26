@@ -130,8 +130,7 @@ pub fn read(body: &[u8]) -> Result<Review, ReviewError> {
 
 /// Why `ingress` is refused, if it is: of the class of the data plane `plane` describes,
 /// as `classes` say, it does not translate into something the proxy accepts. Its Secrets
-/// are taken as they will be there, as `edgerush validate`'s are unless it is asked to
-/// check them.
+/// are taken as they will be there.
 #[must_use]
 pub fn judge(plane: &Plane, classes: &[IngressClass], ingress: &Ingress) -> Option<String> {
     let cluster = Cluster {

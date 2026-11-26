@@ -2,9 +2,8 @@
 //! ([04](../../../docs/04-control-plane.md)) — its arguments, the data plane's settings,
 //! the API server found as a pod finds it, the config stream and the admission webhook it
 //! serves, and what is said of each translation and each data plane. A translation is said
-//! as `validate` says it, and with `--write-config` written to a file.
+//! a line for each finding, and with `--write-config` written to a file.
 
-use crate::validate::{described, read};
 use bytes::Bytes;
 use edgerush_certificates::authority::{Kind, Written};
 use edgerush_config::{Certificate, Config};
@@ -61,8 +60,8 @@ Usage: edgerush controller (--data-plane <FILE> | --control-plane <NAME> [--clus
 Runs a control plane for its data planes, in a cluster: follows the IngressClasses,
 Ingresses, Services and Secrets of its scope through the API server, found as a pod finds
 it, and translates them for each data plane on its own each time they change, once every
-kind has been listed whole. What each translation came to is said on stderr, as `edgerush
-validate` says it, under the DataPlane it is of.
+kind has been listed whole. What each translation came to is said on stderr, a line for
+each finding, under the DataPlane it is of.
 The data planes' settings are a file's, one, with --data-plane, or, with --control-plane,
 those of every DataPlane of the pod's own namespace that names that ControlPlane, followed:
 a generation of each is acted on once the operator's Accepted condition is of it, its last
@@ -120,8 +119,16 @@ data plane's settings, the system's authorities or the stream's or the webhook's
 certificates cannot be used, or it is not in a cluster.
 
 Options:
-      --data-plane <FILE>    The data plane's settings, in YAML, as `edgerush validate`
-                             reads them
+      --data-plane <FILE>    The data plane's settings, in YAML: `ingress_class`,
+                             `cluster_domain`, `ingress_hosts_fall_through`,
+                             `ingress_https_redirect`,
+                             `ingress_https_redirect_max_age` and, optionally,
+                             `gateway`, `ingress_http_port`, `ingress_https_port`,
+                             `ports`, `ip_family`, `backend_authorities`,
+                             `data_plane`, the data plane's own settings, written
+                             into the config as they are, and `rate_limiting`: its
+                             `mode`, `off` or `local`, its `max_key_bytes` and its
+                             `global` limits, each written as in a limits file
       --control-plane <NAME> The ControlPlane this is, whose DataPlane, in the pod's own
                              namespace, says the data plane's settings; instead of
                              --data-plane
@@ -207,7 +214,7 @@ pub(crate) fn command(
         .and_then(|system_authorities| {
             let plane = match &options.settings {
                 Settings::File(path) => {
-                    let plane = read::<Plane>(path).map_err(|failed| failed.to_string())?;
+                    let plane = read_plane(path)?;
                     Source::Fixed(Plane {
                         system_authorities,
                         ..plane
@@ -1964,6 +1971,68 @@ fn of_data_plane(data_plane: &str) -> String {
 "
         )
     }
+}
+
+/// The data plane's settings, from the YAML file at `path`, as a config file is read: no
+/// lines quoted around a mistake.
+fn read_plane(path: &Path) -> Result<Plane, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+    let options = serde_saphyr::options! { with_snippet: false };
+    serde_saphyr::from_slice_with_options(&bytes, options)
+        .map_err(|error| format!("{} is not what was expected: {error}", path.display()))
+}
+
+/// What a translation came to, a line each: what was left out, the paths without their
+/// backend, what of a `tls` is not served as listed and the paths shadowed, then how many
+/// of each, as the control plane logs it.
+fn described(translation: &Translation) -> String {
+    let mut text = String::new();
+    for finding in &translation.report {
+        // Writing to a `String` cannot fail.
+        let _ = if finding.problem.is_note() {
+            writeln!(text, "note: {finding}")
+        } else {
+            writeln!(text, "{finding}")
+        };
+    }
+    for unresolved in &translation.unresolved {
+        let _ = writeln!(text, "{unresolved}");
+    }
+    for tls in &translation.tls {
+        let _ = writeln!(text, "{tls}");
+    }
+    for shadowed in &translation.shadowed {
+        let _ = writeln!(text, "{shadowed}");
+    }
+    for taken in &translation.taken {
+        let _ = writeln!(text, "{taken}");
+    }
+    let config = &translation.config;
+    let notes = translation
+        .report
+        .iter()
+        .filter(|finding| finding.problem.is_note())
+        .count();
+    let _ = write!(
+        text,
+        "{} routes and {} upstreams translated; {} left out; {} paths without their backend; \
+         {} TLS hosts or entries not served as listed; {} paths shadowed; {} Ingresses of other classes \
+         or none passed over",
+        config.routes.len(),
+        config.upstreams.len(),
+        translation.report.len() - notes,
+        translation.unresolved.len(),
+        translation.tls.len(),
+        translation.shadowed.len(),
+        translation.passed_over
+    );
+    // Said only where there are any, as they fail nothing.
+    if notes > 0 {
+        let _ = write!(text, "; {notes} notes");
+    }
+    let _ = writeln!(text);
+    text
 }
 
 /// What is said of `said`, the translation written to `write_config` first if it is one.

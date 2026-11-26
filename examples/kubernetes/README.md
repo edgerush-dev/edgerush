@@ -18,7 +18,7 @@ of objects it then serves.
 | [04-ingress-nginx.yaml](04-ingress-nginx.yaml) | Planned translation of ingress-nginx annotations |
 
 [rate-limits/](rate-limits/README.md) is built: a data plane shared by several teams, its
-RateLimitPolicies at every level, and common mistakes with what `edgerush validate`, `kubectl`
-and status show of each.
+RateLimitPolicies at every level, and common mistakes with what `kubectl` and status show
+of each.
 
 For a working local example, use [Docker Compose](../docker-compose/README.md).
