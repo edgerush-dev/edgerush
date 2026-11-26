@@ -3113,7 +3113,7 @@ impl<F: BufFactory> Connection<F> {
     fn recv_single(
         &mut self, buf: &mut [u8], info: &RecvInfo, recv_pid: Option<usize>,
     ) -> Result<usize> {
-        let now = Instant::now();
+        let now = clock::now(); // EdgeRush: see src/clock.rs.
 
         if buf.is_empty() {
             return Err(Error::Done);
@@ -4085,7 +4085,7 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::Done);
         }
 
-        let now = Instant::now();
+        let now = clock::now(); // EdgeRush: see src/clock.rs.
 
         if self.local_error.is_none() {
             self.do_handshake(now)?;
@@ -7312,7 +7312,7 @@ impl<F: BufFactory> Connection<F> {
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout_instant().map(|timeout| {
-            let now = Instant::now();
+            let now = clock::now(); // EdgeRush: see src/clock.rs.
 
             if timeout <= now {
                 Duration::ZERO
@@ -7326,7 +7326,7 @@ impl<F: BufFactory> Connection<F> {
     ///
     /// If no timeout has occurred it does nothing.
     pub fn on_timeout(&mut self) {
-        let now = Instant::now();
+        let now = clock::now(); // EdgeRush: see src/clock.rs.
 
         if let Some(draining_timer) = self.draining_timer {
             if draining_timer <= now {
@@ -7541,7 +7541,7 @@ impl<F: BufFactory> Connection<F> {
         };
 
         // Change the active path.
-        self.set_active_path(pid, Instant::now())?;
+        self.set_active_path(pid, clock::now())?; // EdgeRush: see src/clock.rs.
 
         Ok(dcid_seq)
     }
@@ -10010,6 +10010,7 @@ pub use crate::error::WireErrorCode;
 
 mod buffers;
 mod cid;
+mod clock;
 mod crypto;
 mod dgram;
 mod error;
