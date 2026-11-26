@@ -185,7 +185,8 @@ pub enum WhenUnreachable {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitHealthCheck {
-    /// Milliseconds between checks of a pod.
+    /// Milliseconds from the end of one check of a pod to the start of the next; sooner after
+    /// a miss, and when a worker's ask of the pod goes wrong (at most once each interval).
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub interval_ms: u64,
     /// Milliseconds a check waits for its answer before it is missed.

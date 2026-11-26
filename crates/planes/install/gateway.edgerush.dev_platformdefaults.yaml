@@ -466,7 +466,10 @@ spec:
                                     only their own requests.
                                   properties:
                                     intervalMs:
-                                      description: IntervalMs is milliseconds between checks of a pod.
+                                      description: |-
+                                        IntervalMs is milliseconds from the end of one check of a pod to the
+                                        start of the next; sooner after a miss, and when a proxy's ask of the
+                                        pod goes wrong (at most once each interval).
                                       format: int64
                                       minimum: 1.0
                                       type: integer

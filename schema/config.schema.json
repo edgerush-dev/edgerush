@@ -1201,7 +1201,7 @@
       "type": "object",
       "properties": {
         "interval_ms": {
-          "description": "Milliseconds between checks of a pod.",
+          "description": "Milliseconds from the end of one check of a pod to the start of the next; sooner after\na miss, and when a worker's ask of the pod goes wrong (at most once each interval).",
           "type": "integer",
           "format": "uint64",
           "minimum": 1

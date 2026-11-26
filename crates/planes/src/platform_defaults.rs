@@ -449,7 +449,9 @@ pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingSynchronous {
 /// only their own requests.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimitingSynchronousHealthCheck {
-    /// IntervalMs is milliseconds between checks of a pod.
+    /// IntervalMs is milliseconds from the end of one check of a pod to the
+    /// start of the next; sooner after a miss, and when a proxy's ask of the
+    /// pod goes wrong (at most once each interval).
     #[serde(rename = "intervalMs")]
     #[serde(default)]
     pub interval_ms: i64,

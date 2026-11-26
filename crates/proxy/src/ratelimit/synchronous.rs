@@ -23,7 +23,9 @@
 //! stream of its own: one check at a time, each `check_interval` after the last ended, which
 //! the pod's task answers in its turn, behind what it was asked before, counting nothing.
 //! `check_misses` missed in a row mark the pod down, as does its stream broken and not opened
-//! again, and one answered marks it up; a pod starts up. Marked down, every worker sends its keys another way at once,
+//! again, and one answered marks it up; a pod starts up. After a miss it is checked again at
+//! once, and so it is when a worker's ask of it times out or its stream breaks: the worker
+//! asks for a check, which alone decides. Marked down, every worker sends its keys another way at once,
 //! letting go of its own stream to it. Only the checks mark a pod down: a worker's timeouts,
 //! the pod slow or the worker behind, decide only its own requests.
 //!
@@ -226,8 +228,12 @@ impl Process {
     }
 
     /// Counts an ask of `member` that ended as `how`: a count, which nothing is decided by.
+    /// One that timed out, or whose stream broke or never opened, has its checks look now.
     fn asked(member: &Member, how: Ended) {
         member.asks.local()[how as usize].inc();
+        if matches!(how, Ended::TimedOut | Ended::Broken) {
+            member.health.ask_check();
+        }
     }
 
     /// What its own keys hold, in bytes, how many there are, and how many were evicted;
@@ -307,7 +313,8 @@ impl Process {
 }
 
 /// What a process's checks say of a pod, which its workers read before every ask of it,
-/// and only its checks write.
+/// and only its checks write; and a worker's word that an ask of it went wrong, which has the
+/// checks look at once.
 #[derive(Debug, Default)]
 struct Health {
     /// Marked down: its keys go another way.
@@ -316,6 +323,11 @@ struct Health {
     marked_down: AtomicU64,
     /// Its checks, answered, missed and refused.
     checks: [AtomicU64; 3],
+    /// A worker's ask of it timed out, or its stream broke or never opened, since its last
+    /// check began: it is checked now, without waiting out the interval.
+    check_now: AtomicBool,
+    /// Wakes its checks for that.
+    woken: tokio::sync::Notify,
 }
 
 impl Health {
@@ -332,6 +344,16 @@ impl Health {
     fn mark(&self, down: bool) {
         if self.down.swap(down, Ordering::Relaxed) != down && down {
             self.marked_down.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// An ask of it went wrong: its checks look now, as HAProxy's do on errors it observes
+    /// (`on-error fastinter`). Only the checks mark it down. Written once until the next check
+    /// begins, however many asks go wrong meanwhile.
+    fn ask_check(&self) {
+        if !self.check_now.load(Ordering::Relaxed) && !self.check_now.swap(true, Ordering::Relaxed)
+        {
+            self.woken.notify_one();
         }
     }
 }
@@ -419,15 +441,19 @@ fn check(process: &std::sync::Weak<Process>, failed: Option<Failed>) {
 
 /// Checks the pod at `address` for as long as `process` is kept, marking the one there down
 /// or up as [`Misses`] says: at once, then one check at a time, each `check_interval` after
-/// the last ended, as Envoy's active health checking does. A check waits `check_timeout` at
-/// most, opening the stream first if there is none, or again at once if it broke; a hung pod
-/// is marked down within about misses x (timeout + interval).
+/// the last ended, as Envoy's active health checking does — but at once after a miss, until
+/// it is answered or the pod marked down, and at once when a worker's ask of it goes wrong,
+/// at most once each interval, as HAProxy's checks do (`fastinter`, `on-error`). A check waits `check_timeout` at most,
+/// opening the stream first if there is none, or again at once if it broke; a pod gone
+/// silent is marked down within about misses x timeout of the first ask that went wrong.
 async fn check_pod(process: std::sync::Weak<Process>, address: String) {
     let mut stream = None;
     let mut misses = Misses::default();
     let mut next = 0_u64;
     // The pod whose misses these are: another at the address, restarted, counts afresh.
     let mut of: Option<Arc<Health>> = None;
+    // When the last check a worker asked for began.
+    let mut asked_at: Option<tokio::time::Instant> = None;
     loop {
         let Some((dial, timeout, limit)) = process.upgrade().map(|held| {
             (
@@ -458,7 +484,36 @@ async fn check_pod(process: std::sync::Weak<Process>, address: String) {
         }
         let interval = held.config.check_interval;
         drop(held);
-        tokio::time::sleep(interval).await;
+        // Missed and not yet marked down: checked again at once, back to back, as HAProxy's
+        // `fastinter` checks a server going down.
+        let going_down =
+            checked == Checked::Missed && of.as_ref().is_some_and(|health| !health.is_down());
+        if going_down {
+            continue;
+        }
+        // Else an interval on, or sooner, a worker's ask of it gone wrong: at once, but at most
+        // once each interval, so that workers timing out on a pod that answers do not have it
+        // checked back to back.
+        match &of {
+            Some(health) => {
+                let regular = tokio::time::Instant::now() + interval;
+                tokio::select! {
+                    () = tokio::time::sleep_until(regular) => {}
+                    () = health.woken.notified() => {
+                        let now = tokio::time::Instant::now();
+                        let asked = asked_at.map_or(now, |at| (at + interval).max(now));
+                        if asked < regular {
+                            tokio::time::sleep_until(asked).await;
+                            asked_at = Some(asked);
+                        } else {
+                            tokio::time::sleep_until(regular).await;
+                        }
+                    }
+                }
+                health.check_now.store(false, Ordering::Relaxed);
+            }
+            None => tokio::time::sleep(interval).await,
+        }
     }
 }
 

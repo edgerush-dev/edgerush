@@ -828,7 +828,7 @@ PY
         return
     fi
     if [ "$1" = sync-mode ]; then
-        printf 'rate_limiting: { mode: synchronous%s, service: { addresses: ["127.0.0.1:7001"], key_secret: 0123456789abcdef0123456789abcdef }, synchronous: { timeout_ms: %s, when_unreachable: %s, health_check: { interval_ms: 100, timeout_ms: 1000, misses: 3 } } }\nlimits_file: %s\n' \
+        printf 'rate_limiting: { mode: synchronous%s, service: { addresses: ["127.0.0.1:7001"], key_secret: 0123456789abcdef0123456789abcdef }, synchronous: { timeout_ms: %s, when_unreachable: %s, health_check: { interval_ms: 100, timeout_ms: 200, misses: 3 } } }\nlimits_file: %s\n' \
             "${RL_MAX_KEY_BYTES:+, max_key_bytes: $RL_MAX_KEY_BYTES}" "$RL_SYNC_TIMEOUT_MS" \
             "$RL_SYNC_UNREACHABLE" "$run-limits.yaml" >>"$config.rl"
         return

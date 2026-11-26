@@ -801,8 +801,8 @@ async fn a_replica_decides_the_keys_of_an_owner_gone_unheard_with_the_store_set_
         .await;
 }
 
-/// A pod that accepts and answers nothing is marked down by its checks alone, one at a time,
-/// within about misses x (timeout + interval): from then on its requests go to
+/// A pod that accepts and answers nothing is marked down by its checks alone, checked again
+/// at once after each miss, within about misses x timeout: from then on its requests go to
 /// `when_unreachable` at once, with no wait. Before that, a request waits its timeout and
 /// marks nothing.
 #[tokio::test]
@@ -857,11 +857,12 @@ async fn a_pod_that_answers_nothing_is_marked_down_by_its_checks() {
         .await;
 }
 
-/// One check at a time: the next starts an interval after the last ended, as Envoy's do,
-/// not on a fixed beat. Each check of a pod that accepts and says nothing opens a connection
-/// of its own, its stream never opened, so the connections accepted show when each began.
+/// After a miss, a pod is checked again at once, back to back, as HAProxy's `fastinter`
+/// checks a server going down; after an answer, an interval on. Each check of a pod that
+/// accepts and says nothing opens a connection of its own, its stream never opened, so the
+/// connections accepted show when each began: a check's timeout apart, not its interval.
 #[tokio::test]
-async fn a_check_begins_an_interval_after_the_last_ended() {
+async fn after_a_miss_a_pod_is_checked_again_at_once() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -885,20 +886,120 @@ async fn a_check_begins_an_interval_after_the_last_ended() {
                     200,
                     "deny",
                 ),
-                200,
+                1_000,
                 200,
                 100,
             );
             // No request: only the checks connect.
             let _serving = serving(&config, 1).await;
-            tokio::time::sleep(Duration::from_millis(1_400)).await;
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
             let began = began.lock().unwrap().clone();
-            assert!(began.len() >= 3, "{} checks", began.len());
+            assert!(began.len() >= 4, "{} checks", began.len());
             for pair in began.windows(2) {
                 let gap = pair[1] - pair[0];
-                // Timeout and interval, a timer's tick short at most; on a beat, 200 ms.
-                assert!(gap >= Duration::from_millis(380), "{gap:?} between checks");
+                // A timeout, a timer's tick short at most; an interval on, over a second.
+                assert!(gap >= Duration::from_millis(180), "{gap:?} between checks");
+                assert!(gap < Duration::from_millis(700), "{gap:?} between checks");
             }
+        })
+        .await;
+}
+
+/// A worker's ask that times out has its pod checked at once, though its interval is ten
+/// seconds: a pod gone silent after its first check answered is marked down within about
+/// misses x timeout of the ask, not at its next check due.
+#[tokio::test]
+async fn a_workers_timeout_has_its_pod_checked_at_once() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 100)],
+                    std::slice::from_ref(&relay.address),
+                    100,
+                    "deny",
+                ),
+                10_000,
+                200,
+                3,
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            let answered = format!(
+                r#"edgerush_rate_limit_pod_checks_total{{pod="{}",outcome="answered"}}"#,
+                relay.address
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), &answered) < Some(1) {
+                assert!(Instant::now() < deadline, "its first check never answered");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            relay.shut_all();
+            let asked = Instant::now();
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            let took = marked(&proxy, &relay.address, true).await;
+            assert!(
+                asked.elapsed() < Duration::from_secs(2),
+                "marked down {took:?} on, {:?} after the ask",
+                asked.elapsed()
+            );
+        })
+        .await;
+}
+
+/// Workers whose every ask of a pod that answers times out have it checked at once, but at
+/// most once each interval: its checks stay a few a second, not back to back.
+#[tokio::test]
+async fn workers_asking_for_checks_have_them_once_each_interval() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let relay = slow_relay(owner, Duration::from_millis(60)).await;
+            let _store =
+                Store::formed(vec![(listener, relay.clone())], &store_config(), None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 1_000)],
+                    std::slice::from_ref(&relay),
+                    20,
+                    "deny",
+                ),
+                500,
+                1_000,
+                3,
+            );
+            let (proxy, _, fronts) = serving_at(&config, 1).await;
+            let answered = format!(
+                r#"edgerush_rate_limit_pod_checks_total{{pod="{relay}",outcome="answered"}}"#
+            );
+            // Its first check answered, every ask then times out for 2 s.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), &answered) < Some(1) {
+                assert!(Instant::now() < deadline, "never checked");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let before = metric(&proxy.metrics(), &answered).unwrap();
+            let mut sends = connected(&fronts).await;
+            let began = Instant::now();
+            let mut asks = 0;
+            while began.elapsed() < Duration::from_secs(2) {
+                assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+                asks += 1;
+            }
+            let checks = metric(&proxy.metrics(), &answered).unwrap() - before;
+            // One asked for once each interval, and an interval after each: about one every
+            // 500 ms over 2 s; back to back, one every 60 ms or so.
+            assert!(asks >= 20, "{asks} asks");
+            assert!(checks <= 9, "{checks} checks in 2 s");
+            assert_eq!(of_pod(&proxy.metrics(), "pod_down", &relay), Some(0));
         })
         .await;
 }
