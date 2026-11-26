@@ -38,27 +38,35 @@ fn mine(value: &Value) -> &asynchronous::Value {
     }
 }
 
-/// Pods 1, 2 and 3 given their first table, as the control plane forms them.
+/// Pods 1, 2 and 3 given their first table, as the control plane forms them, and what they
+/// send then delivered: the first copies among it.
 fn pods() -> Vec<Store> {
     let mut config = Config::defaults();
     config.shards = SHARDS;
     let ids: [NodeId; 3] = [1, 2, 3];
     let members = ids.map(|id| (id, format!("pod-{id}:7000"))).into();
     let first = table::first(&members, SHARDS, 2, 1);
-    ids.iter()
+    let mut pods: Vec<Store> = ids
+        .iter()
         .map(|&id| {
             let peers = ids.iter().copied().filter(|peer| *peer != id);
-            let mut pod = Store::new(id, format!("pod-{id}:7000"), config, peers);
-            let _ = pod.receive(
-                1,
-                Message::TableReply {
-                    table: first.clone(),
-                },
-                ms(1),
-            );
-            pod
+            Store::new(id, format!("pod-{id}:7000"), config, peers)
         })
-        .collect()
+        .collect();
+    let mut going = VecDeque::new();
+    for pod in &mut pods {
+        let from = pod.id();
+        let reply = Message::TableReply {
+            table: first.clone(),
+        };
+        going.extend(
+            pod.receive(1, reply, ms(1))
+                .into_iter()
+                .map(|(to, m)| (from, to, m)),
+        );
+    }
+    deliver(&mut pods, going, ms(1));
+    pods
 }
 
 /// Each pod ticks at `now`, and everything sent is delivered at once, until nothing more is.
@@ -68,6 +76,11 @@ fn step(pods: &mut [Store], now: Time) {
         let from = pod.id();
         going.extend(pod.tick(now).into_iter().map(|(to, m)| (from, to, m)));
     }
+    deliver(pods, going, now);
+}
+
+/// Delivers what is `going`, and what each delivery sends, at `now`, until nothing more is.
+fn deliver(pods: &mut [Store], mut going: VecDeque<(NodeId, NodeId, Message<Value>)>, now: Time) {
     while let Some((from, to, message)) = going.pop_front() {
         let Some(pod) = pods.iter_mut().find(|pod| pod.id() == to) else {
             continue;

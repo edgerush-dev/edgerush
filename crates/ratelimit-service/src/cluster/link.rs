@@ -41,9 +41,9 @@ impl<T> Stream for Received<T> {
     }
 }
 
-/// The most bytes of copies that wait for one peer (decided): the 2 MiB of copies in parts
-/// the store has unanswered to a pod at most, and room for some cycles' copies of one part,
-/// which only the rate keys change at bounds.
+/// The most bytes of copies that wait for one peer (decided): the 2 MiB of whole copies and
+/// repairs the store has unanswered to a pod at most, and room for some cycles' copies of
+/// what changed, which only the rate keys change at bounds.
 pub const COPIES_WAITING: usize = 8 << 20;
 
 /// The most bytes of everything else that wait for one peer (decided): a handoff's part,

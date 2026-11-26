@@ -53,6 +53,12 @@ pub struct Link {
     /// lost waiting twice as long as the one before, and given up after fifteen, as Linux
     /// does; nothing behind it on its lane arrives first. `None`: a message lost is gone.
     pub retransmit: Option<Time>,
+    /// The most bytes that may wait to be sent on its lanes, the bulk copies' and the rest's,
+    /// as a pod's link holds them (`COPIES_WAITING` and `REST_WAITING` in the service): a
+    /// message that would take its lane past that, with something waiting already, is dropped
+    /// and counted in [`Stats::full`]. One lane for everything waits as the rest's. `None`:
+    /// whatever is sent waits its turn.
+    pub waiting: Option<(u64, u64)>,
 }
 
 /// How many times TCP sends a segment again before giving the connection up (Linux's
@@ -91,6 +97,7 @@ impl Link {
             cut: false,
             bandwidth: 125_000_000,
             retransmit: None,
+            waiting: None,
         }
     }
 }
@@ -182,9 +189,14 @@ pub struct Stats {
     /// Parts of copies and handoffs that carried past `part_bytes`, more than one key among
     /// them: never, however many keys a shard holds.
     pub parts_over: u64,
-    /// The most bytes of copies of many parts any owner had unanswered to one replica, by the
+    /// The most bytes of whole copies and repairs any owner had unanswered to one replica, by the
     /// store's count: never past `window_bytes`, however many keys or shards there are.
     pub most_unanswered: u64,
+    /// The most bytes of copies, by the store's count, one pod sent one replica from one tick
+    /// or one message: what its one thread builds at a time, where the world gives work no
+    /// time. A pod's tick that built a megabyte for each of many replicas froze its thread for
+    /// longer than an election waits (#610).
+    pub most_copied_at_once: u64,
     /// Requests counted more than once: a second answer "counted" sent a client for one.
     pub counted_twice: u64,
     /// Requests a client sent that could not reach their pod.
@@ -220,6 +232,8 @@ pub struct Stats {
     pub bytes: u64,
     /// Messages pods sent to pods gone: in a real network each a connection tried and failed.
     pub to_gone: u64,
+    /// Messages dropped as their lane already held what its link's `waiting` lets wait.
+    pub full: u64,
     /// Shards a committed table handed, by plan, to a pod already gone: unserved until it is
     /// failed over again.
     pub moved_to_gone: u64,
@@ -862,18 +876,28 @@ impl World {
             self.found_unreachable(from, to, &message);
             return;
         }
-        let Some(late) = late_by(&link, &mut self.rng) else {
-            return;
-        };
-        // Sent once the link has sent what it already had, taking its size's time.
         let bytes = both::size(&message);
-        let sending = bytes.saturating_mul(1_000_000_000) / link.bandwidth.max(1);
         let bulk = self.lanes
             && matches!(
                 both::as_store(&message),
                 Some(StoreMessage::Replicate { .. })
             );
         let free = self.link_free.get(&(from, to, bulk)).copied().unwrap_or(0);
+        if let Some((copies, rest)) = link.waiting {
+            // What its lane has yet to send, as a pod's link counts what waits on a stream.
+            let waiting =
+                free.saturating_sub(self.now).saturating_mul(link.bandwidth) / 1_000_000_000;
+            let most = if bulk { copies } else { rest };
+            if waiting != 0 && waiting.saturating_add(bytes) > most {
+                self.stats.full += 1;
+                return;
+            }
+        }
+        let Some(late) = late_by(&link, &mut self.rng) else {
+            return;
+        };
+        // Sent once the link has sent what it already had, taking its size's time.
+        let sending = bytes.saturating_mul(1_000_000_000) / link.bandwidth.max(1);
         let sent = self.now.max(free) + sending;
         self.link_free.insert((from, to, bulk), sent);
         self.stats.bytes += bytes;
@@ -1002,6 +1026,19 @@ impl World {
 
     /// Sends what pod `id` gave back, then checks what must never happen.
     fn after(&mut self, id: NodeId, out: Vec<(NodeId, Message)>) {
+        let mut copied: BTreeMap<NodeId, u64> = BTreeMap::new();
+        for (to, message) in &out {
+            if let Some(StoreMessage::Replicate {
+                entries, dropped, ..
+            }) = both::as_store(message)
+            {
+                *copied.entry(*to).or_default() +=
+                    entries.iter().map(|(_, kept)| kept.bytes()).sum::<u64>()
+                        + KEY_BYTES * dropped.len() as u64;
+            }
+        }
+        let most = copied.into_values().max().unwrap_or(0);
+        self.stats.most_copied_at_once = self.stats.most_copied_at_once.max(most);
         for (to, message) in out {
             self.send(id, to, message);
         }

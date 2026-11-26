@@ -438,7 +438,27 @@ fn answers_relayed_are_passed_on_to_their_data_plane() {
 /// A poll answers with the bucket and keeps the key, but is no change to copy.
 #[test]
 fn a_poll_is_answered_and_marks_nothing_to_copy() {
-    let mut pod = member();
+    // Its replicas holding the whole copies it sent them, so that what changes goes to them.
+    let mut pod = Pod::new(1, "pod-1:7000".to_owned(), config(), [2, 3]);
+    let sent = pod.receive(2, StoreMessage::TableReply { table: first() }, ms(1));
+    for (to, message) in sent {
+        if let Message::Store(StoreMessage::Replicate {
+            shard,
+            term,
+            assignment,
+            version,
+            ..
+        }) = message
+        {
+            let held = StoreMessage::Replicated {
+                shard,
+                term,
+                assignment,
+                version,
+            };
+            let _ = pod.receive(to, held, ms(1));
+        }
+    }
     lease(&mut pod, ms(2));
     let own = key_of(1);
     let answers = pod.batch(batch(first().stamp(), 0, vec![poll(own)]), ms(3));

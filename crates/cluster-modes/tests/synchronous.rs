@@ -495,7 +495,28 @@ fn a_refused_request_sends_its_replicas_nothing() {
 /// as safe as the whole.
 #[test]
 fn a_rolling_windows_copy_carries_only_the_slots_changed() {
-    let mut node = member();
+    // Its replicas holding the whole copies it sent them, so that what changes goes to them.
+    let mut node = Pod::new(2, "pod-2:7000".to_owned(), config(), [1, 3]);
+    let members = [1, 2, 3].map(|id| (id, format!("pod-{id}:7000"))).into();
+    let table = table::first(&members, 4, 2, 1);
+    for (to, message) in node.receive(1, StoreMessage::TableReply { table }, ms(1)) {
+        if let Message::Store(StoreMessage::Replicate {
+            shard,
+            term,
+            assignment,
+            version,
+            ..
+        }) = message
+        {
+            let held = StoreMessage::Replicated {
+                shard,
+                term,
+                assignment,
+                version,
+            };
+            let _ = node.receive(to, held, ms(1));
+        }
+    }
     let table = node.store().committed().cloned().unwrap();
     let shard = (0..4).find(|shard| table.owner(*shard) == Some(2)).unwrap();
     for peer in [1, 3] {

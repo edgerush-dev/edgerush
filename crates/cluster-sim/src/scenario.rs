@@ -93,7 +93,7 @@ pub struct Shape {
     pub replicas: usize,
     /// The most one part of a copy or a handoff carries: small, for copies in many parts.
     pub part_bytes: u64,
-    /// The most of copies of many parts unanswered to one pod: small, for copies paced.
+    /// The most of whole copies and repairs unanswered to one pod: small, for copies paced.
     pub window_bytes: u64,
 }
 

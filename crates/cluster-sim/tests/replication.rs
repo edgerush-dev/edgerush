@@ -199,6 +199,79 @@ fn a_pod_joining_over_a_slow_link_is_copied_each_shard_once() {
     }
 }
 
+/// A pod replaced in a cluster whose every shard is copied whole in one part, over links that
+/// drop what passes their queues as a pod's do (#610): the owners left copy each shard to its
+/// new replicas within the window, so that none is dropped or sent twice, and no tick or
+/// message makes more than the window's worth of copies for one replica; a leader is elected
+/// within the usual time, the new pod let in, and every pod comes to hold every key.
+///
+/// The world gives work no time, so it cannot see a pod's thread frozen past an election, as
+/// #610's was by building every copy at once: what one step makes is what stands for it.
+#[test]
+fn a_pod_replaced_is_copied_whole_shards_no_faster_than_their_answers() {
+    // 256 shards of 200 keys, each shard about 10 KB, within one part of 16 KiB: an owner left
+    // with half the shards has well over a megabyte to copy to a replica, where the queue of
+    // copies to it holds 128 KiB, four windows, as a pod's 8 MiB is four of its 2 MiB. Every
+    // copy at once, most were dropped, and made again every 50 ms faster than any got through.
+    let replaced = Shape {
+        preload: 200,
+        clients: 0,
+        part_bytes: 16 << 10,
+        window_bytes: 32 << 10,
+        ..Shape::defaults()
+    };
+    let keys = 200 * usize::from(replaced.shards);
+    for seed in SEEDS {
+        let (mut world, _) = scenario::cluster(seed, replaced);
+        world.set_default_link(Link {
+            waiting: Some((128 << 10, 32 << 10)),
+            ..Link::lan()
+        });
+        let before = (world.stats.full, world.stats.copies_again);
+        world.stats.most_copied_at_once = 0;
+        let leader = world.leader().unwrap();
+        world.crash(leader);
+        let elected = world.run_while_not(ms(1_500), |world| world.leader().is_some());
+        assert!(elected.is_some(), "seed {seed}: no leader");
+        world.run_for(ms(1_000));
+        let new = world.add_pod();
+        let whole = |world: &World| {
+            world.settled()
+                && world
+                    .alive()
+                    .all(|pod| world.node(pod).is_some_and(|node| node.key_count() == keys))
+        };
+        assert!(
+            world.run_while_not(ms(10_000), whole).is_some(),
+            "seed {seed}: {new} never in, every key held by every pod"
+        );
+        assert_eq!(
+            world.stats.full - before.0,
+            0,
+            "seed {seed}: dropped, its queue full"
+        );
+        assert_eq!(
+            world.stats.copies_again - before.1,
+            0,
+            "seed {seed}: sent twice"
+        );
+        assert_eq!(
+            world.stats.parts_more, 0,
+            "seed {seed}: a copy in many parts"
+        );
+        assert!(
+            world.stats.most_copied_at_once <= replaced.window_bytes + replaced.part_bytes,
+            "seed {seed}: {} bytes of copies made at once",
+            world.stats.most_copied_at_once
+        );
+        assert!(
+            world.stats.violations.is_empty(),
+            "{:?}",
+            world.stats.violations
+        );
+    }
+}
+
 /// Past `max_key_bytes`, every pod evicts down within it, owned keys and copies alike, and an
 /// owner's evictions reach its replicas: no replica keeps a key its owner evicted, so one
 /// promoted when the owner crashes brings none of them back at their old counts.

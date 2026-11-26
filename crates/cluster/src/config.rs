@@ -38,10 +38,14 @@ pub struct Config {
     /// so that what a message carries, and what its receiver holds of one, stays within this
     /// however many keys a shard holds.
     pub part_bytes: u64,
-    /// The most bytes of copies of many parts, by the same count, an owner has unanswered to
-    /// one replica, across its shards: each part goes once its answers leave room for a part
-    /// this size, one always when none is unanswered, so that what either end holds of copies
-    /// in progress stays within this however many keys or shards there are.
+    /// The most bytes of whole copies and repairs, of one part or many, by the same count, an
+    /// owner has unanswered to one replica, across its shards: each part goes once its answers
+    /// leave room for a part this size, one always when none is unanswered, so that what
+    /// either end holds of copies in progress, and what one pass makes of them, stays within
+    /// this however many keys or shards there are. Each cycle's copy of what changed goes at
+    /// once, outside it: bounded by the rate keys change at, and kept from waiting behind a
+    /// large copy so that replicas stay current; but none to a replica still taking its whole
+    /// copy of the shard, which could not follow it, until that copy is in.
     pub window_bytes: u64,
     /// How far a peer's wall clock may be off from a pod's before the pod warns of it: nothing
     /// corrects for skew, and copies carry wall-clock times taken to agree.

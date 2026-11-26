@@ -102,8 +102,8 @@ struct Taking {
 /// tells the two apart: a part of one is never answered, nor its answer counted, as the other's.
 type CopyName = (u64, u64, Option<u64>, u64);
 
-/// As owner: a copy of many parts to one replica, sent a few unanswered parts ahead, each cut
-/// as it goes from what the shard holds then.
+/// As owner: a whole copy or a repair to one replica, of one part or many, sent a few
+/// unanswered parts ahead, each cut as it goes from what the shard holds then.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Sending {
     /// The copy: its shard term, the replica's assignment, the copy it follows, its number,
@@ -247,7 +247,8 @@ pub struct Node<V> {
     acked: BTreeMap<(ShardId, NodeId), u64>,
     behind: BTreeMap<(ShardId, NodeId), Time>,
     /// As owner: for each replica, each copy it has not yet said it holds, by the copy's
-    /// number: when it went, and its keys, what a repair sends again.
+    /// number: when it went, and its keys, what a repair sends again. Behind a whole copy going
+    /// to it, what changed after the copy's number is one record, under the latest number.
     unacked: BTreeMap<(ShardId, NodeId), BTreeMap<u64, Unanswered>>,
     /// As owner: for each replica, how long its last answer that said more took, from the
     /// copy it answered.
@@ -264,7 +265,7 @@ pub struct Node<V> {
     copied_under: BTreeMap<ShardId, Stamp>,
     /// As replica: each copy of a shard coming in parts, by the shard and the pod sending it.
     taking: BTreeMap<(ShardId, NodeId), Taking>,
-    /// As owner: each copy of many parts going to a replica, by the replica and the shard.
+    /// As owner: each copy going to a replica part by part, by the replica and the shard.
     sending: BTreeMap<(NodeId, ShardId), Sending>,
     /// As taker: each owner's last changes of a shard coming in parts, by the shard and that
     /// owner: their shard term and the number of the part that comes next in turn.
@@ -1453,35 +1454,78 @@ impl<V: Held> Node<V> {
             let alone = entries.len() + dropped.len() <= 1 || bytes <= self.config.part_bytes;
             for replica in &copies_to(&table, shard) {
                 let mut assignment = self.assignment(shard, *replica);
+                let whole_from = self
+                    .sending
+                    .get(&(*replica, shard))
+                    .filter(|sending| sending.after.is_none())
+                    .map(|sending| sending.version);
                 let unacked = self.unacked.entry((shard, *replica)).or_default();
-                unacked.insert(
-                    version,
-                    Unanswered {
-                        at: now,
-                        keys: keys.clone(),
-                    },
-                );
-                if unacked.len() > UNACKED_MOST {
-                    // The two oldest kept as one, under the later number, from when the older
-                    // went: an answer covering that number covers both.
-                    if let (Some((_, older)), Some((number, newer))) =
-                        (unacked.pop_first(), unacked.pop_first())
-                    {
-                        let keys = older.keys.union(&newer.keys).copied().collect();
-                        unacked.insert(number, Unanswered { at: older.at, keys });
-                    }
-                    // Unanswered so long that the keys to send it again outnumber those the
-                    // shard holds, gone ones among them: a new assignment in their place, the
-                    // repair sending it the whole shard, so that what it keeps stays within
-                    // the shard's size.
-                    let kept: BTreeSet<&Key> =
-                        unacked.values().flat_map(|copy| &copy.keys).collect();
-                    if kept.len() > held {
-                        assignment = self.assign(shard, *replica);
+                // Unanswered so long that the keys to send it again outnumber those the shard
+                // holds, gone ones among them: a new assignment in their place, the repair
+                // sending it the whole shard, so that what it keeps stays within the shard's
+                // size.
+                let over;
+                // Behind a whole copy going, nothing of what changes goes to its replica to be
+                // answered on its own (below): what changes after the copy's number is kept as
+                // one record, under the latest number, for the repair after the copy, its size
+                // known at once, rather than a record a cycle that the bound below would merge
+                // and count again every cycle (#610: ~170 shards' worth a cycle, for a new
+                // member taking them whole, kept its owner's thread busy for seconds).
+                let behind_whole = whole_from
+                    .filter(|from| {
+                        unacked
+                            .last_key_value()
+                            .is_some_and(|(number, _)| number > from)
+                    })
+                    .and_then(|_| unacked.pop_last());
+                // The record keeps when its oldest change was made, as two records kept as one
+                // keep the older's time.
+                if let Some((_, mut since)) = behind_whole {
+                    since.keys.extend(keys.iter().copied());
+                    over = since.keys.len() > held;
+                    unacked.insert(version, since);
+                } else {
+                    unacked.insert(
+                        version,
+                        Unanswered {
+                            at: now,
+                            keys: keys.clone(),
+                        },
+                    );
+                    if unacked.len() > UNACKED_MOST {
+                        // The two oldest kept as one, under the later number, from when the
+                        // older went: an answer covering that number covers both.
+                        if let (Some((_, older)), Some((number, newer))) =
+                            (unacked.pop_first(), unacked.pop_first())
+                        {
+                            let keys = older.keys.union(&newer.keys).copied().collect();
+                            unacked.insert(number, Unanswered { at: older.at, keys });
+                        }
+                        let kept: BTreeSet<&Key> =
+                            unacked.values().flat_map(|copy| &copy.keys).collect();
+                        over = kept.len() > held;
+                    } else {
+                        over = false;
                     }
                 }
+                if over {
+                    assignment = self.assign(shard, *replica);
+                }
                 let under = self.committed_stamp();
+                // A replica still taking its whole copy of the shard could not follow what
+                // changed until it holds that copy, only add the keys, which the repair after
+                // the copy sends again: what changed waits in `unacked` for that repair, rather
+                // than fill the replica's queue behind the copies it waits for (#610). Behind a
+                // repair going it goes at once, as to a replica that holds the shard, so that
+                // a replica repaired while the shard keeps changing catches up.
+                let taking_whole = self
+                    .sending
+                    .get(&(*replica, shard))
+                    .is_some_and(|sending| sending.after.is_none());
                 if alone {
+                    if taking_whole {
+                        continue;
+                    }
                     let copy = Message::Replicate {
                         shard,
                         term: entry.term,
@@ -1529,7 +1573,7 @@ impl<V: Held> Node<V> {
                     self.behind.remove(&copy);
                     continue;
                 }
-                // A copy in parts going to it is its repair, sent again part by part.
+                // A copy going to it is its repair, sent again part by part.
                 if self.sending.contains_key(&(*replica, shard)) {
                     continue;
                 }
@@ -1604,9 +1648,11 @@ impl<V: Held> Node<V> {
         self.next_assignment
     }
 
-    /// Sends `copy` of `shard` to `replica`, in place of any going to it: at once if it fits one
-    /// part, as every copy did before copies went in parts; else part by part, as
-    /// [`pace`](Self::pace) makes room.
+    /// Sends `copy` of `shard` to `replica`, in place of any going to it, part by part as
+    /// [`pace`](Self::pace) makes room: a copy of one part as any other, so that whole copies
+    /// and repairs, however small each is, stay within the window together (#610: sent at
+    /// once, those of one part overran the queue to their replica, and were made again and
+    /// again).
     fn start(
         &mut self,
         replica: NodeId,
@@ -1615,36 +1661,12 @@ impl<V: Held> Node<V> {
         now: Time,
         out: &mut Outbox<V>,
     ) {
-        self.sending.remove(&(replica, shard));
-        let held = self.data.shard(shard);
-        let (keys, bytes) = match &copy.keys {
-            None => held.map_or((0, 0), |held| {
-                (held.len(), held.values().map(Kept::bytes).sum())
-            }),
-            Some(keys) => (
-                keys.len(),
-                keys.iter()
-                    .map(|key| {
-                        held.and_then(|held| held.get(key))
-                            .map_or(KEY_BYTES, Kept::bytes)
-                    })
-                    .sum(),
-            ),
-        };
-        if keys <= 1 || bytes <= self.config.part_bytes {
-            let (entries, dropped) = match &copy.keys {
-                None => (self.all_of(shard), Vec::new()),
-                Some(keys) => self.split(shard, keys.iter().copied()),
-            };
-            out.push((replica, copy.part(shard, (0, false), entries, dropped)));
-            return;
-        }
         self.sending
             .insert((replica, shard), Sending { at: now, ..copy });
         self.pace(now, out);
     }
 
-    /// Sends the parts of copies going in parts that their answers make room for — at most
+    /// Sends the parts of copies going that their answers make room for — at most
     /// `window_bytes` unanswered to any one replica, across its shards, in shard order — and
     /// again, from the first, those unanswered for [`PART_AGAIN`] cycles, each over the keys it
     /// was.
@@ -1694,8 +1716,7 @@ impl<V: Held> Node<V> {
         }
     }
 
-    /// The bytes of copies of many parts it has unanswered to each replica, by the store's
-    /// count.
+    /// The bytes of copies going it has unanswered to each replica, by the store's count.
     fn unanswered(&self) -> BTreeMap<NodeId, u64> {
         let mut unanswered: BTreeMap<NodeId, u64> = BTreeMap::new();
         for ((replica, _), sending) in &self.sending {
@@ -1706,8 +1727,8 @@ impl<V: Held> Node<V> {
         unanswered
     }
 
-    /// The most bytes of copies of many parts it has unanswered to any one replica, by the
-    /// store's count: never past `window_bytes`, but for a part of one key past it.
+    /// The most bytes of whole copies and repairs it has unanswered to any one replica, by
+    /// the store's count: never past `window_bytes`, but for a part of one key past it.
     #[must_use]
     pub fn most_unanswered_bytes(&self) -> u64 {
         self.unanswered().into_values().max().unwrap_or(0)
@@ -1843,18 +1864,6 @@ impl<V: Held> Node<V> {
         (entries, dropped)
     }
 
-    /// Every key it holds of `shard`, with its value.
-    fn all_of(&self, shard: ShardId) -> Vec<(Key, Kept<V>)> {
-        self.data
-            .shard(shard)
-            .map(|keys| {
-                keys.iter()
-                    .map(|(key, value)| (*key, value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// As an owner asked to move a shard: stops answering for it and sends all it holds to the
     /// member taking it, again every [`HANDOFF_AGAIN`] cycles until the table moves it, or drops the
     /// move and the shard is answered for again.
@@ -1895,9 +1904,14 @@ impl<V: Held> Node<V> {
                 self.start(to, shard, copy, now, out);
                 continue;
             }
-            let whole = self.acked.get(&copy).is_some_and(|acked| *acked > 0);
+            let acked = self.acked.get(&copy).copied().unwrap_or(0);
+            let whole = acked > 0;
             let unacked = self.unacked.get(&copy);
-            let behind = unacked.map_or(0, BTreeMap::len);
+            // How many cycles' copies it has yet to answer, by their numbers, one a cycle that
+            // changed the shard: behind a whole copy, those cycles' changes are one record.
+            let behind = unacked
+                .and_then(BTreeMap::last_key_value)
+                .map_or(0, |(number, _)| number.saturating_sub(acked));
             // The copies on their way not held against it: its oldest copy unanswered no
             // older than its last round trip and `CAUGHT_UP` cycles, so that a taker far away
             // under a write every cycle is caught up as one close by is.
@@ -1916,7 +1930,7 @@ impl<V: Held> Node<V> {
                 .announced
                 .get(&shard)
                 .is_some_and(|(_, _, at)| now.saturating_sub(*at) < again);
-            if !whole || (behind > CAUGHT_UP && !within_its_trip) || told {
+            if !whole || (behind > CAUGHT_UP as u64 && !within_its_trip) || told {
                 continue;
             }
             // Caught up: the taker told, to tell the leader itself — a taker gone tells nobody,
@@ -2314,6 +2328,7 @@ impl<V: Held> Node<V> {
                 if owner.is_some() && current {
                     let copy = (shard, from);
                     let acked = self.acked.entry(copy).or_insert(0);
+                    let mut lost = false;
                     if version > *acked {
                         // It has said more: no longer behind since before, nor owed those copies;
                         // how long the copy it answered took, there and back.
@@ -2332,6 +2347,21 @@ impl<V: Held> Node<V> {
                         // taken over this one — and is sent the shard again.
                         *acked = 0;
                         self.unacked.remove(&copy);
+                        lost = true;
+                    }
+                    let acked = *acked;
+                    // A copy going to it ends here: in, once it says it holds that copy's number,
+                    // as a copy of one part is answered by this alone; or of no use, once what
+                    // it says it holds is past what the copy follows, or lost, so that the copy
+                    // cannot follow it — the repairs take it from there.
+                    let ends = self.sending.get(&(from, shard)).is_some_and(|sending| {
+                        (sending.term, sending.assignment) == (term, assignment)
+                            && (version >= sending.version
+                                || sending.after.is_some_and(|after| lost || acked > after))
+                    });
+                    if ends {
+                        self.sending.remove(&(from, shard));
+                        self.pace(now, &mut out);
                     }
                 }
             }
@@ -2881,7 +2911,8 @@ const PART_AGAIN: Time = 25;
 
 /// The most unanswered copies an owner keeps a record of for one replica: past it, the two
 /// oldest are kept as one, so that a repair sends a few keys more, and the record stays
-/// within the shard's keys however long a replica goes unanswering.
+/// within the shard's keys however long a replica goes unanswering. Behind a whole copy going,
+/// a replica's changes are one record already, so it never comes to this.
 const UNACKED_MOST: usize = 64;
 
 /// How often a pod lets go of what it keeps of copies that will not finish.
@@ -3066,7 +3097,26 @@ mod tests {
         let mut node = Node::new(1, address(1), capped, [2, 3]);
         let members = named(&[1, 2, 3]);
         let table = table::first(&members, 4, 2, 1);
-        let _ = node.receive(2, Message::TableReply { table }, ms(1));
+        let sent = node.receive(2, Message::TableReply { table }, ms(1));
+        // Each replica holding its whole copy, so that what changes goes to it.
+        for (replica, copy) in sent {
+            if let Message::Replicate {
+                shard,
+                term,
+                assignment,
+                version,
+                ..
+            } = copy
+            {
+                let held = Message::Replicated {
+                    shard,
+                    term,
+                    assignment,
+                    version,
+                };
+                let _ = node.receive(replica, held, ms(1));
+            }
+        }
         let keys: Vec<Key> = (0..).filter(|key| shard_of(*key, 4) == 0).take(3).collect();
         for key in &keys {
             node.load(*key, Counts::of(1));
@@ -3862,15 +3912,23 @@ mod tests {
     /// keys a part, two parts' worth unanswered at most, 1 holding `per` keys of count 1 in each shard it owns before it takes the
     /// table, so that its first copies to its replicas carry them; with what 1 sent 2 then.
     fn owner_of_many_parts(per: usize) -> (Node, Node, Outbox) {
+        owner_copying_over(8, per)
+    }
+
+    /// As [`owner_of_many_parts`], over `shards` shards.
+    fn owner_copying_over(shards: u16, per: usize) -> (Node, Node, Outbox) {
         let mut config = config();
-        config.shards = 8;
+        config.shards = shards;
         config.part_bytes = 3 * Kept::new(Counts::of(1)).bytes();
         config.window_bytes = 2 * config.part_bytes;
-        let first = table::first(&named(&[1, 2, 3]), 8, 2, 1);
+        let first = table::first(&named(&[1, 2, 3]), shards, 2, 1);
         let mut owner = Node::new(1, address(1), config, [2, 3]);
         let owned: Vec<ShardId> = first.owned_by(1).collect();
         for shard in owned {
-            for key in (0..).filter(|key| shard_of(*key, 8) == shard).take(per) {
+            for key in (0..)
+                .filter(|key| shard_of(*key, shards) == shard)
+                .take(per)
+            {
                 owner.load(key, Counts::of(1));
             }
         }
@@ -3987,6 +4045,30 @@ mod tests {
         let (mut owner, mut replica, sent) = owner_of_many_parts(10);
         let shards = owned_by_1(&owner);
         assert!(shards.len() >= 2, "too few shards of 1's: {shards:?}");
+        let ahead = sent
+            .iter()
+            .filter(|(to, message)| *to == 2 && matches!(message, Message::Replicate { .. }))
+            .count();
+        assert_eq!(ahead, 2, "sent ahead of its answers: {sent:?}");
+        let (most, said) = exchange(&mut owner, &mut replica, sent, ms(2), |_| true);
+        assert_eq!(most, 2);
+        assert_eq!(said.len(), shards.len(), "said held: {said:?}");
+        for shard in shards {
+            assert_eq!(counts_of(&replica, shard), counts_of(&owner, shard));
+        }
+        assert_eq!(unanswered_to_2(&owner), 0);
+        assert!(owner.sending.keys().all(|(replica, _)| *replica != 2));
+    }
+
+    /// Whole copies each of one part go within the window as copies of many parts do (#610):
+    /// an owner of many shards to copy to one replica sends two parts' worth ahead of their
+    /// answers, not every shard at once, the next as one is said held, until every shard is
+    /// copied and none is left going.
+    #[test]
+    fn whole_copies_of_one_part_go_no_faster_than_their_answers() {
+        let (mut owner, mut replica, sent) = owner_copying_over(32, 2);
+        let shards = owned_by_1(&owner);
+        assert!(shards.len() >= 4, "too few shards of 1's: {shards:?}");
         let ahead = sent
             .iter()
             .filter(|(to, message)| *to == 2 && matches!(message, Message::Replicate { .. }))
@@ -5040,6 +5122,125 @@ mod tests {
         );
     }
 
+    /// A taker that answers its whole copy only after a dozen cycles of writes is not caught
+    /// up on that answer: what changed meanwhile, kept as one record behind the copy, counts
+    /// as the cycles it spans, not as one copy. Once the repair after the copy is answered, it
+    /// is.
+    #[test]
+    fn a_taker_answering_its_whole_copy_late_is_caught_up_once_repaired() {
+        let lease = |node: &mut Node, now: Time| {
+            for peer in [1, 3] {
+                let beat = Message::Heartbeat {
+                    term: 1,
+                    leader: Some(1),
+                    committed: node.committed_stamp(),
+                    fresh: false,
+                    sent: now,
+                    wall: 0,
+                    hears: vec![(1, now), (2, now), (3, now)],
+                    leased: true,
+                };
+                let _ = node.receive(peer, beat, now);
+            }
+        };
+        let answer = |message: &Message<Counts>, shard| match message {
+            Message::Replicate {
+                term,
+                assignment,
+                version,
+                more: false,
+                ..
+            } => Some(Message::Replicated {
+                shard,
+                term: *term,
+                assignment: *assignment,
+                version: *version,
+            }),
+            _ => None,
+        };
+        // One replica a shard, so that a shard of pod 2's has a peer that does not copy it.
+        let mut owner = Node::new(2, address(2), config(), [1, 3]);
+        let first = table::first(&named(&[1, 2, 3]), 4, 1, 1);
+        let _ = owner.receive(1, Message::TableReply { table: first }, ms(1));
+        let table = owner.committed().cloned().unwrap();
+        // A taker that does not copy the shard yet, so that it takes it whole.
+        let Some((shard, taker)) = (0..4)
+            .filter(|shard| table.owner(*shard) == Some(2))
+            .find_map(|shard| {
+                let copies = copies_to(&table, shard);
+                [1, 3]
+                    .into_iter()
+                    .find(|pod| !copies.contains(pod))
+                    .map(|pod| (shard, pod))
+            })
+        else {
+            panic!("pod 2 owns no shard a peer does not copy");
+        };
+        let told = |out: &Outbox| {
+            out.iter()
+                .any(|(to, message)| *to == taker && matches!(message, Message::CaughtUp { .. }))
+        };
+        let key = key_in(shard);
+        lease(&mut owner, ms(2));
+        let mut moving = table;
+        moving.version = 2;
+        moving.moves = vec![(shard, taker, moving.stamp())];
+        let whole_in = |out: &Outbox| {
+            out.iter().find_map(|(to, message)| {
+                let whole = matches!(message, Message::Replicate { after: None, .. });
+                (*to == taker && whole)
+                    .then(|| answer(message, shard))
+                    .flatten()
+            })
+        };
+        let mut whole = whole_in(&owner.receive(1, Message::TableReply { table: moving }, ms(3)));
+        let cycle = owner.config.cycle;
+        let at = |step: u64| ms(3) + step * cycle;
+        for step in 1..=12 {
+            lease(&mut owner, at(step));
+            let _ = owner.update(key, at(step), |kept, _| {
+                kept.value.add(1);
+                kept.forget_at = Time::MAX;
+                ((), Changed::Whole)
+            });
+            let out = owner.tick(at(step));
+            assert!(!told(&out), "told before its whole copy was answered");
+            whole = whole.or_else(|| whole_in(&out));
+        }
+        let Some(whole) = whole else {
+            panic!("no whole copy to the taker");
+        };
+        let _ = owner.receive(taker, whole, at(13));
+        // The repair goes once it has been behind `REPAIR_AFTER` cycles.
+        let repaired = 13 + REPAIR_AFTER + 2;
+        let mut repair = None;
+        for step in 13..=repaired {
+            lease(&mut owner, at(step));
+            let out = owner.tick(at(step));
+            assert!(
+                !told(&out),
+                "told it caught up, a dozen cycles' changes unanswered"
+            );
+            repair = repair.or_else(|| {
+                out.iter().find_map(|(to, message)| {
+                    let repair = matches!(message, Message::Replicate { after: Some(_), .. });
+                    (*to == taker && repair)
+                        .then(|| answer(message, shard))
+                        .flatten()
+                })
+            });
+        }
+        let Some(repair) = repair else {
+            panic!("no repair after the whole copy");
+        };
+        let _ = owner.receive(taker, repair, at(repaired + 1));
+        let caught_up = (repaired + 1..=repaired + 5).any(|step| {
+            lease(&mut owner, at(step));
+            told(&owner.tick(at(step)))
+        });
+        assert!(caught_up, "never told once the repair was answered");
+    }
+
     /// The handoff's waits are five copy cycles, as long as the cycle is configured: at a
     /// cycle of 20 ms, an owner whose taker has caught up tells it so again every 100 ms, and
     /// a taker named the owner, the old owner's last changes never coming, serves after 100
@@ -5233,33 +5434,40 @@ mod tests {
         (owner, shard, assignment, version)
     }
 
-    /// A replica that never answers is repaired every five copy cycles, as long as the cycle
-    /// is configured: 100 ms apart at a cycle of 20 ms, not the defaults' 50 ms.
+    /// A copy its replica never answers is sent again every twenty-five copy cycles, as long as
+    /// the cycle is configured — 500 ms apart at a cycle of 20 ms, not the defaults' 250 ms —
+    /// and is the same copy each time, never made again while it goes (#610: made again every
+    /// five, copies the queue had dropped were made again faster than any got through).
     #[test]
-    fn a_replica_unanswering_is_repaired_every_five_cycles() {
+    fn a_copy_unanswered_goes_again_every_twenty_five_cycles() {
         let mut config = config();
         config.cycle = ms(20);
-        let (mut owner, shard, _, _) = owner_copying_to_2_under(config);
-        let repairs: Vec<Time> = (1..200)
-            .map(|step| ms(1 + step * 5))
-            .filter(|now| {
-                owner.tick(*now).iter().any(|(to, message)| {
-                    *to == 2
-                        && matches!(
-                            message,
-                            Message::Replicate { shard: copied, after: None, .. }
-                                if *copied == shard
-                        )
-                })
-            })
-            .collect();
-        assert!(repairs.len() >= 3, "repaired at {repairs:?}");
-        for pair in repairs.windows(2) {
-            let apart = pair[1] - pair[0];
+        let (mut owner, shard, _, version) = owner_copying_to_2_under(config);
+        let mut again: Vec<(Time, u64)> = vec![(ms(1), version)];
+        for step in 1..450 {
+            let now = ms(1 + step * 5);
+            for (to, message) in owner.tick(now) {
+                if let Message::Replicate {
+                    shard: copied,
+                    after: None,
+                    version,
+                    ..
+                } = message
+                    && to == 2
+                    && copied == shard
+                {
+                    again.push((now, version));
+                }
+            }
+        }
+        assert!(again.len() >= 4, "sent at {again:?}");
+        for pair in again.windows(2) {
+            let apart = pair[1].0 - pair[0].0;
             assert!(
-                (ms(100)..=ms(120)).contains(&apart),
-                "repaired {apart} ns apart: {repairs:?}"
+                (ms(500)..=ms(520)).contains(&apart),
+                "sent {apart} ns apart: {again:?}"
             );
+            assert_eq!(pair[1].1, version, "made again: {again:?}");
         }
     }
 
@@ -5287,6 +5495,185 @@ mod tests {
             })
         });
         assert!(again, "never sent the shard again");
+    }
+
+    /// A repair going that what its replica then says no longer follows from — it says it
+    /// holds nothing of this owner's — is let go, and the replica sent the shard whole at the
+    /// next repair, not the repair that cannot follow again.
+    #[test]
+    fn a_repair_the_replica_moves_off_is_let_go() {
+        let (mut owner, shard, assignment, version) = owner_copying_to_2();
+        let said = |version| Message::Replicated {
+            shard,
+            term: 1,
+            assignment,
+            version,
+        };
+        let _ = owner.receive(2, said(version), ms(2));
+        let key = (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0);
+        owner.data.insert(shard, key, Kept::new(Counts::of(1)));
+        owner.dirty.entry(shard).or_default().insert(key);
+        let sent_to_2 = |out: &Outbox, whole: bool| {
+            out.iter().any(|(to, message)| {
+                *to == 2
+                    && matches!(
+                        message,
+                        Message::Replicate { shard: copied, after, .. }
+                            if *copied == shard && after.is_none() == whole
+                    )
+            })
+        };
+        // The changes and their repair go, and are lost.
+        let following = (1..30)
+            .filter(|at| sent_to_2(&owner.tick(ms(2 + at * 5)), false))
+            .count();
+        assert!(following >= 2, "changes and a repair: {following}");
+        let _ = owner.receive(2, said(0), ms(153));
+        let whole = (1..40).any(|at| sent_to_2(&owner.tick(ms(153 + at * 5)), true));
+        assert!(whole, "never sent the shard whole");
+    }
+
+    /// The copies of what changed in `shard` that `out` sends 2.
+    fn changes_to_2(out: &Outbox, shard: ShardId) -> Vec<&Message<Counts>> {
+        out.iter()
+            .filter(|(to, message)| {
+                *to == 2
+                    && matches!(
+                        message,
+                        Message::Replicate { shard: copied, after: Some(_), .. } if *copied == shard
+                    )
+            })
+            .map(|(_, message)| message)
+            .collect()
+    }
+
+    /// A replica still taking its whole copy of a shard is sent none of what changes in it
+    /// meanwhile, which it could not follow (#610: they filled its queue behind the copies it
+    /// waited for); once it says it holds the copy, what changed goes to it, following it.
+    #[test]
+    fn changes_wait_for_the_whole_copy_going() {
+        let (mut owner, shard, assignment, version) = owner_copying_to_2();
+        let key = (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0);
+        // Short of 250 ms, when the copy unanswered goes again.
+        for at in 1..20 {
+            owner.data.insert(shard, key, Kept::new(Counts::of(at)));
+            owner.dirty.entry(shard).or_default().insert(key);
+            let out = owner.tick(ms(1 + at * 5));
+            let sent = changes_to_2(&out, shard);
+            assert!(
+                sent.is_empty(),
+                "sent changes with the copy going: {sent:?}"
+            );
+        }
+        let held = Message::Replicated {
+            shard,
+            term: 1,
+            assignment,
+            version,
+        };
+        let _ = owner.receive(2, held, ms(100));
+        let following = (1..30).any(|at| {
+            changes_to_2(&owner.tick(ms(100 + at * 5)), shard)
+                .iter()
+                .any(|message| {
+                    matches!(
+                        message,
+                        Message::Replicate { after, entries, .. }
+                            if *after == Some(version) && entries.iter().any(|(copied, _)| *copied == key)
+                    )
+                })
+        });
+        assert!(following, "what changed never followed the copy");
+    }
+
+    /// What changes behind a whole copy going is kept for its replica as one record, however
+    /// long the copy takes, not one a cycle that the bound on records would merge and count
+    /// again every cycle (#610: ~170 shards' worth a cycle kept a new owner's thread busy for
+    /// seconds); once the copy is in, the repair after it sends every key changed meanwhile.
+    #[test]
+    fn changes_behind_a_whole_copy_are_kept_as_one_record() {
+        let (mut owner, shard, assignment, version) = owner_copying_to_2();
+        let keys: Vec<Key> = (0..)
+            .filter(|key| shard_of(*key, 4) == shard)
+            .take(100)
+            .collect();
+        // A key changed each cycle, past `UNACKED_MOST` cycles.
+        for (at, key) in (1..).zip(&keys) {
+            owner.data.insert(shard, *key, Kept::new(Counts::of(1)));
+            owner.dirty.entry(shard).or_default().insert(*key);
+            let _ = owner.tick(ms(1 + at * 10));
+        }
+        let records = owner.unacked.get(&(shard, 2)).map_or(0, BTreeMap::len);
+        assert_eq!(records, 1, "records kept behind the copy");
+        let held = Message::Replicated {
+            shard,
+            term: 1,
+            assignment,
+            version,
+        };
+        let _ = owner.receive(2, held, ms(1_005));
+        let mut repaired = BTreeSet::new();
+        for at in 1..30 {
+            for (to, message) in owner.tick(ms(1_005 + at * 5)) {
+                if let Message::Replicate {
+                    shard: copied,
+                    after: Some(after),
+                    entries,
+                    ..
+                } = message
+                    && to == 2
+                    && copied == shard
+                    && after == version
+                {
+                    repaired.extend(entries.into_iter().map(|(key, _)| key));
+                }
+            }
+        }
+        assert_eq!(repaired, keys.iter().copied().collect::<BTreeSet<_>>());
+    }
+
+    /// A repair going holds back nothing of what changes behind it: that goes at once, as to
+    /// any replica that holds the shard, so that a replica repaired while the shard keeps
+    /// changing catches up rather than being repaired for good.
+    #[test]
+    fn changes_go_behind_a_repair_going() {
+        let (mut owner, shard, assignment, version) = owner_copying_to_2();
+        let held = Message::Replicated {
+            shard,
+            term: 1,
+            assignment,
+            version,
+        };
+        let _ = owner.receive(2, held, ms(2));
+        let key = (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0);
+        owner.data.insert(shard, key, Kept::new(Counts::of(1)));
+        owner.dirty.entry(shard).or_default().insert(key);
+        // The change and then its repair go, and are lost.
+        let repairing = (1..30).find(|at| {
+            let _ = owner.tick(ms(2 + at * 5));
+            owner
+                .sending
+                .get(&(2, shard))
+                .is_some_and(|sending| sending.after.is_some())
+        });
+        let Some(at) = repairing else {
+            panic!("never repaired");
+        };
+        owner.data.insert(shard, key, Kept::new(Counts::of(2)));
+        owner.dirty.entry(shard).or_default().insert(key);
+        // Its next cycle, the repair still going.
+        let behind = (at + 1..at + 4).any(|at| {
+            let out = owner.tick(ms(2 + at * 5));
+            !changes_to_2(&out, shard).is_empty()
+        });
+        assert!(
+            owner
+                .sending
+                .get(&(2, shard))
+                .is_some_and(|sending| sending.after.is_some()),
+            "the repair no longer going"
+        );
+        assert!(behind, "held back behind a repair");
     }
 
     /// A replica that never answers costs its owner a bounded record of what to send it
@@ -5456,7 +5843,15 @@ mod tests {
             ((), Changed::Part(0))
         };
         for (whole_first, changes) in [(true, [whole, part]), (false, [part, whole])] {
-            let (mut owner, shard, _, _) = owner_copying_to_2();
+            let (mut owner, shard, assignment, version) = owner_copying_to_2();
+            // Holding its whole copy, so that what changes goes to it.
+            let held = Message::Replicated {
+                shard,
+                term: 1,
+                assignment,
+                version,
+            };
+            let _ = owner.receive(2, held, ms(2));
             let key = (0..).find(|key| shard_of(*key, 4) == shard).unwrap_or(0);
             let mut served = false;
             let mut copied = None;
@@ -5510,7 +5905,7 @@ mod tests {
 
     /// A replica taken off a shard and put back under the same shard term, the whole copy it
     /// is then sent lost: its answers from before, reaching the owner late, count for nothing,
-    /// and the owner sends it the shard again.
+    /// neither for the copy nor for the one going, and the owner sends it the shard again.
     #[test]
     fn a_replica_put_back_is_sent_the_shard_again_whatever_it_said_before() {
         let mut owner = Node::new(1, address(1), config(), [2, 3]);
@@ -5563,7 +5958,8 @@ mod tests {
             },
             ms(4),
         );
-        let again = (1..40).any(|at| {
+        // The copy lost is going still, and goes again after `PART_AGAIN`, 250 ms.
+        let again = (1..80).any(|at| {
             owner.tick(ms(4 + at * 5)).iter().any(|(to, message)| {
                 *to == 2
                     && matches!(
