@@ -12,34 +12,37 @@
 //! OOM killer ends the process, every connection with it, and at `memory.high`, where one
 //! is set, the pod is throttled with reclaim. A worker's storage for requests is a fixed
 //! number that knows nothing of either, so it is sized from the lower of the two as the
-//! process starts, as Envoy Gateway sizes Envoy's heap from the pod's limit: half of it,
-//! shared among the workers, for what the storage account counts, and half for what it does
-//! not — connection and TLS state, the kernel's socket buffers, what the allocator keeps.
-//! Never more than a worker's own bound, which is also what it has without a limit.
+//! process starts, as Envoy Gateway sizes Envoy's heap from the pod's limit.
 //!
-//! The other half also holds the connections, which no storage account counts: so a
-//! worker's connection cap is no more than that half, shared out, at what the dearest kind
-//! of idle connection was measured to cost the pod.
+//! The rate limits' keys come first ([`edgerush_config::memory`]): their cap, the config's
+//! or else worked out from the limit, and half as much again, are set aside. Of what is
+//! left, half, shared among the workers, is for what the storage account counts, never more
+//! than a worker's own bound, which is also what it has without a limit; the rest is for
+//! what it does not — connection and TLS state, the kernel's socket buffers, what the
+//! allocator keeps.
+//!
+//! That rest holds the connections, which no storage account counts: so a worker's
+//! connection cap is no more than it, shared out, at what the dearest kind of idle
+//! connection was measured to cost the pod.
 //!
 //! [03 §9]: ../../../docs/03-data-plane.md
 
 use crate::per_core::CONNECTIONS_PER_WORKER;
+use edgerush_config::memory::{default_max_key_bytes, set_aside};
 use edgerush_control_service::open_files::OpenFiles;
-use edgerush_proxy::H1Limits;
 use edgerush_proxy::connections::{CONNECTION, QUIC_MOST};
+use edgerush_proxy::{H1Limits, KeyCap};
 use std::num::NonZeroUsize;
 
 /// The least storage a worker is given, however small the limit: room for 128 heads of the
 /// largest size, so that no limit leaves a worker unable to read a request.
 const STORAGE_FLOOR: usize = 8 * 1024 * 1024;
 
-/// What an idle TCP connection costs the pod at most, of the kinds measured: TLS with
-/// HTTP/2, after one request, 21.5–21.9 KB of the cgroup's memory (18.2 KB the process's,
-/// 4.0 KB the kernel's), rounded up. Plain HTTP/1 is 7.7 KB, HTTP/2 16.4 KB, TLS HTTP/1
-/// 16.4 KB (laptop, 4 workers, `bench/idle.py`, 03 §9). An HTTP/3 connection, dearer, counts
-/// as up to three connections of this cost ([`quic_weight`]) rather than raising it for
-/// every connection.
-const CONNECTION_COST: u64 = 22 * 1024;
+/// What an idle TCP connection costs the pod at most
+/// ([`edgerush_config::memory::CONNECTION_COST`]). An HTTP/3 connection, dearer, counts as
+/// up to three connections of this cost ([`quic_weight`]) rather than raising it for every
+/// connection.
+const CONNECTION_COST: u64 = edgerush_config::memory::CONNECTION_COST;
 
 /// Where the pod's limit is read, in a cgroup namespace or not.
 #[cfg(target_os = "linux")]
@@ -52,11 +55,59 @@ const RESERVE: u64 = 1024;
 /// Open files a client's connection takes: its own, and in most cases one to its upstream.
 const PER_CONNECTION: u64 = 2;
 
+/// The rate limits' keys as the data plane starts: the cap `stated` by its first config
+/// (the outer none where the mode keeps no keys, the inner where it leaves the cap to the
+/// data plane), and the cap a config leaving it out runs at, worked out from `memory` and
+/// `workers`. The cap it starts with is the most any later config has it hold.
+pub(crate) fn key_cap(stated: Option<Option<u64>>, memory: Memory, workers: NonZeroUsize) -> Keys {
+    let limit = match memory {
+        Memory::NoLimit => None,
+        Memory::Limit { bytes, .. } => Some(bytes),
+    };
+    let count = std::num::NonZeroU64::try_from(workers).unwrap_or(std::num::NonZeroU64::MIN);
+    let default = default_max_key_bytes(limit, count);
+    let (most, whence) = match (stated, limit) {
+        (None, _) => (0, OFF),
+        (Some(Some(stated)), _) => (stated, "the config's"),
+        (Some(None), None) => (default, "no limit to work from"),
+        (Some(None), Some(limit)) if default == limit / 4 => (default, "a quarter of the limit"),
+        (Some(None), Some(_)) => (default, "what the workers leave, less half again"),
+    };
+    Keys {
+        cap: KeyCap { default, most },
+        whence,
+    }
+}
+
+/// Where a key cap comes from when the mode keeps no keys.
+const OFF: &str = "rate limiting off";
+
+/// The rate limits' keys as the data plane starts: what they may hold, and where the cap
+/// it started with came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Keys {
+    pub(crate) cap: KeyCap,
+    pub(crate) whence: &'static str,
+}
+
+/// What `memory` leaves storage and connections once what a key cap of `most` sets aside
+/// is taken out, or nothing if it takes all.
+pub(crate) fn beside_keys(memory: Memory, most: u64) -> Memory {
+    match memory {
+        Memory::NoLimit => Memory::NoLimit,
+        Memory::Limit { bytes, from } => Memory::Limit {
+            bytes: bytes.saturating_sub(set_aside(most)),
+            from,
+        },
+    }
+}
+
 /// How many connections each of `workers` may hold, and what set it: under `open_files`,
 /// what the limit leaves after the reserve, two open files to a connection, shared out; and
-/// under `memory`, the half of it beside storage at [`CONNECTION_COST`] a connection, shared
-/// out — the fewer of the two, never more than [`CONNECTIONS_PER_WORKER`], and never none.
-/// And what an HTTP/3 connection counts as against that ([`quic_weight`]).
+/// under `memory`, what storage leaves of it ([`storage_per_worker`]) at
+/// [`CONNECTION_COST`] a connection, shared out — the fewer of the two, never more than
+/// [`CONNECTIONS_PER_WORKER`], and never none. And what an HTTP/3 connection counts as
+/// against that ([`quic_weight`]).
 pub(crate) fn connections_per_worker(
     open_files: OpenFiles,
     memory: Memory,
@@ -75,7 +126,7 @@ pub(crate) fn connections_per_worker(
     // turns on how far that is above the cap.
     let memory_allows = match memory {
         Memory::NoLimit => None,
-        Memory::Limit { bytes, .. } => Some(bytes / 2 / CONNECTION_COST / workers),
+        Memory::Limit { .. } => Some(beside_storage(memory, workers) / CONNECTION_COST / workers),
     };
     let by_memory = memory_allows.map(bounded);
     let (each, set_by) = match (by_files, by_memory) {
@@ -89,6 +140,20 @@ pub(crate) fn connections_per_worker(
         set_by,
         quic: quic_weight(each, memory_allows),
     }
+}
+
+/// What storage leaves of `memory`'s limit on `workers` workers: storage takes half up to
+/// its ceiling, and what it cannot use is left with the rest.
+fn beside_storage(memory: Memory, workers: u64) -> u64 {
+    let Memory::Limit { bytes, .. } = memory else {
+        return u64::MAX;
+    };
+    let count = usize::try_from(workers)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .unwrap_or(NonZeroUsize::MIN);
+    let storage = u64::try_from(storage_per_worker(memory, count)).unwrap_or(u64::MAX);
+    bytes.saturating_sub(storage.saturating_mul(workers))
 }
 
 /// Each of `workers`' share of the open files: the limit less the reserve, divided among
@@ -224,8 +289,9 @@ fn lower(max: Option<u64>, high: Option<u64>) -> Memory {
     }
 }
 
-/// What each of `workers` may hold for requests under `memory`: half of the limit shared
-/// out, never more than a worker's own bound nor less than [`STORAGE_FLOOR`].
+/// What each of `workers` may hold for requests under `memory`, what the keys leave of the
+/// limit ([`beside_keys`]): half of it shared out, never more than a worker's own bound nor
+/// less than [`STORAGE_FLOOR`].
 pub(crate) fn storage_per_worker(memory: Memory, workers: NonZeroUsize) -> usize {
     let ceiling = H1Limits::default().storage;
     let Memory::Limit { bytes, .. } = memory else {
@@ -238,15 +304,32 @@ pub(crate) fn storage_per_worker(memory: Memory, workers: NonZeroUsize) -> usize
         .clamp(STORAGE_FLOOR.min(ceiling), ceiling)
 }
 
-/// What the start says of the pod's memory and the storage it allows each worker.
-pub(crate) fn described_memory(memory: Memory, storage: usize) -> String {
+/// What the start says of the pod's `memory`, the keys' cap and what it sets aside, and
+/// the storage it allows each worker.
+pub(crate) fn described_memory(memory: Memory, keys: Keys, storage: usize) -> String {
+    const MIB: u64 = 1024 * 1024;
     let each = format!("{} MiB storage a worker", storage / (1024 * 1024));
+    let cap = keys.cap.most;
+    let held = if keys.whence == OFF {
+        format!("no keys ({OFF})")
+    } else {
+        format!("keys {} MiB ({})", cap / MIB, keys.whence)
+    };
     match memory {
-        Memory::NoLimit => format!("memory: no limit; {each}"),
+        Memory::NoLimit => format!("memory: no limit; {held}; {each}"),
         Memory::Limit { bytes, from } => {
+            let aside = set_aside(cap);
+            let aside = match (cap, aside >= bytes) {
+                (0, _) => String::new(),
+                (_, false) => format!(", {} MiB set aside", aside / MIB),
+                (_, true) => format!(
+                    ", {} MiB set aside: nothing left beside them, storage and connections at their floors",
+                    aside / MIB
+                ),
+            };
             format!(
-                "memory: limit {} MiB ({from}); {each}",
-                bytes / (1024 * 1024)
+                "memory: limit {} MiB ({from}); {held}{aside}; {each}",
+                bytes / MIB
             )
         }
     }
@@ -298,12 +381,12 @@ mod tests {
             connections_per_worker(limit(65_536), limited(1024 * MIB), workers(4)),
             bound(5_957, "memory", QUIC_MOST)
         );
-        // 8 GiB: memory would allow more than a worker's bound, 47,662 a worker. An
-        // HTTP/3 connection counts as 3 × 32,768 / 47,662 of one, 2.06, rounded up to the
-        // next sixteenth: 34.
+        // 8 GiB: storage at its ceiling, 1 GiB, and memory would allow more than a worker's
+        // bound, 83,409 a worker. An HTTP/3 connection counts as 3 × 32,768 / 83,409 of
+        // one, 1.18, rounded up to the next sixteenth: 19.
         assert_eq!(
             connections_per_worker(limit(524_288), limited(8192 * MIB), workers(4)),
-            bound(CONNECTIONS_PER_WORKER, "a worker's bound", 34)
+            bound(CONNECTIONS_PER_WORKER, "a worker's bound", 19)
         );
         // A small memory limit with no open-file limit to speak of.
         assert_eq!(
@@ -381,7 +464,9 @@ mod tests {
             };
             let cap = connections_per_worker(files, limited(mebibytes * MIB), workers(count));
             proptest::prop_assert!((CONNECTION..=QUIC_MOST).contains(&cap.quic), "{:?}", cap);
-            let allowed = mebibytes * MIB / 2 / CONNECTION_COST / count as u64;
+            let allowed = beside_storage(limited(mebibytes * MIB), count as u64)
+                / CONNECTION_COST
+                / count as u64;
             // A cap is never none, however little memory there is.
             proptest::prop_assume!(allowed >= cap.each as u64);
             let room = cap.each * CONNECTION;
@@ -568,15 +653,125 @@ mod tests {
         assert_eq!(storage_per_worker(limited(0), workers(1)), STORAGE_FLOOR);
     }
 
+    /// Storage takes half of what the keys leave up to its ceiling, and the connections
+    /// what storage leaves: past the ceiling, all of it.
     #[test]
-    fn the_start_says_what_the_pod_may_use_and_what_each_worker_may_hold() {
+    fn the_connections_have_what_storage_leaves() {
+        // 1 GiB, 4 workers: storage 128 MiB each, half; the connections the other half,
+        // 512 MiB, 23,831, 5,957 each.
         assert_eq!(
-            described_memory(limited(512 * MIB), 64 << 20),
-            "memory: limit 512 MiB (memory.max); 64 MiB storage a worker"
+            connections_per_worker(OpenFiles::NoLimit, limited(GIB), workers(4)).each,
+            5_957
+        );
+        // 4 GiB: storage at its ceiling, 1 GiB in all; the connections 3 GiB, 142,987,
+        // 35,746 each, more than a worker's bound. An HTTP/3 connection counts as
+        // 3 x 32,768 / 35,746 of one, 2.75, rounded up to the next sixteenth: 45.
+        assert_eq!(
+            connections_per_worker(OpenFiles::NoLimit, limited(4 * GIB), workers(4)),
+            bound(CONNECTIONS_PER_WORKER, "a worker's bound", 45)
+        );
+        // Storage raised to its floor takes from the connections: 64 MiB on 16 workers,
+        // 8 MiB each, 128 MiB, leaves none, and a worker still one.
+        assert_eq!(
+            connections_per_worker(OpenFiles::NoLimit, limited(64 * MIB), workers(16)).each,
+            1
+        );
+    }
+
+    /// The figures #609's default was chosen by, on 4 workers: the keys' cap, what it sets
+    /// aside, storage and the connections, from what the cgroup says.
+    #[test]
+    fn the_keys_come_out_of_the_limit_first() {
+        let four = workers(4);
+        let planned = |limit: u64| {
+            let keys = key_cap(Some(None), limited(limit), four);
+            let rest = beside_keys(limited(limit), keys.cap.most);
+            let connections = connections_per_worker(OpenFiles::NoLimit, rest, four);
+            (
+                keys.cap.most,
+                storage_per_worker(rest, four),
+                connections.each,
+            )
+        };
+        // 512 MiB: a quarter, 128 MiB, and 192 MiB set aside; of the 320 MiB left, 40 MiB
+        // storage each, and 160 MiB of connections, 7,447, 1,861 each.
+        assert_eq!(planned(512 * MIB), (128 * MIB, 40 << 20, 1_861));
+        // 2 GiB: 512 MiB, 768 MiB set aside; 160 MiB each, 640 MiB of connections, 7,447
+        // each.
+        assert_eq!(planned(2 * GIB), (512 * MIB, 160 << 20, 7_447));
+        // 8 GiB: two thirds of what the workers' 3,840 MiB leave; the workers then have
+        // all they can use.
+        assert_eq!(
+            planned(8 * GIB),
+            (4352 * MIB * 2 / 3, 256 << 20, CONNECTIONS_PER_WORKER)
+        );
+    }
+
+    #[test]
+    fn the_cap_the_data_plane_starts_with_is_the_configs_or_worked_out() {
+        let four = workers(4);
+        let default = 128 * MIB;
+        let cap = |most| KeyCap { default, most };
+        assert_eq!(
+            key_cap(None, limited(512 * MIB), four),
+            Keys {
+                cap: cap(0),
+                whence: OFF
+            },
+            "keeping no keys, it keeps no room for them"
         );
         assert_eq!(
-            described_memory(Memory::NoLimit, 256 << 20),
-            "memory: no limit; 256 MiB storage a worker"
+            key_cap(Some(Some(MIB)), limited(512 * MIB), four).cap,
+            cap(MIB)
+        );
+        assert_eq!(
+            key_cap(Some(None), limited(512 * MIB), four).cap,
+            cap(default)
+        );
+        assert_eq!(
+            key_cap(Some(None), Memory::NoLimit, four).cap,
+            KeyCap {
+                default: 256 * MIB,
+                most: 256 * MIB
+            }
+        );
+        // A cap that takes all leaves nothing, never less.
+        assert_eq!(beside_keys(limited(GIB), GIB), limited(0));
+        assert_eq!(beside_keys(Memory::NoLimit, GIB), Memory::NoLimit);
+    }
+
+    #[test]
+    fn the_start_says_what_the_pod_may_use_and_what_each_worker_may_hold() {
+        let four = workers(4);
+        let keys = |stated, memory| key_cap(stated, memory, four);
+        let pod = limited(512 * MIB);
+        assert_eq!(
+            described_memory(pod, keys(None, pod), 64 << 20),
+            "memory: limit 512 MiB (memory.max); no keys (rate limiting off); 64 MiB storage a worker"
+        );
+        assert_eq!(
+            described_memory(pod, keys(Some(None), pod), 40 << 20),
+            "memory: limit 512 MiB (memory.max); keys 128 MiB (a quarter of the limit), 192 MiB set aside; 40 MiB storage a worker"
+        );
+        assert_eq!(
+            described_memory(
+                limited(8 * GIB),
+                keys(Some(None), limited(8 * GIB)),
+                256 << 20
+            ),
+            "memory: limit 8192 MiB (memory.max); keys 2901 MiB (what the workers leave, less half again), 4351 MiB set aside; 256 MiB storage a worker"
+        );
+        assert_eq!(
+            described_memory(pod, keys(Some(Some(400 * MIB)), pod), 8 << 20),
+            "memory: limit 512 MiB (memory.max); keys 400 MiB (the config's), 600 MiB set aside: nothing left beside them, storage and connections at their floors; 8 MiB storage a worker"
+        );
+        assert_eq!(
+            described_memory(
+                Memory::NoLimit,
+                keys(Some(None), Memory::NoLimit),
+                256 << 20
+            ),
+            "memory: no limit; keys 256 MiB (no limit to work from); 256 MiB storage a worker"
         );
     }
 

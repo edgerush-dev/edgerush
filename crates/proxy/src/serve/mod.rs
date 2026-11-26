@@ -390,6 +390,8 @@ pub struct Proxy {
     /// Outside it for a different reason: a key must not come round again when a config
     /// does, so what hands them out lives as long as the process.
     keys: Keys,
+    /// What the rate limits' keys may hold, whatever a config asks.
+    key_cap: KeyCap,
     /// Set once, to drain: every worker's sweep brings it to the worker (03 §10).
     draining: AtomicBool,
     /// The keys every worker issues and reads QUIC connection IDs and Retry tokens with.
@@ -415,6 +417,41 @@ pub struct Proxy {
     /// The addresses discovered or resolved that are not sent to, beside the ranges none
     /// is, and who is told of each as it comes to be refused ([`Proxy::deny`]).
     denied: std::sync::Mutex<plane::Egress>,
+}
+
+/// What a data plane's rate-limiting keys may hold: the cap where its config leaves it to
+/// the data plane, and the most any config may have it hold, the cap it started with, beside
+/// which its memory was shared out ([`edgerush_config::memory`]). A config asking for more
+/// runs at the most until a restart: a cap lower than it started with is taken at once
+/// (06 §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyCap {
+    /// The cap where the config leaves it to the data plane.
+    pub default: u64,
+    /// The most it may be.
+    pub most: u64,
+}
+
+impl KeyCap {
+    /// 256 MiB where the config leaves it out, and no most: for a data plane whose memory
+    /// nothing shares out.
+    pub const UNPLANNED: Self = Self {
+        default: edgerush_config::memory::UNLIMITED_KEY_BYTES,
+        most: u64::MAX,
+    };
+
+    /// The cap a config stating `stated` runs at: at least a byte.
+    #[must_use]
+    pub fn of(self, stated: Option<u64>) -> u64 {
+        stated.unwrap_or(self.default).min(self.most).max(1)
+    }
+
+    /// What a config stating `stated` asks for beyond the most, if it does.
+    #[must_use]
+    pub fn held_back(self, stated: Option<u64>) -> Option<u64> {
+        let wanted = stated.unwrap_or(self.default);
+        (wanted > self.most).then_some(wanted)
+    }
 }
 
 /// The data plane's rate limits: whether they were started, and the thread the running

@@ -286,6 +286,58 @@ async fn a_reload_in_local_mode_keeps_the_keys() {
         .await;
 }
 
+/// A data plane never has its keys hold more than the cap it started with, beside which its
+/// memory was shared out (06 §8): a reload asking for more is held to it, and says so; one
+/// asking for less is taken at once. A cap left out is the data plane's own.
+#[test]
+fn a_reload_never_raises_the_keys_cap_past_the_start() {
+    const MIB: u64 = 1024 * 1024;
+    let with_cap = |max_key_bytes: Option<u64>| {
+        let mut section = local_mode();
+        if let Some(limiting) = &mut section {
+            limiting.max_key_bytes = max_key_bytes;
+        }
+        compile(&limited_in(
+            everything_config(([127, 0, 0, 1], 9).into()),
+            section,
+        ))
+        .unwrap()
+    };
+    let cap_shown = |proxy: &Proxy| {
+        let scrape = proxy.metrics();
+        scrape
+            .lines()
+            .find_map(|line| line.strip_prefix("edgerush_rate_limit_max_key_bytes "))
+            .map(|bytes| bytes.parse::<u64>().unwrap())
+    };
+    let key_cap = crate::KeyCap {
+        default: MIB,
+        most: 2 * MIB,
+    };
+    let proxy = Proxy::with_key_cap(with_cap(None), NonZeroUsize::MIN, key_cap).unwrap();
+    proxy.start_rate_limits(|| {}).unwrap();
+    assert_eq!(
+        cap_shown(&proxy),
+        Some(MIB),
+        "left out, the data plane's own"
+    );
+    let more = with_cap(Some(4 * MIB));
+    assert_eq!(proxy.key_cap_held_back(&more), Some((4 * MIB, 2 * MIB)));
+    proxy.reload(more).unwrap();
+    assert_eq!(cap_shown(&proxy), Some(2 * MIB), "held to the start's");
+    let less = with_cap(Some(MIB / 2));
+    assert_eq!(proxy.key_cap_held_back(&less), None);
+    proxy.reload(less).unwrap();
+    assert_eq!(cap_shown(&proxy), Some(MIB / 2), "lower, at once");
+    // Started keeping no keys, it set nothing aside: its keys hold next to nothing.
+    let off = crate::KeyCap {
+        default: MIB,
+        most: 0,
+    };
+    assert_eq!(off.of(None), 1);
+    assert_eq!(off.held_back(Some(MIB)), Some(MIB));
+}
+
 /// `config` with its first route's first rule under `limits` (each `name: key` with ten an
 /// hour and a bucket of `burst`), in local mode with header keys allowed.
 fn keyed_by(mut config: Config, limits: &[(&str, &str, u64)]) -> Config {

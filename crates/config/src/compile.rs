@@ -131,8 +131,10 @@ pub enum CompiledRateLimiting {
     Off,
     /// Each process on what it sees alone.
     Local {
-        /// The bytes the keys may hold on the data plane, held once by its process.
-        max_key_bytes: u64,
+        /// The bytes the keys may hold on the data plane, held once by its process; none
+        /// when left out, for the data plane to work out from its memory
+        /// ([`crate::memory`]).
+        max_key_bytes: Option<u64>,
     },
     /// The key's owner in the service decides every request.
     Synchronous(CompiledSynchronous),
@@ -160,8 +162,9 @@ pub struct CompiledSynchronous {
     pub check_timeout: Duration,
     /// Checks missed in a row that mark a pod down; at least 1.
     pub check_misses: u32,
-    /// The bytes the keys may hold on the data plane, held once by its process.
-    pub max_key_bytes: u64,
+    /// The bytes the keys may hold on the data plane, held once by its process; none when
+    /// left out, for the data plane to work out from its memory ([`crate::memory`]).
+    pub max_key_bytes: Option<u64>,
     /// Mutual TLS to the pods, if they are reached so.
     pub tls: Option<CompiledServiceTls>,
 }
@@ -213,6 +216,18 @@ impl CompiledRateLimiting {
     pub fn enforces(&self) -> bool {
         !matches!(self, Self::Off)
     }
+
+    /// The cap of its keys as the config states it: the outer none where the mode keeps no
+    /// keys, the inner where the config leaves the cap to the data plane.
+    #[must_use]
+    pub fn max_key_bytes(&self) -> Option<Option<u64>> {
+        match self {
+            Self::Off => None,
+            Self::Local { max_key_bytes } => Some(*max_key_bytes),
+            Self::Synchronous(synchronous) => Some(synchronous.max_key_bytes),
+            Self::Asynchronous(service) => Some(service.max_key_bytes),
+        }
+    }
 }
 
 /// The asynchronous mode's service, checked.
@@ -224,8 +239,9 @@ pub struct CompiledRateLimitService {
     pub key_secret: KeySecret,
     /// The time between the process's messages to the service.
     pub cycle: Duration,
-    /// The bytes the keys may hold on the data plane, held once by its process.
-    pub max_key_bytes: u64,
+    /// The bytes the keys may hold on the data plane, held once by its process; none when
+    /// left out, for the data plane to work out from its memory ([`crate::memory`]).
+    pub max_key_bytes: Option<u64>,
     /// Whether quiet keys are polled every cycle while in use.
     pub poll_quiet_keys: bool,
     /// Whether each cycle visits only the keys that need it.
@@ -237,8 +253,6 @@ pub struct CompiledRateLimitService {
 impl CompiledRateLimitService {
     /// What `cycle_ms` is when left out.
     const CYCLE: Duration = Duration::from_millis(10);
-    /// What `max_key_bytes` is when left out: 256 MiB.
-    const MAX_KEY_BYTES: u64 = 256 << 20;
 }
 
 /// The data plane's own settings, each at the value it runs with.
@@ -774,9 +788,7 @@ fn rate_limiting(config: &Config, errors: &mut Vec<ConfigError>) -> CompiledRate
     };
     let place = Place::of(Object::DataPlane);
     let mode = limiting.mode;
-    let max_key_bytes = limiting
-        .max_key_bytes
-        .unwrap_or(CompiledRateLimitService::MAX_KEY_BYTES);
+    let max_key_bytes = limiting.max_key_bytes;
     let uses_service = matches!(
         mode,
         RateLimitMode::Synchronous | RateLimitMode::Asynchronous
@@ -7112,7 +7124,7 @@ upstreams: {}
     }
 
     /// The section left out, or its mode `off`, enforces nothing; `local` keeps keys within
-    /// a cap, 256 MiB when left out, and takes no service; the modes that share counts need
+    /// a cap, left to the data plane when left out, and takes no service; the modes that share counts need
     /// one, and `synchronous` how a request waits for its owner too.
     #[test]
     fn the_mode_takes_what_it_needs_and_nothing_else() {
@@ -7130,13 +7142,13 @@ upstreams: {}
         assert_eq!(
             with("rate_limiting: { mode: local }"),
             Ok(CompiledRateLimiting::Local {
-                max_key_bytes: 256 << 20
+                max_key_bytes: None
             })
         );
         assert_eq!(
             with("rate_limiting: { mode: local, max_key_bytes: 1000 }"),
             Ok(CompiledRateLimiting::Local {
-                max_key_bytes: 1000
+                max_key_bytes: Some(1000)
             })
         );
         assert_eq!(
@@ -7177,7 +7189,7 @@ upstreams: {}
                 check_interval: Duration::from_millis(100),
                 check_timeout: Duration::from_secs(1),
                 check_misses: 3,
-                max_key_bytes: 1000,
+                max_key_bytes: Some(1000),
                 tls: None,
             }))
         );
@@ -7533,7 +7545,7 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}, key_s
             .unwrap();
         assert_eq!(service.addresses, ["rl-0:7000", "rl-1:7000"]);
         assert_eq!(service.cycle, Duration::from_millis(10));
-        assert_eq!(service.max_key_bytes, 256 << 20);
+        assert_eq!(service.max_key_bytes, None, "left to the data plane");
         assert_eq!(
             with("{ addresses: [] }").unwrap_err(),
             ["the data plane: `rate_limiting.service` names no `addresses`"]
@@ -7574,7 +7586,10 @@ rate_limiting: {{ mode: {mode}, service: {{ addresses: ["rl-0:7000"]{tls}, key_s
             "listeners: {}\nroutes: []\nupstreams: {}\nrate_limiting: { mode: asynchronous, max_key_bytes: 1000, service: { addresses: [\"a:1\"], key_secret: 00112233445566778899aabbccddeeff } }\n",
         ))
         .unwrap();
-        assert_eq!(capped.rate_limit_service().unwrap().max_key_bytes, 1000);
+        assert_eq!(
+            capped.rate_limit_service().unwrap().max_key_bytes,
+            Some(1000)
+        );
     }
 
     /// A limit's bucket holds at least two of the service's cycles of its rate, every limit

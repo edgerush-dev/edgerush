@@ -381,10 +381,6 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     // Before a socket is opened, as every socket is an open file.
     let open_files = edgerush_control_service::open_files::raise();
     let memory = crate::limits::memory();
-    let connections = crate::limits::connections_per_worker(open_files, memory, workers);
-    let mut limits = limits;
-    limits.storage = crate::limits::storage_per_worker(memory, workers);
-    limits.descriptors = crate::limits::descriptors_per_worker(open_files, workers);
     // One worker is alone on every listener's port and needs nothing of the kernel; it is
     // from the second on that they share one, which is what SO_REUSEPORT is for.
     let port = if workers == NonZeroUsize::MIN {
@@ -450,6 +446,13 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
             }
         }
     };
+    // Sized once the first config is in, as the keys' cap it states comes first.
+    let keys = crate::limits::key_cap(config.rate_limiting().max_key_bytes(), memory, workers);
+    let beside_keys = crate::limits::beside_keys(memory, keys.cap.most);
+    let connections = crate::limits::connections_per_worker(open_files, beside_keys, workers);
+    let mut limits = limits;
+    limits.storage = crate::limits::storage_per_worker(beside_keys, workers);
+    limits.descriptors = crate::limits::descriptors_per_worker(open_files, workers);
     // In the slots the data plane gives the first config's listeners: in its order.
     let mut bound: Vec<Bound> = config.listeners().iter().map(Bound::from).collect();
     for (slot, listener) in bound.iter_mut().enumerate() {
@@ -459,7 +462,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
     // Limits checked but enforced in none is said once, so that a mode left out is seen.
     let unenforced = (!config.rate_limiting().enforces()).then_some(config.limits().len());
     let unrestricted_from_start = unrestricted(&config);
-    let proxy = Proxy::new(config, workers)
+    let proxy = Proxy::with_key_cap(config, workers, keys.cap)
         .map(Arc::new)
         .map_err(|error| Failure::Proxy {
             config: named.clone(),
@@ -593,7 +596,7 @@ fn run(options: Options, stderr: &mut impl Write) -> Result<(), Failure> {
         stderr,
         format_args!(
             "{}",
-            crate::limits::described_memory(memory, limits.storage)
+            crate::limits::described_memory(memory, keys, limits.storage)
         ),
     );
 
@@ -949,6 +952,12 @@ impl Listening<'_> {
             .map(ToOwned::to_owned)
             .into_iter()
             .collect();
+        // Its memory was shared out beside the cap it started with (06 §8).
+        if let Some((wanted, running)) = self.proxy.key_cap_held_back(&config) {
+            warnings.push(format!(
+                "the keys' cap of {wanted} bytes is more than the data plane started with: they hold {running} until it restarts"
+            ));
+        }
         let turned = http3_turned(&listeners.bound, &config);
         // Taken away: gone from the config, or moved, which is gone and added.
         let closing: Vec<String> = listeners

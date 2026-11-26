@@ -241,8 +241,11 @@ pub struct PlatformDefaultsGatewayClassesDataPlaneRateLimiting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global: Option<Vec<PlatformDefaultsGatewayClassesDataPlaneRateLimitingGlobal>>,
     /// MaxKeyBytes is what the limits' keys may hold, once for the data plane's
-    /// process: past it, keys are evicted, and start again full. 268,435,456
-    /// (256 MiB) unless said. Not under Disabled, which keeps no keys.
+    /// process: past it, keys are evicted, and start again full. Unless said, a
+    /// quarter of the memory limit, or, where more, what the proxy's workers could
+    /// never use of it, less half again; 268,435,456 (256 MiB) with no memory
+    /// limit. It and half as much again must be below the memory limit. Not under
+    /// Disabled, which keeps no keys. A change rolls the proxies.
     #[serde(rename = "maxKeyBytes")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_key_bytes: Option<i64>,

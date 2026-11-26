@@ -2,7 +2,8 @@
 //! what it tells a scrape and the health checker.
 
 use super::{
-    ACCEPT_PAUSE, ListenerSlots, Proxy, ProxyError, Snapshot, authority, is_about_one_connection,
+    ACCEPT_PAUSE, KeyCap, ListenerSlots, Proxy, ProxyError, Snapshot, authority,
+    is_about_one_connection,
 };
 use crate::access_log::{Logs, Sink};
 use crate::downstream::h3::listener as h3_listener;
@@ -574,6 +575,20 @@ impl Proxy {
     ///
     /// [`Worker::new`]: super::Worker::new
     pub fn new(config: Compiled, workers: NonZeroUsize) -> Result<Self, ProxyError> {
+        Self::with_key_cap(config, workers, KeyCap::UNPLANNED)
+    }
+
+    /// A data plane as [`Proxy::new`] makes one, whose rate-limiting keys hold no more than
+    /// `key_cap` allows, whatever a config asks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Proxy::new`].
+    pub fn with_key_cap(
+        config: Compiled,
+        workers: NonZeroUsize,
+        key_cap: KeyCap,
+    ) -> Result<Self, ProxyError> {
         // Every slot there will be, the first config's listeners in the first of them.
         let most = MOST_LISTENERS.max(config.listeners().len());
         let slots = ListenerSlots {
@@ -636,6 +651,7 @@ impl Proxy {
             workers,
             rate_limits: std::sync::Mutex::default(),
             keys,
+            key_cap,
             draining: AtomicBool::new(false),
             quic,
             logs,
@@ -655,6 +671,15 @@ impl Proxy {
     #[must_use]
     pub fn listeners(&self) -> Arc<[Option<String>]> {
         Arc::clone(&self.current.load().slots.names)
+    }
+
+    /// What `config` asks its rate-limiting keys to hold beyond what this data plane may, and
+    /// what it would run them at instead: none if it asks for no more ([`KeyCap`]).
+    #[must_use]
+    pub fn key_cap_held_back(&self, config: &Compiled) -> Option<(u64, u64)> {
+        let stated = config.rate_limiting().max_key_bytes()?;
+        let wanted = self.key_cap.held_back(stated)?;
+        Some((wanted, self.key_cap.of(stated)))
     }
 
     /// Drains the data plane: every worker, at its next sweep, stops accepting and lets its
@@ -807,7 +832,7 @@ impl Proxy {
         // A thread kept keeps the keys it holds, now within this config's bound (06 §8), and
         // dials the pods with this config's certificate from now on.
         if let (Some(hub), Some(service)) = (&hub, snapshot.config.rate_limit_service()) {
-            hub.set_capacity(service.max_key_bytes);
+            hub.set_capacity(self.key_cap.of(service.max_key_bytes));
             hub.set_tls(snapshot.service_tls.clone());
         }
         // Before any request of it can make a record, or be counted.
@@ -1173,12 +1198,11 @@ impl Proxy {
             .collect();
         scrape.push_str(&self.metrics.render_protected(&protected));
         // Only a config that enforces limits shows them.
-        let max_key_bytes = match snapshot.config.rate_limiting() {
-            CompiledRateLimiting::Local { max_key_bytes } => Some(*max_key_bytes),
-            CompiledRateLimiting::Asynchronous(service) => Some(service.max_key_bytes),
-            CompiledRateLimiting::Synchronous(synchronous) => Some(synchronous.max_key_bytes),
-            CompiledRateLimiting::Off => None,
-        };
+        let max_key_bytes = snapshot
+            .config
+            .rate_limiting()
+            .max_key_bytes()
+            .map(|stated| self.key_cap.of(stated));
         if let Some(max_key_bytes) = max_key_bytes
             && !limits.is_empty()
         {
@@ -1242,7 +1266,7 @@ impl Proxy {
         crate::ratelimit::Hub::start(
             service,
             self.workers.get(),
-            service.max_key_bytes,
+            self.key_cap.of(service.max_key_bytes),
             Some(failed.clone()),
             snapshot.service_tls.clone(),
         )
@@ -1261,6 +1285,7 @@ impl Proxy {
         let CompiledRateLimiting::Local { max_key_bytes } = *config.rate_limiting() else {
             return Ok(None);
         };
+        let max_key_bytes = self.key_cap.of(max_key_bytes);
         if let Some(running) = running {
             running.set_capacity(max_key_bytes);
             return Ok(Some(Arc::clone(running)));
@@ -1290,6 +1315,7 @@ impl Proxy {
         }
         crate::ratelimit::synchronous::Process::start(
             synchronous.clone(),
+            self.key_cap.of(synchronous.max_key_bytes),
             self.workers,
             Some(failed.clone()),
             running.map(|running| &**running),

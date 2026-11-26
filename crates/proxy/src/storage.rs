@@ -29,9 +29,9 @@ use bytes::BytesMut;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// What a worker may hold for requests unless it is told otherwise: 14 §8's proposal, to
-/// be checked against measurement before it is adopted.
-pub const LIMIT: usize = 256 * 1024 * 1024;
+/// What a worker may hold for requests unless it is told otherwise: the data plane's
+/// ceiling, which its memory limit is shared out under ([`edgerush_config::memory`]).
+pub const LIMIT: usize = edgerush_config::memory::STORAGE_CEILING;
 
 /// What a worker's own answers and refusals may draw on above the limit, and nothing else:
 /// enough for a worker that has run out to say so rather than close (14 §8).

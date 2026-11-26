@@ -121,8 +121,10 @@ enum Ended {
 }
 
 impl Process {
-    /// The process's synchronous mode for `config`, with `workers` workers, and the thread
-    /// that checks its seeds and members, which calls `failed` if it panics.
+    /// The process's synchronous mode for `config`, with `workers` workers, its own keys
+    /// (with `when_unreachable: local`) within `max_key_bytes`, the cap the data plane runs
+    /// the config at, and the thread that checks its seeds and members, which calls `failed`
+    /// if it panics.
     ///
     /// A reload carries an outage's state across from the `running` one: every member met,
     /// marked down or up as its checks last said, whatever else changed, and the process's
@@ -130,12 +132,13 @@ impl Process {
     /// setting mid-outage neither asks a pod down again nor hands out fresh buckets.
     pub(crate) fn start(
         config: CompiledSynchronous,
+        max_key_bytes: u64,
         workers: NonZeroUsize,
         failed: Option<Failed>,
         running: Option<&Self>,
         tls: Option<SslConnector>,
     ) -> std::io::Result<Arc<Self>> {
-        let process = Self::new(config, workers, running, tls);
+        let process = Self::new(config, max_key_bytes, workers, running, tls);
         let checked = Arc::downgrade(&process);
         std::thread::Builder::new()
             .name("edgerush-rate-limit-check".to_owned())
@@ -147,6 +150,7 @@ impl Process {
     /// are met from the start, so that they are checked before any worker asks them.
     fn new(
         config: CompiledSynchronous,
+        max_key_bytes: u64,
         workers: NonZeroUsize,
         running: Option<&Self>,
         tls: Option<SslConnector>,
@@ -155,10 +159,10 @@ impl Process {
         let local = (config.when_unreachable == WhenUnreachable::Local).then(|| {
             match running.and_then(|running| running.local.as_ref()) {
                 Some(local) => {
-                    local.set_capacity(config.max_key_bytes);
+                    local.set_capacity(max_key_bytes);
                     Arc::clone(local)
                 }
-                None => LocalKeys::unswept(config.max_key_bytes),
+                None => LocalKeys::unswept(max_key_bytes),
             }
         });
         let process = Arc::new(Self {
@@ -1578,7 +1582,7 @@ mod tests {
             check_interval: Duration::from_millis(100),
             check_timeout: Duration::from_millis(100),
             check_misses: 3,
-            max_key_bytes: 1 << 20,
+            max_key_bytes: Some(1 << 20),
             tls: None,
         }
     }
@@ -1587,10 +1591,10 @@ mod tests {
     #[test]
     fn a_reload_carries_what_the_checks_said() {
         let one = NonZeroUsize::MIN;
-        let before = Process::new(config(20), one, None, None);
+        let before = Process::new(config(20), 1 << 20, one, None, None);
         before.member_at("rl-0:7000", Some(7)).health.mark(true);
         before.member_at("rl-1:7000", Some(8));
-        let after = Process::new(config(30), one, Some(&before), None);
+        let after = Process::new(config(30), 1 << 20, one, Some(&before), None);
         assert!(after.member_at("rl-0:7000", Some(7)).health.is_down());
         assert!(!after.member_at("rl-1:7000", Some(8)).health.is_down());
     }
@@ -1600,7 +1604,7 @@ mod tests {
     /// another member at the address, its pod restarted, starts up.
     #[test]
     fn a_member_is_shared_and_shown_by_its_address() {
-        let process = Process::new(config(20), NonZeroUsize::MIN, None, None);
+        let process = Process::new(config(20), 1 << 20, NonZeroUsize::MIN, None, None);
         let seed = process.member_at("rl-0:7000", None);
         seed.health.mark(true);
         let named = process.member_at("rl-0:7000", Some(7));

@@ -1393,7 +1393,7 @@
           "default": null
         },
         "max_key_bytes": {
-          "description": "Bytes the rate limits' keys may take in memory on this data plane, which its process\nholds once for all its workers, worked out from what each key keeps: past it, keys are\nevicted, and start again full. 268,435,456 (256 MiB)\nwhen left out. Not for `off`, which keeps no keys.",
+          "description": "Bytes the rate limits' keys may take in memory on this data plane, which its process\nholds once for all its workers, worked out from what each key keeps: past it, keys are\nevicted, and start again full. Left out,\nthe data plane works it out from its memory limit as it starts: a quarter of it, or\nwhat its workers could never use, less half again, whichever is more; 268,435,456\n(256 MiB) with no limit ([`crate::memory`]). A control plane always states it. Not\nfor `off`, which keeps no keys.",
           "type": [
             "integer",
             "null"

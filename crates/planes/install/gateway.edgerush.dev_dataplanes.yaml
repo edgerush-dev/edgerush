@@ -1582,8 +1582,11 @@ spec:
                   maxKeyBytes:
                     description: |-
                       MaxKeyBytes is what the limits' keys may hold, once for the data plane's
-                      process: past it, keys are evicted, and start again full. 268,435,456
-                      (256 MiB) unless said. Not under Disabled, which keeps no keys.
+                      process: past it, keys are evicted, and start again full. Unless said, a
+                      quarter of the memory limit, or, where more, what the proxy's workers could
+                      never use of it, less half again; 268,435,456 (256 MiB) with no memory
+                      limit. It and half as much again must be below the memory limit. Not under
+                      Disabled, which keeps no keys. A change rolls the proxies.
                     format: int64
                     minimum: 1
                     type: integer

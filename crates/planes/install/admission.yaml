@@ -221,3 +221,51 @@ metadata:
 spec:
   policyName: edgerush-control-plane-data-plane-status
   validationActions: [Deny]
+---
+# A DataPlane's key cap and half as much again must be below its pods' memory limit
+# (docs/05 §1, docs/06 §8): its proxies set that much aside before they size storage and
+# connections, and a cap they cannot hold leaves them nothing beside their keys. Here
+# rather than among the CRD's CEL rules, which cost reading a quantity as reading a string
+# of any length, over the API server's budget however the schema bounds it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: edgerush-data-plane-key-cap
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [gateway.edgerush.dev]
+        apiVersions: [v1alpha1]
+        operations: [CREATE, UPDATE]
+        resources: [dataplanes]
+  matchConditions:
+    - name: a-key-cap-beside-a-memory-limit
+      expression: >-
+        has(object.spec.rateLimiting) && has(object.spec.rateLimiting.maxKeyBytes) &&
+        has(object.spec.resources) && has(object.spec.resources.limits) &&
+        has(object.spec.resources.limits.memory)
+  variables:
+    # A quantity, or bytes written as a bare integer.
+    - name: memory
+      expression: >-
+        type(object.spec.resources.limits.memory) == int
+        ? quantity(string(object.spec.resources.limits.memory))
+        : quantity(object.spec.resources.limits.memory)
+    - name: cap
+      expression: object.spec.rateLimiting.maxKeyBytes
+  validations:
+    # memory - cap > cap / 2, which overflows nothing however large the cap.
+    - expression: variables.memory.sub(quantity(string(variables.cap))).isGreaterThan(quantity(string(variables.cap / 2)))
+      message: rateLimiting.maxKeyBytes and half as much again must be below resources.limits.memory
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: edgerush-data-plane-key-cap
+  labels: { app.kubernetes.io/part-of: edgerush }
+spec:
+  policyName: edgerush-data-plane-key-cap
+  validationActions: [Deny]
