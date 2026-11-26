@@ -463,6 +463,7 @@ where
 }
 
 const STORE_DECIDE: &str = "/edgerush.cluster.v1.Cluster/Decide";
+const STORE_COORDINATE: &str = "/edgerush.cluster.v1.Cluster/Coordinate";
 const STORE_PEER: &str = "/edgerush.cluster.v1.Cluster/Peer";
 const STORE_COPY: &str = "/edgerush.cluster.v1.Cluster/Copy";
 const STORE_HELLO: &str = "/edgerush.cluster.v1.Cluster/Hello";
@@ -483,6 +484,7 @@ async fn each_caller_may_call_only_its_own_methods() {
     let mut store_server = StoreServer::new(store);
     for (path, allowed) in [
         (STORE_DECIDE, Caller::DataPlane),
+        (STORE_COORDINATE, Caller::Pod),
         (STORE_PEER, Caller::Pod),
         (STORE_COPY, Caller::Pod),
         (STORE_HELLO, Caller::Pod),

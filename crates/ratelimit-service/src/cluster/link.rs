@@ -1,7 +1,9 @@
 //! What a pod sends to one peer (cluster-store-transplant-plan.md, "T4d"): a queue for each of
-//! the two streams, counted in bytes, and a task for each that dials a connection of its own to
-//! the peer once something waits, opens its stream with the pod's hello and sends what waits,
-//! cut into pieces.
+//! its three streams — coordination, copies, and the rest (#618) — counted in bytes, and a task
+//! for each that dials a connection of its own to the peer once something waits, opens its
+//! stream with the pod's hello and sends what waits, cut into pieces. Each on a connection of
+//! its own, what one carries waits behind nothing another does: a heartbeat neither behind a
+//! snapshot nor behind the answers to one.
 //!
 //! A message past what its queue holds is dropped and the connection kept; a connection lost
 //! drops what waited for it, and the next is dialled for the next message, backed off. The
@@ -46,8 +48,9 @@ impl<T> Stream for Received<T> {
 /// what changed, which only the rate keys change at bounds.
 pub const COPIES_WAITING: usize = 8 << 20;
 
-/// The most bytes of everything else that wait for one peer (decided): a handoff's part,
-/// with heartbeats and tables beside it.
+/// The most bytes of everything else that wait for one peer on either of its other streams
+/// (decided): a handoff's part, with heartbeats and tables beside it, on the coordination
+/// stream; copies' answers and the modes' messages on the rest.
 pub const REST_WAITING: usize = 2 << 20;
 
 /// How long a stream waits to dial again after a dial that failed, at first and at most:
@@ -60,6 +63,7 @@ pub(crate) const HELLO: &str = "edgerush-hello-bin";
 
 /// The cluster's service, as gRPC calls it, and its methods.
 pub(crate) const SERVICE: &str = "edgerush.cluster.v1.Cluster";
+pub(crate) const COORDINATE: &str = "/edgerush.cluster.v1.Cluster/Coordinate";
 pub(crate) const PEER: &str = "/edgerush.cluster.v1.Cluster/Peer";
 pub(crate) const COPY: &str = "/edgerush.cluster.v1.Cluster/Copy";
 pub(crate) const GREET: &str = "/edgerush.cluster.v1.Cluster/Hello";
@@ -139,10 +143,11 @@ impl Queue {
     }
 }
 
-/// What a pod sends to one peer: its two queues, and the tasks that send them, stopped when
+/// What a pod sends to one peer: its three queues, and the tasks that send them, stopped when
 /// it is dropped.
 #[derive(Debug)]
 pub(crate) struct Link {
+    coordination: Queue,
     rest: Queue,
     copies: Queue,
     tasks: Tasks,
@@ -151,10 +156,10 @@ pub(crate) struct Link {
 
 /// A link's tasks, stopped when dropped.
 #[derive(Debug)]
-pub(crate) struct Tasks([JoinHandle<()>; 2]);
+pub(crate) struct Tasks([JoinHandle<()>; 3]);
 
 impl Tasks {
-    /// Waits for both to end.
+    /// Waits for all of them to end.
     pub(crate) async fn ended(&mut self) {
         for task in &mut self.0 {
             let _ended = task.await;
@@ -185,9 +190,18 @@ impl Link {
     ) -> Result<Self, Error> {
         let from = hello.address.parse::<SocketAddr>().ok().map(|own| own.ip());
         let hello = Bytes::from(hello.encode_to_vec());
+        let (coordination, coordination_waiting, coordination_count) = Queue::new(REST_WAITING);
         let (rest, rest_waiting, rest_count) = Queue::new(REST_WAITING);
         let (copies, copies_waiting, copies_count) = Queue::new(COPIES_WAITING);
         let tasks = Tasks([
+            tokio::spawn(send_all(
+                channel(address, dial, from)?,
+                COORDINATE,
+                hello.clone(),
+                coordination_waiting,
+                coordination_count,
+                Arc::clone(counts),
+            )),
             tokio::spawn(send_all(
                 channel(address, dial, from)?,
                 PEER,
@@ -206,6 +220,7 @@ impl Link {
             )),
         ]);
         Ok(Self {
+            coordination,
             rest,
             copies,
             tasks,
@@ -217,6 +232,7 @@ impl Link {
     /// past what its queue holds.
     pub(crate) fn send<W: prost::Message + Default + Debug>(&self, outgoing: &Outgoing<W>) {
         let (encoded, queue) = match outgoing {
+            Outgoing::Coordinate(message) => (message.encode_to_vec(), &self.coordination),
             Outgoing::Peer(message) => (message.encode_to_vec(), &self.rest),
             Outgoing::Copy(message) => (message.encode_to_vec(), &self.copies),
         };

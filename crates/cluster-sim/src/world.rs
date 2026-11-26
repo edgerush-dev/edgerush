@@ -33,6 +33,43 @@ const CHECKS_APART: u64 = 0x6368_6563_6b73;
 /// What sets a client's checks' lane to a pod apart from its requests': a stream of its own.
 const CHECK_LANE: NodeId = 1 << 61;
 
+/// A stream between pods, as a pod's link sends each message (`wire::wire` in the service),
+/// each a connection of its own: copies on one; heartbeats, votes, tables and handoffs on
+/// another, waiting behind nothing else; and the rest — copies' answers, takings and lacks, and
+/// the modes' messages — on a third.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Lane {
+    Copies,
+    Coordination,
+    Rest,
+}
+
+impl Lane {
+    /// The lane `message` goes on.
+    fn of(message: &Message) -> Self {
+        match both::as_store(message) {
+            Some(StoreMessage::Replicate { .. }) => Self::Copies,
+            Some(
+                StoreMessage::Replicated { .. }
+                | StoreMessage::Took { .. }
+                | StoreMessage::Lacking { .. },
+            )
+            | None => Self::Rest,
+            Some(_) => Self::Coordination,
+        }
+    }
+
+    /// What sets the order along it apart from the other lanes' between the same two, beside
+    /// [`CHECK_LANE`].
+    const fn apart(self) -> NodeId {
+        match self {
+            Self::Rest => 0,
+            Self::Copies => 1 << 62,
+            Self::Coordination => 3 << 61,
+        }
+    }
+}
+
 /// The control plane's identity, apart from every pod's and client's.
 pub const CONTROL: NodeId = CLIENT_BASE - 1;
 
@@ -53,11 +90,11 @@ pub struct Link {
     /// lost waiting twice as long as the one before, and given up after fifteen, as Linux
     /// does; nothing behind it on its lane arrives first. `None`: a message lost is gone.
     pub retransmit: Option<Time>,
-    /// The most bytes that may wait to be sent on its lanes, the bulk copies' and the rest's,
-    /// as a pod's link holds them (`COPIES_WAITING` and `REST_WAITING` in the service): a
-    /// message that would take its lane past that, with something waiting already, is dropped
-    /// and counted in [`Stats::full`]. One lane for everything waits as the rest's. `None`:
-    /// whatever is sent waits its turn.
+    /// The most bytes that may wait to be sent on its lanes, the bulk copies' and each other
+    /// lane's, as a pod's link holds them (`COPIES_WAITING` and `REST_WAITING` in the
+    /// service): a message that would take its lane past that, with something waiting
+    /// already, is dropped and counted in [`Stats::full`]. One lane for everything waits as
+    /// the rest's. `None`: whatever is sent waits its turn.
     pub waiting: Option<(u64, u64)>,
 }
 
@@ -293,11 +330,11 @@ pub struct World {
     /// them, over every life of the key and every owner: what each pod's count of it rose by
     /// as it took a data plane's report.
     applied: BTreeMap<Key, u64>,
-    /// When each link's lane is next free to start sending: bulk copies apart from the rest, as
-    /// separate streams over one connection, so that heartbeats and handoffs never queue
-    /// behind a replica's snapshot.
-    link_free: BTreeMap<(NodeId, NodeId, bool), Time>,
-    /// Whether bulk copies have a lane of their own; one lane for everything if not.
+    /// When each link's lane is next free to start sending, a pod's streams each a lane of its
+    /// own, as each is a connection of its own: so that heartbeats never queue behind a
+    /// replica's snapshot, nor behind the answers to copies or forwarded batches.
+    link_free: BTreeMap<(NodeId, NodeId, Lane), Time>,
+    /// Whether a pod's streams are lanes apart; one lane for everything if not.
     pub lanes: bool,
     config: Config,
     next_pod: NodeId,
@@ -897,17 +934,17 @@ impl World {
             return;
         }
         let bytes = both::size(&message);
-        let bulk = self.lanes
-            && matches!(
-                both::as_store(&message),
-                Some(StoreMessage::Replicate { .. })
-            );
-        let free = self.link_free.get(&(from, to, bulk)).copied().unwrap_or(0);
+        let lane = if self.lanes {
+            Lane::of(&message)
+        } else {
+            Lane::Rest
+        };
+        let free = self.link_free.get(&(from, to, lane)).copied().unwrap_or(0);
         if let Some((copies, rest)) = link.waiting {
             // What its lane has yet to send, as a pod's link counts what waits on a stream.
             let waiting =
                 free.saturating_sub(self.now).saturating_mul(link.bandwidth) / 1_000_000_000;
-            let most = if bulk { copies } else { rest };
+            let most = if lane == Lane::Copies { copies } else { rest };
             if waiting != 0 && waiting.saturating_add(bytes) > most {
                 self.stats.full += 1;
                 return;
@@ -919,7 +956,7 @@ impl World {
         // Sent once the link has sent what it already had, taking its size's time.
         let sending = bytes.saturating_mul(1_000_000_000) / link.bandwidth.max(1);
         let sent = self.now.max(free) + sending;
-        self.link_free.insert((from, to, bulk), sent);
+        self.link_free.insert((from, to, lane), sent);
         self.stats.bytes += bytes;
         *self
             .stats
@@ -928,10 +965,10 @@ impl World {
             .or_insert(0) += bytes;
         let delay = link.delay + self.rng.below(link.jitter.max(1));
         // In order along one lane, as along one stream.
-        let lane = (from, to.wrapping_add(if bulk { 1 << 62 } else { 0 }));
-        let last = self.last_arrival.get(&lane).copied().unwrap_or(0);
+        let along = (from, to.wrapping_add(lane.apart()));
+        let last = self.last_arrival.get(&along).copied().unwrap_or(0);
         let at = (sent + delay + late).max(last);
-        self.last_arrival.insert(lane, at);
+        self.last_arrival.insert(along, at);
         self.schedule(at, Event::Deliver { from, to, message });
     }
 
