@@ -168,30 +168,35 @@ fn decide_all(setup: (Worker, Limit), limits: usize) -> (Decision, Worker) {
     (decision, worker)
 }
 
-/// A registry of a hundred thousand keys, `KEY` among them unless said, and a worker with
-/// no handles.
-fn registry(with_key: bool) -> (Worker, Limit) {
+/// A registry of a hundred thousand keys, `KEY` among them unless said, made through another
+/// worker's handles, and a worker with none. The other's handles are handed on, boxed, as
+/// `Worker` is: dropped here, their tables would be freed just before what is measured, and
+/// its first allocation would pay for glibc sorting them, more instructions than making the
+/// key itself (GitHub #222).
+fn registry(with_key: bool) -> (Worker, Limit, Box<Handles<Keyed>>) {
     let mut worker: Worker = Box::new((Local::new(hasher()), Handles::new(hasher())));
     let contract = contract(100);
-    {
-        let (local, _) = &mut *worker;
-        let mut other = Handles::new(hasher());
-        let keys = (0..100_000).map(|k| format!("api/0\0key-{k}").into_bytes());
-        for key in keys.chain(with_key.then(|| KEY.to_vec())) {
-            local.decide(&mut other, &[(&key, contract)], 0);
-        }
+    let mut other = Box::new(Handles::new(hasher()));
+    let (local, _) = &mut *worker;
+    let keys = (0..100_000).map(|k| format!("api/0\0key-{k}").into_bytes());
+    for key in keys.chain(with_key.then(|| KEY.to_vec())) {
+        local.decide(&mut other, &[(&key, contract)], 0);
     }
-    (worker, contract)
+    (worker, contract, other)
 }
 
 #[library_benchmark]
 #[bench::found(registry(true))]
 #[bench::made(registry(false))]
-fn first_meeting(setup: (Worker, Limit)) -> (Decision, Worker) {
-    let (mut worker, contract) = setup;
+fn first_meeting(
+    setup: (Worker, Limit, Box<Handles<Keyed>>),
+) -> (Decision, Worker, Box<Handles<Keyed>>) {
+    let (mut worker, contract, other) = setup;
     let (local, handles) = &mut *worker;
     let decision = local.decide(handles, black_box(&[(KEY, contract)]), black_box(MS));
-    (decision, worker)
+    // Handed back with the rest, so that the other's handles are freed outside what is
+    // measured too.
+    (decision, worker, other)
 }
 
 library_benchmark_group!(
