@@ -334,9 +334,9 @@ fn a_key_cap_left_out_is_worked_out_from_the_pods() {
         cap("  resources: { requests: { cpu: 4 }, limits: { memory: 512Mi } }\n"),
         Some(128 * MIB)
     );
-    // 8 GiB on 4: two thirds of what the workers' 3,840 MiB leave, as a quantity or as
-    // bytes written as one.
-    for memory in ["8Gi", "\"8589934592\""] {
+    // 8 GiB on 4: two thirds of what the workers' 3,840 MiB leave, as a quantity, as bytes
+    // written as one, or as bytes written as an integer over 32 bits.
+    for memory in ["8Gi", "\"8589934592\"", "8589934592"] {
         assert_eq!(
             cap(&format!(
                 "  resources: {{ requests: {{ cpu: \"4\" }}, limits: {{ memory: {memory} }} }}\n"

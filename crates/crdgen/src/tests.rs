@@ -183,6 +183,50 @@ fn int_or_string() {
     );
 }
 
+/// An int-or-string of Kubernetes' quantity pattern, as a pod's resources have, is
+/// k8s-openapi's `Quantity`, which reads an integer of any size; another int-or-string is
+/// still an `IntOrString`, whose integer is 32 bits.
+#[test]
+fn a_quantity_is_k8s_openapis() {
+    let structs = analyzed(
+        r#"
+        properties:
+          limits:
+            additionalProperties:
+              anyOf: [{ type: integer }, { type: string }]
+              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+              x-kubernetes-int-or-string: true
+            type: object
+          port:
+            anyOf: [{ type: integer }, { type: string }]
+            pattern: ^[0-9]+$
+            x-kubernetes-int-or-string: true
+          size:
+            anyOf: [{ type: integer }, { type: string }]
+            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+            x-kubernetes-int-or-string: true
+          sizes:
+            items:
+              anyOf: [{ type: integer }, { type: string }]
+              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+              x-kubernetes-int-or-string: true
+            type: array
+        required: [size]
+        type: object
+        "#,
+        "Volume",
+    );
+    assert_eq!(
+        types(&structs[0]),
+        [
+            ("limits", "Option<BTreeMap<String, Quantity>>"),
+            ("port", "Option<IntOrString>"),
+            ("size", "Quantity"),
+            ("sizes", "Option<Vec<Quantity>>"),
+        ]
+    );
+}
+
 #[test]
 fn string_or_string_array() {
     let structs = analyzed(

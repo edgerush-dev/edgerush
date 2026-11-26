@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use proptest::prelude::*;
 
 use super::{millis, workers};
 
-fn cpu(quantity: &str) -> BTreeMap<String, IntOrString> {
-    BTreeMap::from([("cpu".to_owned(), IntOrString::String(quantity.to_owned()))])
+fn cpu(quantity: &str) -> BTreeMap<String, Quantity> {
+    BTreeMap::from([("cpu".to_owned(), Quantity(quantity.to_owned()))])
 }
 
 #[test]
@@ -43,17 +43,19 @@ fn a_limit_alone_is_the_request_as_kubernetes_takes_it() {
 #[test]
 fn neither_runs_one_worker() {
     assert_eq!(workers(None, None), Ok(1));
-    let memory_alone =
-        BTreeMap::from([("memory".to_owned(), IntOrString::String("1Gi".to_owned()))]);
+    let memory_alone = BTreeMap::from([("memory".to_owned(), Quantity("1Gi".to_owned()))]);
     assert_eq!(workers(Some(&memory_alone), None), Ok(1));
 }
 
 #[test]
 fn a_whole_number_of_cpus_may_be_an_integer() {
-    let three = BTreeMap::from([("cpu".to_owned(), IntOrString::Int(3))]);
-    assert_eq!(workers(Some(&three), None), Ok(3));
-    let negative = BTreeMap::from([("cpu".to_owned(), IntOrString::Int(-3))]);
-    assert_eq!(workers(Some(&negative), None), Err("-3".to_owned()));
+    let read = |cpu: serde_json::Value| {
+        let resources: BTreeMap<String, Quantity> =
+            serde_json::from_value(serde_json::json!({ "cpu": cpu })).unwrap();
+        workers(Some(&resources), None)
+    };
+    assert_eq!(read(serde_json::json!(3)), Ok(3));
+    assert_eq!(read(serde_json::json!(-3)), Err("-3".to_owned()));
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! A schema walked into the structs it needs and their fields. Adapted from kopium's
-//! `analyzer.rs` (NOTICE); the one change of substance is that an enumerated string is a
-//! `String`, its values kept for its docs.
+//! `analyzer.rs` (NOTICE); the changes of substance are that an enumerated string is a
+//! `String`, its values kept for its docs, and that a quantity is k8s-openapi's
+//! `Quantity`, not an `IntOrString`.
 
 use std::collections::BTreeMap;
 
@@ -150,7 +151,7 @@ fn container(
             }
             None => {
                 if value.x_kubernetes_int_or_string == Some(true) {
-                    "IntOrString".to_owned()
+                    int_or_string_type(value).to_owned()
                 } else if value.x_kubernetes_preserve_unknown_fields == Some(true)
                     || value
                         .one_of
@@ -238,7 +239,7 @@ fn map_value_type(
         Some("boolean") => "bool".to_owned(),
         Some("number") => number_type(s).to_owned(),
         Some("integer") => integer_type(s).to_owned(),
-        None if s.x_kubernetes_int_or_string == Some(true) => "IntOrString".to_owned(),
+        None if s.x_kubernetes_int_or_string == Some(true) => int_or_string_type(s).to_owned(),
         None if s.x_kubernetes_preserve_unknown_fields == Some(true) => {
             "serde_json::Value".to_owned()
         }
@@ -277,7 +278,7 @@ fn array_type(
             let (inner, depth) = array_type(s, stack, key, depth + 1)?;
             return Ok((format!("Vec<{inner}>"), depth));
         }
-        None if s.x_kubernetes_int_or_string == Some(true) => "IntOrString".to_owned(),
+        None if s.x_kubernetes_int_or_string == Some(true) => int_or_string_type(s).to_owned(),
         None => return Err(format!("array {key} of {stack} has items of no type")),
         Some(other) => {
             return Err(format!(
@@ -286,6 +287,20 @@ fn array_type(
         }
     };
     Ok((format!("Vec<{items}>"), depth))
+}
+
+/// The pattern of Kubernetes' `Quantity`, as its OpenAPI schema has it.
+const QUANTITY_PATTERN: &str = r"^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$";
+
+/// The type of an int-or-string: k8s-openapi's `Quantity` where it has Kubernetes'
+/// quantity pattern, as a pod's resources do, since a quantity's integer may be of any
+/// size and `IntOrString`'s is 32 bits; `IntOrString` otherwise.
+fn int_or_string_type(value: &JSONSchemaProps) -> &'static str {
+    if value.pattern.as_deref() == Some(QUANTITY_PATTERN) {
+        "Quantity"
+    } else {
+        "IntOrString"
+    }
 }
 
 /// Whether an array is of Kubernetes' standard conditions, which k8s-openapi has a type for.
