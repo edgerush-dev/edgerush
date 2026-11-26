@@ -27,6 +27,12 @@ const LINGER: Time = 50_000_000;
 /// Clients' identities start here, apart from every pod's.
 pub const CLIENT_BASE: NodeId = 1_000_000;
 
+/// What sets the clients' checks' randomness apart from the world's, from one seed.
+const CHECKS_APART: u64 = 0x6368_6563_6b73;
+
+/// What sets a client's checks' lane to a pod apart from its requests': a stream of its own.
+const CHECK_LANE: NodeId = 1 << 61;
+
 /// The control plane's identity, apart from every pod's and client's.
 pub const CONTROL: NodeId = CLIENT_BASE - 1;
 
@@ -149,6 +155,20 @@ enum Event {
         id: u64,
         pod: NodeId,
     },
+    /// Client `client`'s check `id` of `pod` reaching the pod, or, `answered`, its answer
+    /// reaching the client.
+    Check {
+        client: NodeId,
+        pod: NodeId,
+        id: u64,
+        answered: bool,
+    },
+    /// Client `client`'s check `id` of `pod` refused: its link cut, or the pod gone.
+    CheckRefused {
+        client: NodeId,
+        pod: NodeId,
+        id: u64,
+    },
     Sample,
 }
 
@@ -234,6 +254,9 @@ impl Stats {
 pub struct World {
     now: Time,
     rng: Rng,
+    /// What the clients' checks draw on, apart from everything else, so that a seed's run
+    /// goes as it did before clients checked, but where the checks change it.
+    check_rng: Rng,
     queue: BinaryHeap<Reverse<(Time, u64)>>,
     events: BTreeMap<u64, Event>,
     seq: u64,
@@ -273,6 +296,8 @@ pub struct World {
     held: BTreeMap<NodeId, (u64, u64)>,
     /// The rule clients' requests are held to, and whether `when_unreachable` admits.
     limit: Option<(Rule, bool)>,
+    /// How the synchronous mode's clients check the pods.
+    checks: crate::client::Checks,
     /// Under a rule, what clients were told, judged by the rule's reference.
     oracle: Option<Oracle>,
     /// The same, each decision judged at the true time it was made: what a skewed clock
@@ -317,6 +342,7 @@ impl World {
         let mut world = Self {
             now: 0,
             rng: Rng::new(seed),
+            check_rng: Rng::new(seed ^ CHECKS_APART),
             queue: BinaryHeap::new(),
             events: BTreeMap::new(),
             seq: 0,
@@ -342,6 +368,7 @@ impl World {
             tables: BTreeMap::new(),
             held: BTreeMap::new(),
             limit: None,
+            checks: crate::client::Checks::default(),
             oracle: None,
             true_time: None,
             decided: BTreeMap::new(),
@@ -778,6 +805,13 @@ impl World {
             Event::ClientSend(id) => self.client_send(id),
             Event::ClientCheck(id) => self.client_check(id),
             Event::Unreachable { client, id, pod } => self.client_unreachable(client, id, pod),
+            Event::Check {
+                client,
+                pod,
+                id,
+                answered,
+            } => self.check_arrived(client, pod, id, answered),
+            Event::CheckRefused { client, pod, id } => self.check_refused(client, pod, id),
             Event::Sample => self.on_sample(),
         }
     }

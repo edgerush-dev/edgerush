@@ -3,6 +3,13 @@
 //! — never when its answer is late, as the owner may have counted it — and given up at its
 //! deadline. Another way is the pod a data plane would choose, by the key, so that every
 //! client sends a key the same way.
+//!
+//! It checks every pod it may ask, as a data plane's checking thread does (docs/06 §4): one
+//! check at a time, each an interval after the last ended, but at once after a miss, and at
+//! once — at most once each interval — when a request to the pod goes unanswered in time or
+//! cannot reach it. Checks missed in a row, or one refused, its link cut or its pod gone,
+//! mark the pod down, and its keys go another way until a check is answered. Nothing else
+//! marks a pod down: such a request decides only itself, and asks for a check.
 
 use edgerush_cluster::table::{Table, shard_of};
 use edgerush_cluster::{Key, NodeId, Time};
@@ -10,7 +17,7 @@ use edgerush_cluster_synchronous::{Answer, Rule};
 
 /// The synchronous mode's messages, over the store of both modes' values.
 pub type Message = edgerush_cluster_synchronous::Message<edgerush_cluster_modes::Value>;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How one request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,8 +61,6 @@ struct Inflight {
     to: NodeId,
     /// When to ask again, the pod having answered that it did not count it.
     again: Option<Time>,
-    /// Whether the attempt in flight has been counted against its pod's breaker.
-    missed: bool,
     /// Whether it gives back one counted before: sent again until answered, at most
     /// [`GIVE_BACK_SENDS`] sends unanswered, as each may be credited, its answer only late.
     give_back: bool,
@@ -75,8 +80,6 @@ pub struct Client {
     pub interval: Time,
     /// How long a request may take before it is refused.
     pub deadline: Time,
-    /// How long an attempt may go unanswered before it is tried elsewhere.
-    pub attempt: Time,
     table: Option<Table>,
     next: u64,
     inflight: BTreeMap<u64, Inflight>,
@@ -90,16 +93,15 @@ pub struct Client {
     groups: BTreeMap<u64, Group>,
     /// Parts counted for requests then refused.
     pub orphaned: u64,
-    /// Pods it has stopped asking, each until when, as a data plane's breaker does: one left
-    /// [`AVOID_AFTER`] attempts in a row unanswered, each sent to it as the key's owner. Their keys go to another pod meanwhile, to
-    /// be forwarded.
-    avoiding: BTreeMap<NodeId, Time>,
-    /// Attempts each pod has left unanswered in a row.
-    misses: BTreeMap<NodeId, u32>,
-    /// Pods its stream to is down — a send could not reach them — each until when: asked by
-    /// no path meanwhile, where one avoided for answers missing may still be.
-    down: BTreeMap<NodeId, Time>,
-    /// Its clock as of its last event, for whom to avoid.
+    /// Pods its checks have marked down: their keys go another way, to be forwarded.
+    down: BTreeSet<NodeId>,
+    /// Each pod's checks.
+    checks: BTreeMap<NodeId, Checking>,
+    /// How it checks the pods.
+    pub checking: Checks,
+    /// The number of its last check.
+    checked: u64,
+    /// Its clock as of its last event.
     now: Time,
     /// Requests it has made, parts and give-backs aside.
     pub requests: u64,
@@ -135,12 +137,59 @@ const NOBODY: NodeId = 0;
 /// How long a request with no pod to go to waits before it is tried again.
 const WAIT: Time = 1_000_000;
 
-/// How long a client avoids a pod that left attempts unanswered.
-const AVOID_FOR: Time = 500_000_000;
+/// How a client checks the pods, as a data plane's `health_check` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checks {
+    /// From the end of one check to the start of the next.
+    pub interval: Time,
+    /// How long a check waits for its answer before it is missed.
+    pub timeout: Time,
+    /// Checks missed in a row that mark a pod down.
+    pub misses: u32,
+}
 
-/// Attempts a pod leaves unanswered in a row before a client avoids it: one alone is as likely
-/// a message lost, and avoiding the owner of a key over it sends its requests the long way.
-const AVOID_AFTER: u32 = 2;
+impl Default for Checks {
+    /// The bench's: every 100 ms, 200 ms each, three in a row.
+    fn default() -> Self {
+        Self {
+            interval: 100_000_000,
+            timeout: 200_000_000,
+            misses: 3,
+        }
+    }
+}
+
+/// One pod's checks.
+#[derive(Clone, Copy, Debug, Default)]
+struct Checking {
+    /// The check out, by its number, and when it was sent.
+    out: Option<(u64, Time)>,
+    /// When the next is due.
+    due: Time,
+    /// Checks missed in a row.
+    misses: u32,
+    /// A request to the pod went wrong since the last check began: a check asked for.
+    wanted: bool,
+    /// When the last check asked for so was due.
+    asked_at: Option<Time>,
+}
+
+impl Checking {
+    /// The next check brought forward for a request gone wrong, if one was: to `now`, but no
+    /// sooner than an interval after the last asked for so.
+    fn bring_forward(&mut self, now: Time, interval: Time) {
+        if !self.wanted || self.out.is_some() {
+            return;
+        }
+        let at = self
+            .asked_at
+            .map_or(now, |asked| asked.saturating_add(interval).max(now));
+        if at < self.due {
+            self.due = at;
+            self.asked_at = Some(at);
+        }
+    }
+}
 
 /// A request split by key.
 #[derive(Clone, Debug, Default)]
@@ -165,7 +214,6 @@ impl Client {
             keys,
             interval,
             deadline,
-            attempt: deadline / 4,
             table: None,
             next: 0,
             inflight: BTreeMap::new(),
@@ -174,9 +222,10 @@ impl Client {
             multi: None,
             groups: BTreeMap::new(),
             orphaned: 0,
-            avoiding: BTreeMap::new(),
-            misses: BTreeMap::new(),
-            down: BTreeMap::new(),
+            down: BTreeSet::new(),
+            checks: BTreeMap::new(),
+            checking: Checks::default(),
+            checked: 0,
             now: 0,
             requests: 0,
             left: BTreeMap::new(),
@@ -209,21 +258,16 @@ impl Client {
         }
     }
 
-    /// Where it would send a request under `key`: of `pods`, those it does not avoid, as
-    /// [`choose`](Self::choose) chooses; every one avoided, of those whose stream is up; none
-    /// if every one's is down.
+    /// Where it would send a request under `key`: of `pods`, those not marked down, as
+    /// [`choose`](Self::choose) chooses; none if every one is, as a data plane's plane then has
+    /// none to ask.
     fn target(&self, key: Key, pods: &[NodeId]) -> Option<NodeId> {
-        let reachable: Vec<NodeId> = pods
+        let open: Vec<NodeId> = pods
             .iter()
             .copied()
             .filter(|pod| !self.is_down(*pod))
             .collect();
-        let open: Vec<NodeId> = reachable
-            .iter()
-            .copied()
-            .filter(|pod| !self.avoided(*pod))
-            .collect();
-        self.choose(key, if open.is_empty() { &reachable } else { &open })
+        self.choose(key, &open)
     }
 
     /// Of `open`, the pods `key` may be sent to now, the one a data plane's `Plane::through`
@@ -268,13 +312,6 @@ impl Client {
             .and_then(|table| table.owner(shard_of(key, self.shards)))
     }
 
-    /// Whether it avoids `pod` now, for answers missing.
-    fn avoided(&self, pod: NodeId) -> bool {
-        self.avoiding
-            .get(&pod)
-            .is_some_and(|until| *until > self.now)
-    }
-
     /// Request `id` with no pod to send it to, every stream down: waits, tried again in a
     /// millisecond, and left to `when_unreachable` at its deadline if none comes back.
     fn wait(&mut self, id: u64, now: Time) {
@@ -282,7 +319,6 @@ impl Client {
             entry.to = NOBODY;
             entry.sent = now;
             entry.again = Some(now + WAIT);
-            entry.missed = true;
         }
     }
 
@@ -326,7 +362,6 @@ impl Client {
                 sent: now,
                 to: to.unwrap_or(NOBODY),
                 again: None,
-                missed: false,
                 give_back: true,
                 unanswered: 0,
                 receipt,
@@ -364,7 +399,6 @@ impl Client {
                 sent: now,
                 to: to.unwrap_or(NOBODY),
                 again: None,
-                missed: false,
                 give_back: false,
                 unanswered: 0,
                 receipt: 0,
@@ -418,7 +452,6 @@ impl Client {
                     sent: now,
                     to: to.unwrap_or(NOBODY),
                     again: None,
-                    missed: false,
                     give_back: false,
                     unanswered: 0,
                     receipt: 0,
@@ -526,8 +559,6 @@ impl Client {
                     0
                 };
                 self.inflight.remove(&id);
-                self.avoiding.remove(&inflight.to);
-                self.misses.remove(&inflight.to);
                 if inflight.give_back {
                     return (None, Vec::new());
                 }
@@ -546,8 +577,6 @@ impl Client {
             // Refused under its rule, charged nothing: what other parts were charged given back.
             Answer::Limited { .. } => {
                 self.inflight.remove(&id);
-                self.avoiding.remove(&inflight.to);
-                self.misses.remove(&inflight.to);
                 if let Some(group) = inflight.group {
                     if let Some(entry) = self.groups.get_mut(&group) {
                         entry.limited = true;
@@ -614,13 +643,12 @@ impl Client {
         entry.sent = now;
         entry.to = to;
         entry.again = None;
-        entry.missed = false;
         Some((to, self.request(id, inflight.key)))
     }
 
     /// Request `id` could not reach the pod it was sent to — its stream to it down, the pod
-    /// gone — so that pod never had it: sent another way, to be forwarded, and the pod avoided
-    /// as a data plane's breaker would.
+    /// gone — so that pod never had it: sent another way, to be forwarded, never to that pod
+    /// again. That marks the pod down for no other request: only its checks do.
     pub fn unreachable(
         &mut self,
         id: u64,
@@ -636,14 +664,93 @@ impl Client {
         {
             return None;
         }
-        self.avoiding.insert(pod, now + AVOID_FOR);
-        self.down.insert(pod, now + AVOID_FOR);
-        self.retry_anywhere(id, now, pods, pod)
+        self.trouble(pod, now);
+        self.retry_anywhere(id, now, pods, pod, false)
     }
 
-    /// At `now`: requests past their deadline refused, those a pod said it did not count asked
-    /// again, and attempts unanswered for `attempt` counted against their pod's breaker — never
-    /// sent again, as the owner may have counted them.
+    /// At `now`, the checks to send, each to its pod with its number: one to each of `pods`
+    /// with none out and its interval since the last ended gone by, a pod first met checked at
+    /// once. A check out past its timeout is missed first, the `misses`th in a row marking its
+    /// pod down.
+    pub fn checks_due(&mut self, now: Time, pods: &[NodeId]) -> Vec<(NodeId, u64)> {
+        self.now = now;
+        let mut due = Vec::new();
+        for pod in pods {
+            let checks = self.checking;
+            let mut checking = self.checks.get(pod).copied().unwrap_or(Checking {
+                due: now,
+                ..Checking::default()
+            });
+            if let Some((_, sent)) = checking.out
+                && now.saturating_sub(sent) >= checks.timeout
+            {
+                checking.out = None;
+                checking.misses = checking.misses.saturating_add(1);
+                // Missed: checked again at once, but an interval on once marked down.
+                checking.due = if checking.misses >= checks.misses {
+                    self.down.insert(*pod);
+                    now + checks.interval
+                } else {
+                    now
+                };
+                checking.bring_forward(now, checks.interval);
+            }
+            if checking.out.is_none() && now >= checking.due {
+                self.checked += 1;
+                checking.out = Some((self.checked, now));
+                checking.wanted = false;
+                due.push((*pod, self.checked));
+            }
+            self.checks.insert(*pod, checking);
+        }
+        due
+    }
+
+    /// Pod `pod`'s answer to check `id`, at `now`: if it is the check out, the pod is up.
+    pub fn check_answered(&mut self, pod: NodeId, id: u64, now: Time) {
+        self.now = now;
+        let interval = self.checking.interval;
+        if let Some(checking) = self.checks.get_mut(&pod)
+            && checking.out.is_some_and(|(out, _)| out == id)
+        {
+            checking.out = None;
+            checking.due = now + interval;
+            checking.misses = 0;
+            checking.bring_forward(now, interval);
+            self.down.remove(&pod);
+        }
+    }
+
+    /// A request to `pod` went wrong at `now` — unanswered by its deadline, or unable to reach
+    /// it — which asks for its pod to be checked at once, at most once each interval.
+    fn trouble(&mut self, pod: NodeId, now: Time) {
+        let interval = self.checking.interval;
+        let checking = self.checks.entry(pod).or_insert(Checking {
+            due: now,
+            ..Checking::default()
+        });
+        checking.wanted = true;
+        checking.bring_forward(now, interval);
+    }
+
+    /// Check `id` of `pod` refused at `now`, its link cut or the pod gone: if it is the check
+    /// out, the pod is down at once.
+    pub fn check_refused(&mut self, pod: NodeId, id: u64, now: Time) {
+        self.now = now;
+        let interval = self.checking.interval;
+        if let Some(checking) = self.checks.get_mut(&pod)
+            && checking.out.is_some_and(|(out, _)| out == id)
+        {
+            checking.out = None;
+            checking.due = now + interval;
+            checking.bring_forward(now, interval);
+            self.down.insert(pod);
+        }
+    }
+
+    /// At `now`: requests past their deadline refused, and those a pod said it did not count
+    /// asked again. One unanswered is waited on to its deadline, never sent again, as the
+    /// owner may have counted it, and marks its pod down for nothing.
     pub fn check(&mut self, now: Time, pods: &[NodeId]) -> (Vec<Ended>, Vec<Send>) {
         self.now = now;
         let mut ended = Vec::new();
@@ -670,12 +777,15 @@ impl Client {
                     if let Some(entry) = self.inflight.get_mut(&id) {
                         entry.unanswered = unanswered;
                     }
-                    sends.extend(self.retry_anywhere(id, now, pods, inflight.to));
+                    sends.extend(self.retry_anywhere(id, now, pods, inflight.to, true));
                 }
                 continue;
             }
             if now.saturating_sub(inflight.started) >= self.deadline {
                 self.inflight.remove(&id);
+                if inflight.to != NOBODY {
+                    self.trouble(inflight.to, now);
+                }
                 let keys = if inflight.keys.is_empty() {
                     vec![inflight.key]
                 } else {
@@ -695,44 +805,22 @@ impl Client {
             // Not counted: asked again of another pod, which knows the owner if its table is
             // later — the pod asked may be cut off from the rest, its table behind.
             if inflight.again.is_some_and(|at| now >= at) {
-                sends.extend(self.retry_anywhere(id, now, pods, inflight.to));
-                continue;
-            }
-            // A request sent whole is waited on for three quarters of its deadline: the pod
-            // gathering it answers once its parts are in.
-            let attempt = if inflight.keys.is_empty() {
-                self.attempt
-            } else {
-                self.deadline / 4 * 3
-            };
-            if !inflight.missed && now.saturating_sub(inflight.sent) >= attempt {
-                // A pod asked only to forward, the key's owner another — perhaps the one gone
-                // and failing over — is not counted against: that says nothing of the pod, as
-                // a data plane's breaker has it (docs/06 §4). A pod gathering a request is.
-                if !inflight.keys.is_empty() || self.owner(inflight.key) == Some(inflight.to) {
-                    let misses = self.misses.entry(inflight.to).or_insert(0);
-                    *misses += 1;
-                    if *misses >= AVOID_AFTER {
-                        self.avoiding.insert(inflight.to, now + AVOID_FOR);
-                    }
-                }
-                // Counted once against it, and waited on to its deadline.
-                if let Some(entry) = self.inflight.get_mut(&id) {
-                    entry.missed = true;
-                }
+                sends.extend(self.retry_anywhere(id, now, pods, inflight.to, true));
             }
         }
         (ended, sends)
     }
 
-    /// Sends request `id` again, to a pod not `avoid` as [`choose`](Self::choose) chooses;
-    /// else to `avoid`, if its stream is up; else it waits.
+    /// Sends request `id` again, to a pod not `avoid` and not marked down, as
+    /// [`choose`](Self::choose) chooses; else, if `or_avoid`, to `avoid` if it is not marked
+    /// down; else it waits.
     fn retry_anywhere(
         &mut self,
         id: u64,
         now: Time,
         pods: &[NodeId],
         avoid: NodeId,
+        or_avoid: bool,
     ) -> Option<(NodeId, Message)> {
         let inflight = self.inflight.get(&id)?.clone();
         let others: Vec<NodeId> = pods
@@ -740,8 +828,7 @@ impl Client {
             .copied()
             .filter(|pod| *pod != avoid && !self.is_down(*pod))
             .collect();
-        // Else the pod avoided, if its stream is not down; else it waits.
-        let pool = if others.is_empty() {
+        let pool = if others.is_empty() && or_avoid {
             pods.iter()
                 .copied()
                 .filter(|pod| *pod == avoid && !self.is_down(*pod))
@@ -757,13 +844,13 @@ impl Client {
         entry.sent = now;
         entry.to = to;
         entry.again = None;
-        entry.missed = false;
         Some((to, self.request(id, inflight.key)))
     }
 
-    /// Whether its stream to `pod` is down now.
-    fn is_down(&self, pod: NodeId) -> bool {
-        self.down.get(&pod).is_some_and(|until| *until > self.now)
+    /// Whether its checks have marked `pod` down.
+    #[must_use]
+    pub fn is_down(&self, pod: NodeId) -> bool {
+        self.down.contains(&pod)
     }
 }
 

@@ -329,6 +329,12 @@ fn a_late_admission_of_a_request_left_to_allow_stands() {
                 delay: ms(1_200),
                 ..Link::lan()
             };
+            // The clients' checks wait longer than the answers are late, so that the pods stay up
+            // for them.
+            world.set_checks(edgerush_cluster_sim::client::Checks {
+                timeout: ms(2_000),
+                ..edgerush_cluster_sim::client::Checks::default()
+            });
             let clients: Vec<_> = world.client_ids().collect();
             for pod in &pods {
                 for client in &clients {

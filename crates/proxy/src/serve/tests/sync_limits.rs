@@ -274,19 +274,49 @@ async fn give_back_directly(address: &str, key: &[u8], count: u64) {
     );
 }
 
-/// `config` with its owners' breaker opened by `failures` in a row and probed after
-/// `probe_after_ms`.
-fn with_breaker(mut config: Config, failures: u32, probe_after_ms: u64) -> Config {
+/// `config` with its pods checked every `interval_ms`, each check waiting `timeout_ms`, and
+/// `misses` in a row marking a pod down.
+fn with_checks(mut config: Config, interval_ms: u64, timeout_ms: u64, misses: u32) -> Config {
     let synchronous = config
         .rate_limiting
         .as_mut()
         .and_then(|limiting| limiting.synchronous.as_mut())
         .unwrap();
-    synchronous.breaker = edgerush_config::RateLimitBreaker {
-        failures,
-        probe_after_ms,
+    synchronous.health_check = edgerush_config::RateLimitHealthCheck {
+        interval_ms,
+        timeout_ms,
+        misses,
     };
     config
+}
+
+/// `config` with checks quick to mark a pod down: every 50 ms, missed past 100 ms, two in a
+/// row.
+fn quick_checks(config: Config) -> Config {
+    with_checks(config, 50, 100, 2)
+}
+
+/// The value of the metric `name` of the pod at `address` in `scrape`.
+fn of_pod(scrape: &str, name: &str, address: &str) -> Option<u64> {
+    metric(
+        scrape,
+        &format!(r#"edgerush_rate_limit_{name}{{pod="{address}"}}"#),
+    )
+}
+
+/// Waits, five seconds at most, until `proxy`'s checks have marked the pod at `address`
+/// down, or up: how long that took.
+async fn marked(proxy: &Proxy, address: &str, down: bool) -> Duration {
+    let began = Instant::now();
+    while of_pod(&proxy.metrics(), "pod_down", address) != Some(u64::from(down)) {
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{address} never marked {}",
+            if down { "down" } else { "up" }
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    began.elapsed()
 }
 
 /// The line of `scrape` that begins `name`, and its value.
@@ -298,7 +328,7 @@ fn metric(scrape: &str, name: &str) -> Option<u64> {
 
 /// The name of the metric of what was asked of the pod at `address` and came to `outcome`.
 fn asks(address: &str, outcome: &str) -> String {
-    format!(r#"edgerush_rate_limit_owner_asks_total{{pod="{address}",outcome="{outcome}"}}"#)
+    format!(r#"edgerush_rate_limit_pod_asks_total{{pod="{address}",outcome="{outcome}"}}"#)
 }
 
 /// `config` with its first route's first rule under `limits`, each `(name, burst)` keyed by
@@ -323,7 +353,7 @@ fn synchronous_in(
     let addresses: Vec<String> = addresses.iter().map(|a| format!("\"{a}\"")).collect();
     config.rate_limiting = Some(
         serde_saphyr::from_str(&format!(
-            "{{ mode: synchronous, service: {{ addresses: [{}], key_secret: {SECRET} }}, synchronous: {{ timeout_ms: {timeout_ms}, when_unreachable: {when_unreachable}, breaker: {{ failures: 5, probe_after_ms: 1000 }} }} }}",
+            "{{ mode: synchronous, service: {{ addresses: [{}], key_secret: {SECRET} }}, synchronous: {{ timeout_ms: {timeout_ms}, when_unreachable: {when_unreachable}, health_check: {{ interval_ms: 100, timeout_ms: 1000, misses: 3 }} }} }}",
             addresses.join(", ")
         ))
         .unwrap(),
@@ -350,13 +380,50 @@ async fn serving_at(
     Vec<::h2::client::SendRequest<Bytes>>,
     Vec<SocketAddr>,
 ) {
+    workers_of(started(config, workers), workers).await
+}
+
+/// The same behind `relay`, its pod's only way in: the checking thread's connection first,
+/// connection 0, so that the workers' are counted from 1.
+async fn serving_behind(
+    config: &Config,
+    workers: usize,
+    relay: &GatedRelay,
+) -> (
+    Arc<Proxy>,
+    Vec<::h2::client::SendRequest<Bytes>>,
+    Vec<SocketAddr>,
+) {
+    let proxy = started(config, workers);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while relay.accepted() == 0 {
+        assert!(Instant::now() < deadline, "never checked");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    workers_of(proxy, workers).await
+}
+
+/// A data plane for `config` of `workers` workers, its rate limits started.
+fn started(config: &Config, workers: usize) -> Arc<Proxy> {
     let proxy = Proxy::new(
         compile(config).unwrap(),
         NonZeroUsize::new(workers).unwrap(),
     )
     .unwrap();
     proxy.start_rate_limits(|| {}).unwrap();
-    let proxy = Arc::new(proxy);
+    Arc::new(proxy)
+}
+
+/// `workers` workers of `proxy`, each serving a connection of its own: the data plane, a
+/// client's connection to each, and where each listens.
+async fn workers_of(
+    proxy: Arc<Proxy>,
+    workers: usize,
+) -> (
+    Arc<Proxy>,
+    Vec<::h2::client::SendRequest<Bytes>>,
+    Vec<SocketAddr>,
+) {
     let mut sends = Vec::new();
     let mut fronts = Vec::new();
     for position in 0..u16::try_from(workers).unwrap() {
@@ -396,6 +463,17 @@ async fn send_round(
         sends.push(send);
     }
     answers
+}
+
+/// A client's connection to each worker listening at `fronts`, made now: after a wait on a
+/// pod's checks, as a worker closes a connection that waits long for its first or next
+/// request.
+async fn connected(fronts: &[SocketAddr]) -> Vec<::h2::client::SendRequest<Bytes>> {
+    let mut sends = Vec::new();
+    for front in fronts {
+        sends.push(h2_library_client(*front, &::h2::client::Builder::new()).await);
+    }
+    sends
 }
 
 fn statuses(answers: &[Response<::h2::RecvStream>]) -> Vec<u16> {
@@ -677,13 +755,15 @@ async fn a_replica_decides_the_keys_of_an_owner_gone_unheard_with_the_store_set_
                     pod.pod.set_forwarder_decides(decides).await;
                 }
                 let (upstream, _) = counting_upstream().await;
-                let config = synchronous_in(
+                // Checks quick to mark the stopped pod down, wherever its connections are
+                // refused only after retrying (Windows).
+                let config = quick_checks(synchronous_in(
                     everything_config(upstream),
                     &[("per-client", 5)],
                     &store.addresses(),
                     200,
                     "deny",
-                );
+                ));
                 let (_, key) = keys_of(&config).remove(0);
                 let owner = store.owner_of(&key).await;
                 let (_proxy, mut sends) = serving(&config, 1).await;
@@ -721,11 +801,12 @@ async fn a_replica_decides_the_keys_of_an_owner_gone_unheard_with_the_store_set_
         .await;
 }
 
-/// A seed that does not answer opens its breaker after `failures` timeouts in a row: from
-/// then on its requests are decided by `when_unreachable` at once, nothing asked of it, and
-/// the metrics say so, by its address.
+/// A pod that accepts and answers nothing is marked down by its checks alone, checked again
+/// at once after each miss, within about misses x timeout: from then on its requests go to
+/// `when_unreachable` at once, with no wait. Before that, a request waits its timeout and
+/// marks nothing.
 #[tokio::test]
-async fn an_owner_that_keeps_timing_out_opens_its_breaker() {
+async fn a_pod_that_answers_nothing_is_marked_down_by_its_checks() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -739,7 +820,65 @@ async fn an_owner_that_keeps_timing_out_opens_its_breaker() {
                 }
             });
             let (upstream, _) = counting_upstream().await;
-            let config = with_breaker(
+            let config = quick_checks(synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 10)],
+                std::slice::from_ref(&address),
+                200,
+                "deny",
+            ));
+            let (proxy, _, fronts) = serving_at(&config, 1).await;
+            let took = marked(&proxy, &address, true).await;
+            let mut sends = connected(&fronts).await;
+            assert!(took < Duration::from_secs(1), "marked down after {took:?}");
+            let began = Instant::now();
+            assert_eq!(
+                statuses(&send_round(&mut sends, 5).await),
+                [503, 503, 503, 503, 503]
+            );
+            assert!(
+                began.elapsed() < Duration::from_millis(200),
+                "none waited: {:?}",
+                began.elapsed()
+            );
+            let scrape = proxy.metrics();
+            let line = |name: &str| metric(&scrape, name);
+            assert_eq!(line(&asks(&address, "timed_out")), Some(0), "{scrape}");
+            assert_eq!(of_pod(&scrape, "pod_marked_down_total", &address), Some(1));
+            let missed = format!(
+                r#"edgerush_rate_limit_pod_checks_total{{pod="{address}",outcome="missed"}}"#
+            );
+            assert!(line(&missed) >= Some(2), "{scrape}");
+            assert_eq!(
+                line(r#"edgerush_rate_limit_unreachable_total{action="deny"}"#),
+                Some(5)
+            );
+        })
+        .await;
+}
+
+/// After a miss, a pod is checked again at once, back to back, as HAProxy's `fastinter`
+/// checks a server going down; after an answer, an interval on. Each check of a pod that
+/// accepts and says nothing opens a connection of its own, its stream never opened, so the
+/// connections accepted show when each began: a check's timeout apart, not its interval.
+#[tokio::test]
+async fn after_a_miss_a_pod_is_checked_again_at_once() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = silent.local_addr().unwrap().to_string();
+            let began = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let held_began = Arc::clone(&began);
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = silent.accept().await {
+                    held_began.lock().unwrap().push(Instant::now());
+                    held.push(socket);
+                }
+            });
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
                 synchronous_in(
                     everything_config(upstream),
                     &[("per-client", 10)],
@@ -747,42 +886,209 @@ async fn an_owner_that_keeps_timing_out_opens_its_breaker() {
                     200,
                     "deny",
                 ),
-                2,
-                60_000,
+                1_000,
+                200,
+                100,
+            );
+            // No request: only the checks connect.
+            let _serving = serving(&config, 1).await;
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            let began = began.lock().unwrap().clone();
+            assert!(began.len() >= 4, "{} checks", began.len());
+            for pair in began.windows(2) {
+                let gap = pair[1] - pair[0];
+                // A timeout, a timer's tick short at most; an interval on, over a second.
+                assert!(gap >= Duration::from_millis(180), "{gap:?} between checks");
+                assert!(gap < Duration::from_millis(700), "{gap:?} between checks");
+            }
+        })
+        .await;
+}
+
+/// A worker's ask that times out has its pod checked at once, though its interval is ten
+/// seconds: a pod gone silent after its first check answered is marked down within about
+/// misses x timeout of the ask, not at its next check due.
+#[tokio::test]
+async fn a_workers_timeout_has_its_pod_checked_at_once() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 100)],
+                    std::slice::from_ref(&relay.address),
+                    100,
+                    "deny",
+                ),
+                10_000,
+                200,
+                3,
             );
             let (proxy, mut sends) = serving(&config, 1).await;
-            let began = Instant::now();
-            assert_eq!(statuses(&send_round(&mut sends, 2).await), [503, 503]);
-            assert!(began.elapsed() >= Duration::from_millis(400), "each waited");
-            let began = Instant::now();
-            assert_eq!(
-                statuses(&send_round(&mut sends, 5).await),
-                [503, 503, 503, 503, 503]
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            let answered = format!(
+                r#"edgerush_rate_limit_pod_checks_total{{pod="{}",outcome="answered"}}"#,
+                relay.address
             );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), &answered) < Some(1) {
+                assert!(Instant::now() < deadline, "its first check never answered");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            relay.shut_all();
+            let asked = Instant::now();
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            let took = marked(&proxy, &relay.address, true).await;
             assert!(
-                began.elapsed() < Duration::from_millis(400),
-                "none waited: {:?}",
-                began.elapsed()
+                asked.elapsed() < Duration::from_secs(2),
+                "marked down {took:?} on, {:?} after the ask",
+                asked.elapsed()
             );
+        })
+        .await;
+}
+
+/// Workers whose every ask of a pod that answers times out have it checked at once, but at
+/// most once each interval: its checks stay a few a second, not back to back.
+#[tokio::test]
+async fn workers_asking_for_checks_have_them_once_each_interval() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let relay = slow_relay(owner, Duration::from_millis(60)).await;
+            let _store =
+                Store::formed(vec![(listener, relay.clone())], &store_config(), None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 1_000)],
+                    std::slice::from_ref(&relay),
+                    20,
+                    "deny",
+                ),
+                500,
+                1_000,
+                3,
+            );
+            let (proxy, _, fronts) = serving_at(&config, 1).await;
+            let answered = format!(
+                r#"edgerush_rate_limit_pod_checks_total{{pod="{relay}",outcome="answered"}}"#
+            );
+            // Its first check answered, every ask then times out for 2 s.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), &answered) < Some(1) {
+                assert!(Instant::now() < deadline, "never checked");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let before = metric(&proxy.metrics(), &answered).unwrap();
+            let mut sends = connected(&fronts).await;
+            let began = Instant::now();
+            let mut asks = 0;
+            while began.elapsed() < Duration::from_secs(2) {
+                assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+                asks += 1;
+            }
+            let checks = metric(&proxy.metrics(), &answered).unwrap() - before;
+            // One asked for once each interval, and an interval after each: about one every
+            // 500 ms over 2 s; back to back, one every 60 ms or so.
+            assert!(asks >= 20, "{asks} asks");
+            assert!(checks <= 9, "{checks} checks in 2 s");
+            assert_eq!(of_pod(&proxy.metrics(), "pod_down", &relay), Some(0));
+        })
+        .await;
+}
+
+/// A pod whose connections are refused, here dropped as they are accepted, is marked down at
+/// its first check, its stream never opened: no misses are waited for.
+#[tokio::test]
+async fn a_pod_that_refuses_is_marked_down_at_once() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Accepts and drops every connection: each stream broken as it opens.
+            let closing = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let closed = closing.local_addr().unwrap().to_string();
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = closing.accept().await {
+                    drop(socket);
+                }
+            });
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    std::slice::from_ref(&closed),
+                    200,
+                    "deny",
+                ),
+                // A check a second: at the first, refused; by misses, the third, two seconds on.
+                1_000,
+                1_000,
+                3,
+            );
+            let (proxy, _) = serving(&config, 1).await;
+            let took = marked(&proxy, &closed, true).await;
+            assert!(took < Duration::from_millis(500), "after {took:?}");
+            let refused = format!(
+                r#"edgerush_rate_limit_pod_checks_total{{pod="{closed}",outcome="refused"}}"#
+            );
+            assert!(metric(&proxy.metrics(), &refused) >= Some(1));
+        })
+        .await;
+}
+
+/// A pod slow to answer, past the requests' timeout but within the checks', is not marked
+/// down: its requests each wait their timeout and go to `when_unreachable`, its checks are
+/// answered, and the metrics show it slow.
+#[tokio::test]
+async fn a_slow_pod_is_asked_and_never_marked_down() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let owner = listener.local_addr().unwrap();
+            let relay = slow_relay(owner, Duration::from_millis(150)).await;
+            let _store =
+                Store::formed(vec![(listener, relay.clone())], &store_config(), None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = with_checks(
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 100)],
+                    std::slice::from_ref(&relay),
+                    50,
+                    "deny",
+                ),
+                50,
+                1_000,
+                2,
+            );
+            let (proxy, mut sends) = serving(&config, 1).await;
+            for _ in 0..4 {
+                let began = Instant::now();
+                assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+                assert!(began.elapsed() >= Duration::from_millis(50), "it waited");
+            }
+            // Checked meanwhile, each answer as slow as the requests'.
+            let answered = format!(
+                r#"edgerush_rate_limit_pod_checks_total{{pod="{relay}",outcome="answered"}}"#
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while metric(&proxy.metrics(), &answered) < Some(3) {
+                assert!(Instant::now() < deadline, "its checks never answered");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             let scrape = proxy.metrics();
-            let line = |name: &str| metric(&scrape, name);
-            assert_eq!(line(&asks(&address, "timed_out")), Some(2), "{scrape}");
-            assert_eq!(
-                line(&format!(
-                    r#"edgerush_rate_limit_owner_breaker_trips_total{{pod="{address}"}}"#
-                )),
-                Some(1)
-            );
-            assert_eq!(
-                line(&format!(
-                    r#"edgerush_rate_limit_owner_breaker_open{{pod="{address}"}}"#
-                )),
-                Some(1)
-            );
-            assert_eq!(
-                line(r#"edgerush_rate_limit_unreachable_total{action="deny"}"#),
-                Some(7)
-            );
+            assert_eq!(of_pod(&scrape, "pod_down", &relay), Some(0), "{scrape}");
+            assert_eq!(of_pod(&scrape, "pod_marked_down_total", &relay), Some(0));
+            assert_eq!(metric(&scrape, &asks(&relay, "timed_out")), Some(4));
         })
         .await;
 }
@@ -835,6 +1141,8 @@ async fn owners_are_asked_with_the_certificate_the_config_shows() {
 struct GatedRelay {
     address: String,
     gates: Arc<std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>>,
+    /// Each connection's switch that cuts it, both ways, as a connection lost.
+    cuts: Arc<std::sync::Mutex<Vec<tokio::sync::watch::Sender<bool>>>>,
     /// Whether a connection's gate is open when it is accepted.
     open_at_first: Arc<std::sync::atomic::AtomicBool>,
     accepted: Arc<AtomicUsize>,
@@ -855,6 +1163,8 @@ impl GatedRelay {
         let listener = TcpListener::bind((ip, 0)).await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let gates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cuts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held_cuts = Arc::clone(&cuts);
         let open_at_first = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let held_open_at_first = Arc::clone(&open_at_first);
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -874,20 +1184,32 @@ impl GatedRelay {
                 let (gate, mut open) =
                     tokio::sync::watch::channel(held_open_at_first.load(Ordering::Relaxed));
                 held_gates.lock().unwrap().push(gate);
+                let (cut, cutting) = tokio::sync::watch::channel(false);
+                held_cuts.lock().unwrap().push(cut);
                 let nth = held_accepted.fetch_add(1, Ordering::Relaxed);
                 let accepted_in = held_epoch.load(Ordering::Relaxed);
                 let (mut from_client, mut to_client) = client.into_split();
                 let (mut from_server, mut to_server) = server.into_split();
+                let mut cut_up = cutting.clone();
                 tokio::spawn(async move {
-                    let _ended = tokio::io::copy(&mut from_client, &mut to_server).await;
+                    tokio::select! {
+                        _ = tokio::io::copy(&mut from_client, &mut to_server) => {}
+                        // A switch let go of, forgotten, cuts nothing.
+                        Ok(_) = cut_up.wait_for(|cut| *cut) => {}
+                    }
                 });
+                let mut cut_down = cutting;
                 let (ended, epoch) = (Arc::clone(&held_ended), Arc::clone(&held_epoch));
                 tokio::spawn(async move {
                     let mut buffer = vec![0; 16_384];
-                    while let Ok(read) = from_server.read(&mut buffer).await
-                        && read > 0
-                    {
-                        if open.wait_for(|open| *open).await.is_err()
+                    loop {
+                        let read = tokio::select! {
+                            read = from_server.read(&mut buffer) => read,
+                            Ok(_) = cut_down.wait_for(|cut| *cut) => break,
+                        };
+                        let Ok(read) = read else { break };
+                        if read == 0
+                            || open.wait_for(|open| *open).await.is_err()
                             || to_client.write_all(&buffer[..read]).await.is_err()
                         {
                             break;
@@ -902,6 +1224,7 @@ impl GatedRelay {
         Self {
             address,
             gates,
+            cuts,
             open_at_first,
             accepted,
             ended,
@@ -918,6 +1241,7 @@ impl GatedRelay {
             gate.send_replace(true);
         }
         gates.clear();
+        self.cuts.lock().unwrap().clear();
         self.accepted.store(0, Ordering::Relaxed);
         self.ended.lock().unwrap().clear();
     }
@@ -939,6 +1263,11 @@ impl GatedRelay {
         }
     }
 
+    /// Cuts the `nth` connection accepted, from 0, both ways.
+    fn cut(&self, nth: usize) {
+        self.cuts.lock().unwrap()[nth].send_replace(true);
+    }
+
     /// Opens or shuts the gate of the `nth` connection accepted, from 0.
     fn gate(&self, nth: usize, open: bool) {
         self.gates.lock().unwrap()[nth].send_replace(open);
@@ -946,10 +1275,6 @@ impl GatedRelay {
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::Relaxed)
-    }
-
-    fn ended(&self) -> usize {
-        self.ended.lock().unwrap().len()
     }
 
     /// Whether the `nth` connection accepted has ended.
@@ -962,8 +1287,15 @@ impl GatedRelay {
 /// connection to it goes through the relay: formed, then with every connection forming made
 /// forgotten. Served plain, or with `tls`.
 async fn behind_a_relay(tls: Option<SecuredPods>) -> (Store, GatedRelay) {
+    let (store, relay, _) = behind_a_relay_reached(tls).await;
+    (store, relay)
+}
+
+/// The same, and where the pod itself is reached, past the relay, to be asked directly.
+async fn behind_a_relay_reached(tls: Option<SecuredPods>) -> (Store, GatedRelay, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let relay = GatedRelay::to(listener.local_addr().unwrap()).await;
+    let direct = listener.local_addr().unwrap();
+    let relay = GatedRelay::to(direct).await;
     let store = Store::formed(
         vec![(listener, relay.address.clone())],
         &store_config(),
@@ -973,14 +1305,14 @@ async fn behind_a_relay(tls: Option<SecuredPods>) -> (Store, GatedRelay) {
     store.stop_forming();
     tokio::time::sleep(Duration::from_millis(50)).await;
     relay.forget();
-    (store, relay)
+    (store, relay, direct.to_string())
 }
 
-/// An open breaker is probed after `probe_after`: once its pod is back and tells its table on
-/// the probe's stream, the breaker closes, and requests are asked of the pod again. Plain, and
-/// with mutual TLS, which the probe dials with as the streams do.
+/// A pod marked down is marked up by its next check answered, once it is back, and
+/// requests are asked of it again. Plain, and with mutual TLS, which the checks dial with as
+/// the workers' streams do.
 #[tokio::test]
-async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
+async fn a_pod_marked_down_is_marked_up_once_a_check_is_answered() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -990,43 +1322,86 @@ async fn an_open_breaker_closes_once_a_probe_hears_from_its_owner() {
                 let (_store, relay) = behind_a_relay(tls).await;
                 relay.shut_all();
                 let (upstream, _) = counting_upstream().await;
-                let mut config = with_breaker(
-                    synchronous_in(
-                        everything_config(upstream),
-                        &[("per-client", 10)],
-                        std::slice::from_ref(&relay.address),
-                        100,
-                        "deny",
-                    ),
-                    1,
-                    200,
-                );
+                let mut config = quick_checks(synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    std::slice::from_ref(&relay.address),
+                    100,
+                    "deny",
+                ));
                 if secured {
                     let shown = authority.issue(&["plane", PLANE_ID]);
                     config = service_tls(config, &authority.pem(), POD_ID, shown);
                 }
-                let (proxy, mut sends) = serving(&config, 1).await;
+                let (proxy, _, fronts) = serving_at(&config, 1).await;
+                marked(&proxy, &relay.address, true).await;
+                let mut sends = connected(&fronts).await;
                 assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
-                let open = format!(
-                    r#"edgerush_rate_limit_owner_breaker_open{{pod="{}"}}"#,
-                    relay.address
-                );
-                assert_eq!(metric(&proxy.metrics(), &open), Some(1));
                 relay.open_all();
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while metric(&proxy.metrics(), &open) != Some(0) {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the breaker never closed, secured {secured}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
+                let took = marked(&proxy, &relay.address, false).await;
+                let mut sends = connected(&fronts).await;
+                assert!(
+                    took < Duration::from_secs(1),
+                    "up after {took:?}, secured {secured}"
+                );
                 assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
                 assert_eq!(
                     metric(&proxy.metrics(), &asks(&relay.address, "answered")),
                     Some(1)
                 );
             }
+        })
+        .await;
+}
+
+/// The checks' stream lost, and opened again at once, marks nothing: the pod is down only if
+/// it cannot be opened again, and its checks are answered on the new one.
+#[tokio::test]
+async fn a_checks_stream_lost_and_opened_again_marks_nothing() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = quick_checks(synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 100)],
+                std::slice::from_ref(&relay.address),
+                200,
+                "deny",
+            ));
+            let (proxy, mut sends, _) = serving_behind(&config, 1, &relay).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 2, "the checks' and the worker's");
+            relay.cut(0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while relay.accepted() < 3 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the checks' stream never opened again"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // A few checks on the new stream.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let scrape = proxy.metrics();
+            let checks = |outcome: &str| {
+                metric(
+                    &scrape,
+                    &format!(
+                        r#"edgerush_rate_limit_pod_checks_total{{pod="{}",outcome="{outcome}"}}"#,
+                        relay.address
+                    ),
+                )
+            };
+            assert_eq!(checks("refused"), Some(0), "{scrape}");
+            assert!(checks("answered") >= Some(3), "{scrape}");
+            assert_eq!(
+                of_pod(&scrape, "pod_marked_down_total", &relay.address),
+                Some(0),
+                "{scrape}"
+            );
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
         })
         .await;
 }
@@ -1169,18 +1544,22 @@ async fn with_local_an_owner_out_of_reach_is_decided_by_the_process_buckets() {
                 listener.local_addr().unwrap().to_string()
             };
             let (upstream, _) = counting_upstream().await;
-            let config = with_breaker(
-                synchronous_in(
-                    everything_config(upstream),
-                    &[("per-client", 10)],
-                    &[closed],
-                    100,
-                    "local",
-                ),
-                2,
-                60_000,
-            );
-            let (proxy, mut sends) = serving(&config, 2).await;
+            let config = quick_checks(synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 10)],
+                std::slice::from_ref(&closed),
+                100,
+                "local",
+            ));
+            let (proxy, _, fronts) = serving_at(&config, 2).await;
+            // Marked down first, so that no request waits for it and the buckets' waits are
+            // exact; the clients connect only then, as a connection waiting that long for its
+            // first request is closed.
+            marked(&proxy, &closed, true).await;
+            let mut sends = Vec::new();
+            for front in fronts {
+                sends.push(h2_library_client(front, &::h2::client::Builder::new()).await);
+            }
             let answers = send_round(&mut sends, 16).await;
             let statuses = statuses(&answers);
             assert_eq!(
@@ -1240,17 +1619,13 @@ async fn with_local_an_owner_out_of_reach_decides_a_rolling_window_locally() {
                 listener.local_addr().unwrap().to_string()
             };
             let (upstream, _) = counting_upstream().await;
-            let mut config = with_breaker(
-                synchronous_in(
+            let mut config = synchronous_in(
                     everything_config(upstream),
                     &[("per-client", 10)],
                     &[closed],
                     100,
                     "local",
-                ),
-                2,
-                60_000,
-            );
+                );
             config.limits = Some(serde_saphyr::from_str("limits:\n  - { name: per-client, key: client, model: { rolling_window: { limit: 10, window: 1h, slots: 60 } } }\n").unwrap());
             let (proxy, mut sends) = serving(&config, 2).await;
             let answers = send_round(&mut sends, 16).await;
@@ -1296,31 +1671,20 @@ async fn local_buckets_carry_over_from_one_outage_to_the_next() {
             let (store, relay) = behind_a_relay(None).await;
             relay.shut_all();
             let (upstream, _) = counting_upstream().await;
-            let config = with_breaker(
-                synchronous_in(
-                    everything_config(upstream),
-                    &[("per-client", 10)],
-                    std::slice::from_ref(&relay.address),
-                    100,
-                    "local",
-                ),
-                1,
-                200,
-            );
-            let (proxy, mut sends) = serving(&config, 1).await;
+            let config = quick_checks(synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 10)],
+                std::slice::from_ref(&relay.address),
+                100,
+                "local",
+            ));
+            let (proxy, mut sends, fronts) = serving_at(&config, 1).await;
             let first = statuses(&send_round(&mut sends, 11).await);
             assert_eq!(first[..10], [200; 10], "{first:?}");
             assert_eq!(first[10], 429, "the local bucket spent");
             relay.open_all();
-            let open = format!(
-                r#"edgerush_rate_limit_owner_breaker_open{{pod="{}"}}"#,
-                relay.address
-            );
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while metric(&proxy.metrics(), &open) != Some(0) {
-                assert!(Instant::now() < deadline, "the breaker never closed");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            marked(&proxy, &relay.address, false).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(
                 statuses(&send_round(&mut sends, 1).await),
                 [200],
@@ -1360,9 +1724,8 @@ async fn with_local_only_the_keys_out_of_reach_are_decided_locally() {
             let ((_, answered_key), (out_of_reach, out_key)) = (&keys[0], &keys[1]);
             let answering = store.owner_of(answered_key).await;
             store.stop(store.owner_of(out_key).await).await;
-            // A breaker slow to open: a key sent through the answering pod to the one
-            // stopped times out there, which is not the answering pod's failure.
-            let config = with_breaker(config, 100, 60_000);
+            // A key sent through the answering pod to the one stopped times out there,
+            // which marks nothing down: the one stopped is marked down by its checks.
             let (_proxy, mut sends) = serving(&config, 1).await;
             assert_eq!(statuses(&send_round(&mut sends, 5).await), [200; 5]);
             // The answering owner's bucket full again; the local one spent.
@@ -1385,7 +1748,7 @@ async fn with_local_only_the_keys_out_of_reach_are_decided_locally() {
         .await;
 }
 
-/// The process's own buckets are swept, on the probe thread: a key full and unused for a
+/// The process's own buckets are swept, on the checking thread: a key full and unused for a
 /// second is forgotten. Read from the process itself, not from the metrics a worker writes
 /// once a sweep: the key could come and go between two of those.
 #[tokio::test]
@@ -1398,17 +1761,13 @@ async fn the_local_buckets_are_swept() {
                 listener.local_addr().unwrap().to_string()
             };
             let (upstream, _) = counting_upstream().await;
-            let mut config = with_breaker(
-                synchronous_in(
+            let mut config = synchronous_in(
                     everything_config(upstream),
                     &[("per-client", 10)],
                     &[closed],
                     100,
                     "local",
-                ),
-                1,
-                60_000,
-            );
+                );
             // A thousand a second, a bucket of one: full again a millisecond after its
             // request.
             config.limits = Some(
@@ -1481,16 +1840,12 @@ async fn an_admission_that_comes_too_late_is_given_back_if_the_request_was_refus
                 let _store =
                     Store::formed(vec![(listener, relay.clone())], &store_config(), None).await;
                 let (upstream, _) = counting_upstream().await;
-                let config = with_breaker(
-                    synchronous_in(
-                        everything_config(upstream),
-                        &[("per-client", 5)],
-                        std::slice::from_ref(&relay),
-                        100,
-                        when,
-                    ),
+                let config = synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 5)],
+                    std::slice::from_ref(&relay),
                     100,
-                    60_000,
+                    when,
                 );
                 let (_, key) = keys_of(&config).remove(0);
                 let (proxy, mut sends) = serving(&config, 1).await;
@@ -1517,10 +1872,11 @@ async fn an_admission_that_comes_too_late_is_given_back_if_the_request_was_refus
 }
 
 /// A reload mid-outage carries its state across: one that changes `timeout_ms` keeps the
-/// seed's breaker open, so requests are not made to wait again, and the process's own
-/// buckets as they were spent, not full; one that leaves `local` lets them go.
+/// seed marked down, so requests are not made to wait again, nor is it marked down twice,
+/// and the process's own buckets as they were spent, not full; one that leaves `local`
+/// lets them go.
 #[tokio::test]
-async fn a_reload_mid_outage_keeps_the_breakers_and_the_local_buckets() {
+async fn a_reload_mid_outage_keeps_the_pods_down_and_the_local_buckets() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1535,19 +1891,17 @@ async fn a_reload_mid_outage_keeps_the_breakers_and_the_local_buckets() {
             });
             let (upstream, _) = counting_upstream().await;
             let in_mode = |timeout_ms, when| {
-                with_breaker(
-                    synchronous_in(
-                        everything_config(upstream),
-                        &[("per-client", 10)],
-                        std::slice::from_ref(&address),
-                        timeout_ms,
-                        when,
-                    ),
-                    1,
-                    60_000,
-                )
+                quick_checks(synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 10)],
+                    std::slice::from_ref(&address),
+                    timeout_ms,
+                    when,
+                ))
             };
-            let (proxy, mut sends) = serving(&in_mode(200, "local"), 1).await;
+            let (proxy, _, fronts) = serving_at(&in_mode(200, "local"), 1).await;
+            marked(&proxy, &address, true).await;
+            let mut sends = connected(&fronts).await;
             let first = statuses(&send_round(&mut sends, 11).await);
             assert_eq!(first[..10], [200; 10], "{first:?}");
             assert_eq!(first[10], 429);
@@ -1562,27 +1916,28 @@ async fn a_reload_mid_outage_keeps_the_breakers_and_the_local_buckets() {
             );
             assert!(
                 began.elapsed() < Duration::from_millis(300),
-                "the breaker still open: {:?}",
+                "still marked down: {:?}",
                 began.elapsed()
             );
+            // Its checks go on missing under the new process: down still, marked once.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             let scrape = proxy.metrics();
+            assert_eq!(of_pod(&scrape, "pod_down", &address), Some(1), "{scrape}");
             assert_eq!(
-                metric(
-                    &scrape,
-                    &format!(r#"edgerush_rate_limit_owner_breaker_trips_total{{pod="{address}"}}"#)
-                ),
+                of_pod(&scrape, "pod_marked_down_total", &address),
                 Some(1),
                 "{scrape}"
             );
             proxy
                 .reload(compile(&in_mode(300, "deny")).unwrap())
                 .unwrap();
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
         })
         .await;
 }
 
-/// A stream let go of while its pod's breaker was open ends only later, after the worker has
+/// A stream let go of while its pod was marked down ends only later, after the worker has
 /// opened another to the same pod: its end is its own, and leaves the stream that replaced it
 /// as it is — no request fails on it, and none has to open yet another.
 #[tokio::test]
@@ -1592,46 +1947,39 @@ async fn a_stream_let_go_of_ends_without_touching_the_one_that_replaced_it() {
         .run_until(async {
             let (_store, relay) = behind_a_relay(None).await;
             let (upstream, _) = counting_upstream().await;
-            let config = with_breaker(
-                synchronous_in(
-                    everything_config(upstream),
-                    &[("per-client", 100)],
-                    std::slice::from_ref(&relay.address),
-                    300,
-                    "deny",
-                ),
-                1,
-                200,
-            );
-            let (proxy, mut sends) = serving(&config, 1).await;
-            // Connection 0, opened with the limiter, answers.
+            let config = quick_checks(synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 100)],
+                std::slice::from_ref(&relay.address),
+                300,
+                "deny",
+            ));
+            let (proxy, mut sends, fronts) = serving_behind(&config, 1, &relay).await;
+            // Connection 1, opened with the limiter, answers.
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
-            // Then holds its answers: an ask times out and opens the breaker.
+            // Then it and the checks' connection, 0, hold their answers: the pod is marked
+            // down.
+            relay.gate(1, false);
             relay.gate(0, false);
+            marked(&proxy, &relay.address, true).await;
+            let mut sends = connected(&fronts).await;
+            // The worker lets go of connection 1, whose end the gate holds.
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
-            // The worker lets go of connection 0, whose end the gate holds.
-            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
-            // The probe (connection 1) closes the breaker; a request opens connection 2.
-            let open = format!(
-                r#"edgerush_rate_limit_owner_breaker_open{{pod="{}"}}"#,
-                relay.address
-            );
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while metric(&proxy.metrics(), &open) != Some(0) {
-                assert!(Instant::now() < deadline, "the breaker never closed");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            // The checks answered again, the pod is up; a request opens connection 2.
+            relay.gate(0, true);
+            marked(&proxy, &relay.address, false).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             assert_eq!(
                 relay.accepted(),
                 3,
-                "the first, the probe's, and the new one"
+                "the checks', the first, and the new one"
             );
-            // Connection 0's end reaches its reader now.
-            let ended = relay.ended();
-            relay.gate(0, true);
-            while relay.ended() == ended {
-                assert!(Instant::now() < deadline, "connection 0 never ended");
+            // Connection 1's end reaches its reader now.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            relay.gate(1, true);
+            while !relay.has_ended(1) {
+                assert!(Instant::now() < deadline, "connection 1 never ended");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1651,52 +1999,47 @@ async fn a_stream_let_go_of_while_opening_does_not_replace_the_one_after_it() {
         .run_until(async {
             let (_store, relay) = behind_a_relay(None).await;
             let (upstream, _) = counting_upstream().await;
-            let config = with_breaker(
-                synchronous_in(
-                    everything_config(upstream),
-                    &[("per-client", 100)],
-                    std::slice::from_ref(&relay.address),
-                    300,
-                    "deny",
-                ),
-                1,
-                200,
-            );
-            let (proxy, mut sends) = serving(&config, 1).await;
-            // The limiter is made, and connection 0 opened, at the first request; its gate
+            let config = quick_checks(synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 100)],
+                std::slice::from_ref(&relay.address),
+                300,
+                "deny",
+            ));
+            let (proxy, mut sends, fronts) = serving_behind(&config, 1, &relay).await;
+            // The limiter is made, and connection 1 opened, at the first request; its gate
             // is shut as soon as it is accepted, so its opening hangs and the ask times out.
             let first = send_round(&mut sends, 1);
             let shut_early = async {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while relay.accepted() == 0 {
-                    assert!(Instant::now() < deadline, "connection 0 never came");
+                while relay.accepted() < 2 {
+                    assert!(Instant::now() < deadline, "connection 1 never came");
                     tokio::task::yield_now().await;
                 }
-                relay.gate(0, false);
+                relay.gate(1, false);
             };
             let (first, ()) = tokio::join!(first, shut_early);
             assert_eq!(statuses(&first), [503]);
-            // The worker lets go of connection 0 while it is still opening.
+            // The checks' connection holds its answers too: the pod is marked down, and the
+            // worker lets go of connection 1 while it is still opening.
+            relay.gate(0, false);
+            marked(&proxy, &relay.address, true).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
-            let open = format!(
-                r#"edgerush_rate_limit_owner_breaker_open{{pod="{}"}}"#,
-                relay.address
-            );
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while metric(&proxy.metrics(), &open) != Some(0) {
-                assert!(Instant::now() < deadline, "the breaker never closed");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            relay.gate(0, true);
+            marked(&proxy, &relay.address, false).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             assert_eq!(
                 relay.accepted(),
                 3,
-                "the first, the probe's, and the new one"
+                "the checks', the first, and the new one"
             );
-            // Connection 0 opens now: it is closed, and connection 2 kept.
-            relay.gate(0, true);
-            while !relay.has_ended(0) {
-                assert!(Instant::now() < deadline, "connection 0 was kept");
+            // Connection 1 opens now: it is closed, and connection 2 kept.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            relay.gate(1, true);
+            while !relay.has_ended(1) {
+                assert!(Instant::now() < deadline, "connection 1 was kept");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1709,7 +2052,7 @@ async fn a_stream_let_go_of_while_opening_does_not_replace_the_one_after_it() {
 
 /// A reload that changes the synchronous section, or leaves the mode, has each worker let
 /// go of its old limiter at its next sweep, with no request needed: its streams to the pods
-/// close, and with them its hold on the old process.
+/// close, and with them its hold on the old process, whose checks end with it.
 #[tokio::test]
 async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
     let local = tokio::task::LocalSet::new();
@@ -1718,33 +2061,31 @@ async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
             let (_store, relay) = behind_a_relay(None).await;
             let (upstream, _) = counting_upstream().await;
             let in_mode = |timeout_ms| {
-                with_breaker(
-                    synchronous_in(
-                        everything_config(upstream),
-                        &[("per-client", 100)],
-                        std::slice::from_ref(&relay.address),
-                        timeout_ms,
-                        "deny",
-                    ),
-                    5,
-                    60_000,
+                synchronous_in(
+                    everything_config(upstream),
+                    &[("per-client", 100)],
+                    std::slice::from_ref(&relay.address),
+                    timeout_ms,
+                    "deny",
                 )
             };
-            let (proxy, mut sends, fronts) = serving_at(&in_mode(200), 1).await;
+            let (proxy, mut sends, fronts) = serving_behind(&in_mode(200), 1, &relay).await;
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
-            assert_eq!(relay.accepted(), 1);
-            // The section changed: the old limiter's stream ends, though nothing asks.
+            assert_eq!(relay.accepted(), 2, "the checks' and the limiter's");
+            // The section changed: the old limiter's stream ends, though nothing asks, and
+            // so do the old process's checks; the new process checks on a stream of its own.
             proxy.reload(compile(&in_mode(300)).unwrap()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !relay.has_ended(0) {
+            while !(relay.has_ended(1) && relay.has_ended(0)) {
                 assert!(Instant::now() < deadline, "the old limiter was kept");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            assert_eq!(relay.accepted(), 3, "the new checks'");
             // The client's connection went idle meanwhile: another.
             let mut sends = vec![h2_library_client(fronts[0], &::h2::client::Builder::new()).await];
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
-            assert_eq!(relay.accepted(), 2, "the new limiter's stream");
-            // The mode left: the limiter goes, and its stream with it.
+            assert_eq!(relay.accepted(), 4, "the new limiter's stream");
+            // The mode left: the limiter goes, and its stream and checks with it.
             let mut local_mode = in_mode(300);
             local_mode.rate_limiting = Some(edgerush_config::RateLimiting {
                 mode: edgerush_config::RateLimitMode::Local,
@@ -1754,10 +2095,163 @@ async fn a_reload_lets_go_of_the_old_limiter_and_its_streams() {
                 experimental_header_keys: None,
             });
             proxy.reload(compile(&local_mode).unwrap()).unwrap();
-            while !relay.has_ended(1) {
+            while !(relay.has_ended(3) && relay.has_ended(2)) {
                 assert!(Instant::now() < deadline, "the limiter outlived its mode");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        })
+        .await;
+}
+
+/// The name of the metric of the times a worker gave a connection to the pod at `address`
+/// up for a new one.
+fn reconnects(address: &str) -> String {
+    format!(r#"edgerush_rate_limit_pod_reconnects_total{{pod="{address}"}}"#)
+}
+
+/// `config` for a worker behind `relay`, one limit of a bucket of `burst`, waiting
+/// `timeout_ms` and denying what is out of reach: `timeouts_before_reconnect` left out, at
+/// 2.
+fn reconnecting(upstream: SocketAddr, relay: &GatedRelay, burst: u64, timeout_ms: u64) -> Config {
+    synchronous_in(
+        everything_config(upstream),
+        &[("per-client", burst)],
+        std::slice::from_ref(&relay.address),
+        timeout_ms,
+        "deny",
+    )
+}
+
+/// A worker whose asks time out twice in a row on its connection asks on a new one, and its
+/// requests are answered again, the pod marked down for no one. The connection given up is
+/// still read: the admissions its pod sent too late are given back when they come, and once
+/// the last is read it is let go of, before its asks' waits and a second past are over. (The
+/// gate is shut for well under the connection's keepalive, 1 s, which would drop it.)
+#[tokio::test]
+async fn a_connection_that_keeps_timing_out_is_replaced_and_drained() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay, direct) = behind_a_relay_reached(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let config = reconnecting(upstream, &relay, 5, 300);
+            let (_, key) = keys_of(&config).remove(0);
+            let (proxy, mut sends, _) = serving_behind(&config, 1, &relay).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(1, false);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            assert_eq!(relay.accepted(), 2, "one timeout: the same connection");
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            let replaced = Instant::now();
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 3, "a new connection after the second");
+            let scrape = proxy.metrics();
+            assert_eq!(
+                metric(
+                    &scrape,
+                    &format!(r#"edgerush_rate_limit_pod_down{{pod="{}"}}"#, relay.address)
+                ),
+                Some(0),
+                "down for no one: {scrape}"
+            );
+            assert_eq!(metric(&scrape, &reconnects(&relay.address)), Some(1));
+            // The two late admissions come through on connection 1, and it is let go of.
+            relay.gate(1, true);
+            while !relay.has_ended(1) {
+                assert!(
+                    replaced.elapsed() < Duration::from_millis(1_000),
+                    "connection 1 kept until its bound (1.3 s), or for good"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!relay.has_ended(2), "the new one carries on");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Charged for the two answered alone: the late two given back.
+            assert_eq!(ask_directly(&direct, &key, 5).await, 3);
+        })
+        .await;
+}
+
+/// An answer read between two timeouts starts the count again: a timeout, an answer, a
+/// timeout keeps the connection; a second timeout in a row replaces it.
+#[tokio::test]
+async fn an_answer_between_timeouts_keeps_the_connection() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let (proxy, mut sends, _) =
+                serving_behind(&reconnecting(upstream, &relay, 100, 100), 1, &relay).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(1, false);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            relay.gate(1, true);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(1, false);
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            // Kept: this one goes on connection 1 too, and times out.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [503]);
+            assert_eq!(relay.accepted(), 2, "the count began again at the answer");
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 3, "two in a row: replaced");
+            assert_eq!(
+                metric(&proxy.metrics(), &reconnects(&relay.address)),
+                Some(1)
+            );
+        })
+        .await;
+}
+
+/// One connection drains at a time: while the one given up is still read, timeouts on its
+/// replacement open no third; once it is gone (at its bound, or dropped by its keepalive
+/// first, its gate shut; the bound alone is the unit tests'), two timeouts in a row replace
+/// the second.
+#[tokio::test]
+async fn one_connection_drains_at_a_time() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_store, relay) = behind_a_relay(None).await;
+            let (upstream, _) = counting_upstream().await;
+            let (proxy, mut sends, fronts) =
+                serving_behind(&reconnecting(upstream, &relay, 100, 100), 1, &relay).await;
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(1, false);
+            assert_eq!(statuses(&send_round(&mut sends, 2).await), [503, 503]);
+            let replaced = Instant::now();
+            // Connection 2 opens and answers (one still opening is new already, and its
+            // timeouts count for nothing), then holds its answers too.
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            relay.gate(2, false);
+            assert_eq!(statuses(&send_round(&mut sends, 3).await), [503, 503, 503]);
+            assert!(
+                replaced.elapsed() < Duration::from_millis(1_100),
+                "still draining: {:?}",
+                replaced.elapsed()
+            );
+            assert_eq!(
+                relay.accepted(),
+                3,
+                "no third of the worker's while the first drains"
+            );
+            // Connection 2 answers meanwhile, so that its keepalive keeps it, and its count
+            // begins again; connection 1, still shut, goes.
+            relay.gate(2, true);
+            tokio::time::sleep(Duration::from_millis(1_300).saturating_sub(replaced.elapsed()))
+                .await;
+            // The client's connection went idle meanwhile: another.
+            let mut sends = vec![h2_library_client(fronts[0], &::h2::client::Builder::new()).await];
+            relay.gate(2, false);
+            assert_eq!(statuses(&send_round(&mut sends, 2).await), [503, 503]);
+            assert_eq!(relay.accepted(), 3);
+            relay.open_all();
+            assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
+            assert_eq!(relay.accepted(), 4, "replaced, none draining now");
+            assert_eq!(
+                metric(&proxy.metrics(), &reconnects(&relay.address)),
+                Some(2)
+            );
         })
         .await;
 }
@@ -1837,10 +2331,10 @@ async fn a_key_whose_owner_is_cut_off_from_the_data_plane_is_forwarded() {
 }
 
 /// A key whose owner is gone, not yet failed over, is forwarded through a pod that serves,
-/// and times out there: no failure of that pod's, whose breaker stays closed for its own keys,
-/// while the gone owner's opens.
+/// and times out there: the owner gone is marked down by its checks, and the pods that
+/// forward its keys are not, however their asks time out.
 #[tokio::test]
-async fn a_timeout_forwarding_to_an_owner_gone_opens_no_breaker_but_the_owners() {
+async fn an_owner_gone_is_marked_down_and_the_pods_forwarding_its_keys_are_not() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1853,33 +2347,24 @@ async fn a_timeout_forwarding_to_an_owner_gone_opens_no_breaker_but_the_owners()
             // Slow to take a pod out, so that the one stopped keeps its shards.
             let store = Store::formed(listeners, &holding_config(), None).await;
             let (upstream, _) = counting_upstream().await;
-            let config = with_breaker(
-                synchronous_in(
-                    everything_config(upstream),
-                    &[("per-client", 100)],
-                    &store.addresses(),
-                    200,
-                    "deny",
-                ),
-                2,
-                60_000,
-            );
+            let config = quick_checks(synchronous_in(
+                everything_config(upstream),
+                &[("per-client", 100)],
+                &store.addresses(),
+                200,
+                "deny",
+            ));
             let (_, key) = keys_of(&config).remove(0);
             let owner = store.owner_of(&key).await;
-            let (proxy, mut sends) = serving(&config, 1).await;
+            let (proxy, mut sends, fronts) = serving_at(&config, 1).await;
             // The worker's table in, from its first request.
             assert_eq!(statuses(&send_round(&mut sends, 1).await), [200]);
             tokio::time::sleep(Duration::from_millis(300)).await;
             store.stop(owner).await;
+            marked(&proxy, &store.pods[owner].address, true).await;
+            let mut sends = connected(&fronts).await;
             assert_eq!(statuses(&send_round(&mut sends, 4).await), [503; 4]);
             let scrape = proxy.metrics();
-            let open = |address: &str| {
-                metric(
-                    &scrape,
-                    &format!(r#"edgerush_rate_limit_owner_breaker_open{{pod="{address}"}}"#),
-                )
-            };
-            assert_eq!(open(&store.pods[owner].address), Some(1), "{scrape}");
             let forwarders: Vec<&ServedPod> = (0..3)
                 .filter(|at| *at != owner)
                 .map(|at| &store.pods[at])
@@ -1890,7 +2375,12 @@ async fn a_timeout_forwarding_to_an_owner_gone_opens_no_breaker_but_the_owners()
                 .sum();
             assert!(timed_out >= 2, "forwarded and timed out: {scrape}");
             for pod in forwarders {
-                assert_ne!(open(&pod.address), Some(1), "{}: {scrape}", pod.address);
+                assert_eq!(
+                    of_pod(&scrape, "pod_down", &pod.address),
+                    Some(0),
+                    "{}: {scrape}",
+                    pod.address
+                );
             }
         })
         .await;

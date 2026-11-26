@@ -385,7 +385,7 @@ fn a_rate_limiting_value_the_data_plane_cannot_take_is_said_by_its_field() {
     assert_eq!(
         unusable(
             "{ mode: Synchronous, synchronous: { timeoutMs: 20, whenUnreachable: Allow, \
-             breaker: { failures: 5, probeAfterMs: 1000 } } }"
+             healthCheck: { intervalMs: 100, timeoutMs: 1000, misses: 3 } } }"
         ),
         "DataPlane edge/web: rateLimiting.mode: `Synchronous` is not served yet"
     );

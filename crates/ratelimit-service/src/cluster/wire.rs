@@ -20,7 +20,9 @@
 //! other mode than its key's bit says is refused ([`Value::fits`]).
 //!
 //! A data plane asks a pod on a stream of its own ([`Asking`]), and is told its answers and the
-//! pod's table on it ([`Telling`]): plain messages, a table at 256 shards a few KB.
+//! pod's table on it ([`Telling`]): plain messages, a table at 256 shards a few KB. A data
+//! plane also checks the pod on such a stream ([`Check`]): the pod's task answers that itself,
+//! and the mode never sees it.
 //!
 //! Every message goes as one or more [`Piece`]s: a shard's whole copy can pass what one gRPC
 //! message may hold, and the store sends it as one message, so the wire cuts it ([`pieces`])
@@ -80,6 +82,9 @@ pub enum Invalid {
     /// A data plane's batch saying no cycle, which its owner counts those admitting by.
     #[error("a batch of no cycle")]
     Cycle,
+    /// A check, or its answer, which the pod's task deals with itself: never the mode's.
+    #[error("a check, not the mode's message")]
+    Check,
 }
 
 /// A mode's value as the wire carries it: a protobuf message of the mode's own.
@@ -744,12 +749,12 @@ pub enum Answered {
     NotServing(Empty),
 }
 
-/// What a data plane asks a pod on its stream: a request under one key, or one under several
-/// to gather. The stream names the client, so neither need say who asks.
+/// What a data plane asks a pod on its stream: a request under one key, one under several to
+/// gather, or a check. The stream names the client, so none need say who asks.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Asking {
     /// Which.
-    #[prost(oneof = "Asked", tags = "1, 2")]
+    #[prost(oneof = "Asked", tags = "1, 2, 3")]
     pub asked: Option<Asked>,
 }
 
@@ -762,6 +767,19 @@ pub enum Asked {
     /// A request under several keys, to be counted under all or reported not counted.
     #[prost(message, tag = "2")]
     Gather(Gather),
+    /// Whether the pod's task answers: it counts nothing.
+    #[prost(message, tag = "3")]
+    Check(Check),
+}
+
+/// A data plane's check of a pod, and the pod's answer: the pod's task answers it in its turn,
+/// behind what was asked before it, so that its answer says the task is taking what it is
+/// asked, not just that the connection is up. It counts nothing against any key.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct Check {
+    /// The data plane's number for it.
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
 }
 
 /// A request under several keys.
@@ -775,11 +793,12 @@ pub struct Gather {
     pub keys: Vec<u64>,
 }
 
-/// What a pod tells a data plane on its stream: an answer, or the table it has committed.
+/// What a pod tells a data plane on its stream: an answer, the table it has committed, or a
+/// check answered.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Telling {
     /// Which.
-    #[prost(oneof = "Told", tags = "1, 2")]
+    #[prost(oneof = "Told", tags = "1, 2, 3")]
     pub told: Option<Told>,
 }
 
@@ -792,6 +811,9 @@ pub enum Told {
     /// An answer, by the data plane's number.
     #[prost(message, tag = "2")]
     Reply(Reply),
+    /// A check answered, by the data plane's number.
+    #[prost(message, tag = "3")]
+    Checked(Check),
 }
 
 /// Not this pod's key.
@@ -1288,6 +1310,41 @@ pub fn asked_from<V>(asking: Asking, client: NodeId) -> Result<SyncMessage<V>, I
             id: gather.id,
             keys: keys_from_wire(gather.keys)?,
         }),
+        Asked::Check(_) => Err(Invalid::Check),
+    }
+}
+
+/// The number of the check `asking` is, if it is one ([`Check`]).
+#[must_use]
+pub const fn check(asking: &Asking) -> Option<u64> {
+    match &asking.asked {
+        Some(Asked::Check(check)) => Some(check.id),
+        _ => None,
+    }
+}
+
+/// The pod's answer to check `id`, as its stream carries it down.
+#[must_use]
+pub const fn checked(id: u64) -> Telling {
+    Telling {
+        told: Some(Told::Checked(Check { id })),
+    }
+}
+
+/// Check `id`, as a data plane's stream carries it up.
+#[must_use]
+pub const fn asking_check(id: u64) -> Asking {
+    Asking {
+        asked: Some(Asked::Check(Check { id })),
+    }
+}
+
+/// The number of the check `telling` answers, if it answers one.
+#[must_use]
+pub const fn told_checked(telling: &Telling) -> Option<u64> {
+    match &telling.told {
+        Some(Told::Checked(check)) => Some(check.id),
+        _ => None,
     }
 }
 
@@ -1343,6 +1400,7 @@ pub fn told_from(telling: Telling) -> Result<SyncMessage, Invalid> {
             id: reply.id,
             answer: answer_from(reply.answer.ok_or(Invalid::Missing)?)?,
         },
+        Told::Checked(_) => return Err(Invalid::Check),
     })
 }
 
@@ -2121,6 +2179,35 @@ mod tests {
             keys: vec![1, 2],
         };
         assert!(mode_wire(1, gather).is_none());
+    }
+
+    /// A check comes up a data plane's stream as a check, and its answer down it as one, by
+    /// its number; neither is ever taken for the mode's message.
+    #[test]
+    fn a_check_and_its_answer_come_through_the_stream_and_are_never_the_modes() {
+        for id in [0, 7, u64::MAX] {
+            let asked = asking_check(id);
+            let decoded = Asking::decode(asked.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(check(&decoded), Some(id));
+            assert_eq!(asked_from::<SyncValue>(decoded, 1), Err(Invalid::Check));
+            let told = Telling::decode(checked(id).encode_to_vec().as_slice()).unwrap();
+            assert_eq!(told, checked(id));
+            assert_eq!(told_checked(&told), Some(id));
+            assert_eq!(told_from(told), Err(Invalid::Check));
+        }
+        let gather = asking(SyncMessage::Gather {
+            client: 0,
+            id: 1,
+            keys: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(check(&gather), None);
+        let reply = telling(SyncMessage::<SyncValue>::Reply {
+            client: 0,
+            id: 1,
+            answer: SyncAnswer::Counted(0),
+        });
+        assert_eq!(reply.as_ref().and_then(told_checked), None);
     }
 
     proptest! {

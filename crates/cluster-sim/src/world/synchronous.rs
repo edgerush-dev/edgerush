@@ -2,8 +2,8 @@
 //! answered admitted, refused or counted, and give back what a refused request was charged.
 
 use super::both::{Caller, synchronous_of};
-use super::{CLIENT_BASE, Event, World, store_kind, store_size};
-use crate::client::{Client, Multi};
+use super::{CHECK_LANE, CLIENT_BASE, Event, World, late_by, store_kind, store_size};
+use crate::client::{Checks, Client, Multi};
 use edgerush_cluster::Message as StoreMessage;
 use edgerush_cluster::{Key, NodeId, ShardId, Time, ms};
 use edgerush_cluster_synchronous::{Answer, Value};
@@ -57,6 +57,19 @@ impl World {
         }
     }
 
+    /// Every client of the synchronous mode, and every one added from now, checks the pods
+    /// as `checks` says.
+    pub fn set_checks(&mut self, checks: Checks) {
+        self.checks = checks;
+        for client in self
+            .clients
+            .values_mut()
+            .filter_map(Caller::synchronous_mut)
+        {
+            client.checking = checks;
+        }
+    }
+
     /// Whether pods started from now forward a request for a shard not theirs.
     pub fn set_forwarding(&mut self, forwarding: bool) {
         self.forwarding = forwarding;
@@ -90,6 +103,7 @@ impl World {
         if let Some((rule, allow)) = self.limit {
             client.set_limit(rule, allow);
         }
+        client.checking = self.checks;
         self.clients.insert(id, Caller::Synchronous(client));
         let first = self.now + self.rng.below(interval.max(1));
         self.schedule(first, Event::ClientSend(id));
@@ -324,13 +338,103 @@ impl World {
             return;
         };
         let (ended, sends) = client.check(now, &pods);
+        let checks = client.checks_due(now, &pods);
         for (keys, outcome) in ended {
             self.record(id, outcome, &keys);
         }
         for (to, message) in sends {
             self.send(id, to, message.into());
         }
+        for (pod, check) in checks {
+            self.send_check(id, pod, check, false);
+        }
         self.schedule(now + ms(1), Event::ClientCheck(id));
+    }
+
+    /// Client `client`'s check `id` of `pod` sent on its way, or, `answered`, its answer sent
+    /// back, over their link as a message goes, on a lane of its own: a check refused if the
+    /// link to the pod is cut, its answer lost if the link back is.
+    pub(super) fn send_check(&mut self, client: NodeId, pod: NodeId, id: u64, answered: bool) {
+        let (from, to) = if answered {
+            (pod, client)
+        } else {
+            (client, pod)
+        };
+        let link = self.link(from, to);
+        if link.cut {
+            if !answered {
+                let at = self.now + link.delay;
+                self.schedule(at, Event::CheckRefused { client, pod, id });
+            }
+            return;
+        }
+        let Some(late) = late_by(&link, &mut self.check_rng) else {
+            return;
+        };
+        let delay = link.delay + self.check_rng.below(link.jitter.max(1));
+        let lane = (from, to.wrapping_add(CHECK_LANE));
+        let last = self.last_arrival.get(&lane).copied().unwrap_or(0);
+        let at = (self.now + delay + late).max(last);
+        self.last_arrival.insert(lane, at);
+        self.schedule(
+            at,
+            Event::Check {
+                client,
+                pod,
+                id,
+                answered,
+            },
+        );
+    }
+
+    /// Client `client`'s check `id` of `pod` arrived: at the pod, answered as it takes it —
+    /// held while it is frozen, refused if it is gone — or, `answered`, its answer at the
+    /// client.
+    pub(super) fn check_arrived(&mut self, client: NodeId, pod: NodeId, id: u64, answered: bool) {
+        let now = self.now;
+        if answered {
+            if let Some(entry) = self
+                .clients
+                .get_mut(&client)
+                .and_then(Caller::synchronous_mut)
+            {
+                entry.check_answered(pod, id, now);
+            }
+            return;
+        }
+        let Some(held) = self.pods.get(&pod) else {
+            return;
+        };
+        if !held.alive {
+            let at = now + self.link(pod, client).delay;
+            self.schedule(at, Event::CheckRefused { client, pod, id });
+            return;
+        }
+        if let Some(until) = held.frozen(now) {
+            self.schedule(
+                until,
+                Event::Check {
+                    client,
+                    pod,
+                    id,
+                    answered,
+                },
+            );
+            return;
+        }
+        self.send_check(client, pod, id, true);
+    }
+
+    /// Client `client`'s check `id` of `pod` refused.
+    pub(super) fn check_refused(&mut self, client: NodeId, pod: NodeId, id: u64) {
+        let now = self.now;
+        if let Some(entry) = self
+            .clients
+            .get_mut(&client)
+            .and_then(Caller::synchronous_mut)
+        {
+            entry.check_refused(pod, id, now);
+        }
     }
     /// `from`, a client, told soon that `message` could not reach pod `to`.
     pub(super) fn unreachable(&mut self, from: NodeId, to: NodeId, message: &Message) {
