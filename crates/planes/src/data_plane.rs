@@ -1318,8 +1318,8 @@ pub struct DataPlaneRateLimiting {
     pub mode: String,
     /// Synchronous is how a request waits for its key's owner, and what decides
     /// it when the owner does not answer: what the Synchronous mode needs, and
-    /// no other takes. Every field is required, as how a proxy behaves when its
-    /// owners are out of reach is the DataPlane's to say.
+    /// no other takes. Every field but TimeoutsBeforeReconnect is required, as how
+    /// a proxy behaves when its owners are out of reach is the DataPlane's to say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synchronous: Option<DataPlaneRateLimitingSynchronous>,
 }
@@ -1461,22 +1461,32 @@ pub struct DataPlaneRateLimitingGlobalModelRollingWindow {
 
 /// Synchronous is how a request waits for its key's owner, and what decides
 /// it when the owner does not answer: what the Synchronous mode needs, and
-/// no other takes. Every field is required, as how a proxy behaves when its
-/// owners are out of reach is the DataPlane's to say.
+/// no other takes. Every field but TimeoutsBeforeReconnect is required, as how
+/// a proxy behaves when its owners are out of reach is the DataPlane's to say.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct DataPlaneRateLimitingSynchronous {
-    /// Breaker is when a proxy stops asking an owner that does not answer, and
-    /// when it tries it again: open, nothing is asked of the owner and
-    /// WhenUnreachable decides at once.
+    /// HealthCheck is how a proxy checks each pod of the rate-limiting
+    /// service, on a thread and a stream of its own, apart from its requests;
+    /// only the checks mark a pod down, its keys going through another pod
+    /// meanwhile, or, none left, to WhenUnreachable. A proxy's timeouts decide
+    /// only their own requests.
+    #[serde(rename = "healthCheck")]
     #[serde(default)]
-    pub breaker: DataPlaneRateLimitingSynchronousBreaker,
+    pub health_check: DataPlaneRateLimitingSynchronousHealthCheck,
     /// TimeoutMs is milliseconds a request waits for its owner's answer before
     /// WhenUnreachable decides it.
     #[serde(rename = "timeoutMs")]
     #[serde(default)]
     pub timeout_ms: i64,
+    /// TimeoutsBeforeReconnect is timeouts in a row on a proxy worker's own
+    /// connection to a pod, no answer read on it between, after which that
+    /// worker asks the pod on a new connection, still reading the old one a
+    /// while for answers that come late. It marks the pod down for no one.
+    #[serde(rename = "timeoutsBeforeReconnect")]
+    #[serde(default = "default_data_plane_rate_limiting_synchronous_timeouts_before_reconnect")]
+    pub timeouts_before_reconnect: i32,
     /// WhenUnreachable is what decides a request whose owner does not answer
-    /// in time, or whose breaker is open:
+    /// in time, or whose key no pod marked up is left to ask:
     ///
     /// * Allow: it goes on, as under no limit.
     /// * Deny: it is refused, 503 with Retry-After: 1, as the service failed, not the client.
@@ -1488,21 +1498,29 @@ pub struct DataPlaneRateLimitingSynchronous {
     pub when_unreachable: String,
 }
 
-/// Breaker is when a proxy stops asking an owner that does not answer, and
-/// when it tries it again: open, nothing is asked of the owner and
-/// WhenUnreachable decides at once.
+/// HealthCheck is how a proxy checks each pod of the rate-limiting
+/// service, on a thread and a stream of its own, apart from its requests;
+/// only the checks mark a pod down, its keys going through another pod
+/// meanwhile, or, none left, to WhenUnreachable. A proxy's timeouts decide
+/// only their own requests.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
-pub struct DataPlaneRateLimitingSynchronousBreaker {
-    /// Failures is timeouts and broken streams in a row that open it; any
-    /// answer starts the count again.
+pub struct DataPlaneRateLimitingSynchronousHealthCheck {
+    /// IntervalMs is milliseconds from the end of one check of a pod to the
+    /// start of the next; sooner after a miss, and when a proxy's ask of the
+    /// pod goes wrong (at most once each interval).
+    #[serde(rename = "intervalMs")]
     #[serde(default)]
-    pub failures: i32,
-    /// ProbeAfterMs is milliseconds open before the owner is tried again,
-    /// without a request: its first word closes the breaker, and none leaves
-    /// it open as long again.
-    #[serde(rename = "probeAfterMs")]
+    pub interval_ms: i64,
+    /// Misses is checks missed in a row that mark a pod down. A check
+    /// refused, its stream broken and not opened again, marks it down at
+    /// once, and one answered marks it up.
     #[serde(default)]
-    pub probe_after_ms: i64,
+    pub misses: i32,
+    /// TimeoutMs is milliseconds a check waits for its answer before it is
+    /// missed.
+    #[serde(rename = "timeoutMs")]
+    #[serde(default)]
+    pub timeout_ms: i64,
 }
 
 /// Replicas is how many proxies run. With max above min, a
@@ -1686,6 +1704,12 @@ fn default_data_plane_ingress_https_redirect() -> bool {
 #[rustfmt::skip]
 fn default_data_plane_ingress_https_redirect_max_age() -> i64 {
     30
+}
+
+/// The schema's default.
+#[rustfmt::skip]
+fn default_data_plane_rate_limiting_synchronous_timeouts_before_reconnect() -> i32 {
+    2
 }
 
 /// The schema's default.

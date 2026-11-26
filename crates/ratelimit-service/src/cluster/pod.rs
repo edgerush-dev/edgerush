@@ -113,6 +113,8 @@ enum Command {
     Client(oneshot::Sender<(NodeId, Told)>),
     /// A client's request.
     Ask(NodeId, PodMessage),
+    /// A client's check: answered as the task takes it, behind what was sent before it.
+    Check(oneshot::Sender<()>),
     /// Drain, and say so by dropping the sender once stopped.
     Drain(oneshot::Sender<()>),
     Stop,
@@ -417,6 +419,17 @@ impl StoreClient {
             .is_ok()
     }
 
+    /// Checks the pod: true once its task has taken the check, in turn behind what was sent it
+    /// before, so that it says the task is taking what it is asked. False once the pod has
+    /// stopped.
+    pub async fn check(&self) -> bool {
+        let (answered, answering) = oneshot::channel();
+        if self.commands.send(Command::Check(answered)).await.is_err() {
+            return false;
+        }
+        answering.await.is_ok()
+    }
+
     /// What it is told next: an answer, or the newest table it was sent, if it has not been
     /// told that one. An answer waiting goes first, so that tables delay none; a table waits
     /// only while answers do, a client behind meanwhile told a newer one by any pod it asks
@@ -584,6 +597,9 @@ impl Running {
                             let out = self.node.receive(client, message, now);
                             self.send(out);
                         }
+                    }
+                    Some(Command::Check(answered)) => {
+                        let _gone = answered.send(());
                     }
                     Some(Command::Drain(stopped)) => {
                         self.node.store_mut().drain();
@@ -1127,7 +1143,8 @@ where
 /// Serves one data plane's stream `S` as `client`: what it asks handed to the pod, and what
 /// the pod tells the client sent down, until either side ends it. Its requests are read only
 /// as the pod takes them, and its answers wait in the client's queue while the data plane
-/// reads slowly.
+/// reads slowly. A check waits for the pod's task to take it, its answer then sent down: the
+/// stream that checks is one of its own, with no answers to hold up meanwhile.
 async fn serve_data_plane<S, A>(
     mut client: StoreClient,
     mut asked: A,
@@ -1142,6 +1159,17 @@ async fn serve_data_plane<S, A>(
                 let Some(Ok(asking)) = asking else {
                     return;
                 };
+                if let Some(id) = S::check(&asking) {
+                    if !client.check().await {
+                        return;
+                    }
+                    if let Some(checked) = S::checked(id)
+                        && telling.send(Ok(checked)).await.is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 // One the mode cannot use is dropped, as a message lost.
                 if let Ok(message) = S::asked_from(asking, client.id())
                     && !client.ask(message).await
@@ -1374,6 +1402,87 @@ mod tests {
         ) -> Poll<Option<Self::Item>> {
             Poll::Pending
         }
+    }
+
+    /// A data plane that asks what it holds, in turn, then nothing more.
+    struct Asks(std::collections::VecDeque<Asking>);
+
+    impl futures_core::Stream for Asks {
+        type Item = Result<Asking, Status>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.0
+                .pop_front()
+                .map_or(Poll::Pending, |asking| Poll::Ready(Some(Ok(asking))))
+        }
+    }
+
+    /// A check on a data plane's stream reaches the pod's task behind what was asked before
+    /// it, and is answered only once the task has taken it: a task held up holds the check's
+    /// answer up too, which is what makes it a check of the task and not of the connection.
+    #[tokio::test]
+    async fn a_check_is_answered_once_the_pods_task_takes_it_behind_what_came_before() {
+        let mut running = running();
+        let (given, giving) = oneshot::channel();
+        running.client(given);
+        let (id, told) = giving.await.unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let client = StoreClient { id, commands, told };
+        let gather = wire::asking(ModeMessage::Gather {
+            client: 0,
+            id: 1,
+            keys: Vec::new(),
+        })
+        .unwrap();
+        let check = Asking {
+            asked: Some(wire::Asked::Check(wire::Check { id: 9 })),
+        };
+        let Received(mut written) =
+            data_plane_stream::<Decide, _>(client, Asks([gather, check].into()));
+        let wait = Duration::from_secs(1);
+        let first = tokio::time::timeout(wait, received.recv()).await.unwrap();
+        assert!(matches!(first, Some(Command::Ask(asker, _)) if asker == id));
+        let Ok(Some(Command::Check(answered))) = tokio::time::timeout(wait, received.recv()).await
+        else {
+            panic!("no check after the request");
+        };
+        let early = tokio::time::timeout(Duration::from_millis(50), written.recv()).await;
+        assert!(
+            early.is_err(),
+            "told {early:?} before the task took the check"
+        );
+        answered.send(()).unwrap();
+        let told = tokio::time::timeout(wait, written.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(told, wire::checked(9));
+    }
+
+    /// The pod's task answers a check in its turn; once the pod has stopped, a check says so.
+    #[tokio::test]
+    async fn the_pods_task_answers_a_check_and_a_stopped_pod_does_not() {
+        let (commands, received) = mpsc::channel(8);
+        let (given, giving) = oneshot::channel();
+        commands.send(Command::Client(given)).await.unwrap();
+        let task = tokio::spawn(running().run(received));
+        let (id, told) = giving.await.unwrap();
+        let client = StoreClient {
+            id,
+            commands: commands.clone(),
+            told,
+        };
+        let wait = Duration::from_secs(1);
+        let checked = tokio::time::timeout(wait, client.check()).await;
+        assert_eq!(checked, Ok(true), "the task did not answer the check");
+        commands.send(Command::Stop).await.unwrap();
+        task.await.unwrap();
+        let after = tokio::time::timeout(wait, client.check()).await;
+        assert_eq!(after, Ok(false), "a stopped pod answered the check");
     }
 
     /// Every answer waiting for a data plane is handed to its stream's writer at once, before
