@@ -13,7 +13,8 @@ pub struct Config {
     /// the others take its shards.
     pub stop_serving: Time,
     /// How long a pod goes unheard before the leader takes it out, or a voter takes its leader
-    /// for gone.
+    /// for gone; and how long one heard but not hearing the leader says it holds no lease
+    /// before the leader takes it out.
     pub silence: Time,
     /// The most a pod waits, beyond `silence`, before it starts an election: each waits a part
     /// of it of its own, so that two rarely start together.
