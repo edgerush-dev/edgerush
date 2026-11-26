@@ -30,6 +30,13 @@ Every change is marked `EdgeRush:` in the source.
   counted in `recv_single`, cleared where the ACK frame is written in `send_single`. The
   decision is `ack_due`, which `write_pkt_type` asks before it starts a packet for an ACK
   alone (`src/lib.rs`). Five tests at the end of `src/tests.rs` cover it.
+- **Tests can hold a connection's clock still.** A connection reads the time itself in
+  `recv()`, `send()`, `timeout()`, `on_timeout()` and `migrate()`, so a test that nothing
+  goes out before a timer is due, as the delayed-ACK tests check, raced the real clock and
+  failed on a busy machine. Those reads now go through `clock::now()` (`src/clock.rs`):
+  `Instant::now()` in every build but quiche's own tests, where a test may hold its
+  thread's clock still and move it on by hand (`clock::held`). The delayed-ACK tests hold
+  it from the end of the handshake.
 - **A server follows every NAT rebinding.** A server's paths are capped at its
   `active_connection_id_limit`, two by default, and a new path found room only by dropping
   one that held no Destination Connection ID. A path the peer has left keeps its ID, and

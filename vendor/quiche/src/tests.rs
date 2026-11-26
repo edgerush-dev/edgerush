@@ -15077,8 +15077,12 @@ fn server_qlog() {
 }
 
 /// EdgeRush: a pipe past its handshake and quiet, whose server delays ACKs
-/// with `max_ack_delay` at `max_ack_delay` ms, and whose client does not.
-fn delayed_ack_pipe(max_ack_delay: u64) -> test_utils::Pipe {
+/// with `max_ack_delay` at `max_ack_delay` ms, and whose client does not;
+/// and the clock both read, held still from then on, so that whether an ACK
+/// is due depends on the test and not on how busy the machine is.
+fn delayed_ack_pipe(
+    max_ack_delay: u64,
+) -> (test_utils::Pipe, clock::held::Held) {
     let mut client = test_utils::Pipe::default_config("cubic").unwrap();
     let mut server = test_utils::Pipe::default_config("cubic").unwrap();
     server.set_max_ack_delay(max_ack_delay);
@@ -15091,7 +15095,7 @@ fn delayed_ack_pipe(max_ack_delay: u64) -> test_utils::Pipe {
     assert_eq!(pipe.advance(), Ok(()));
     assert!(pipe.server.handshake_confirmed);
 
-    pipe
+    (pipe, clock::held::hold())
 }
 
 /// EdgeRush: one packet of stream data from the client, `data` on stream 0,
@@ -15127,7 +15131,7 @@ fn only_acks(frames: &[frame::Frame]) -> bool {
 /// EdgeRush: an ACK alone waits for a second ack-eliciting packet, and the
 /// timer says when it is due meanwhile.
 fn delayed_ack_waits_for_a_second_packet() {
-    let mut pipe = delayed_ack_pipe(25);
+    let (mut pipe, _clock) = delayed_ack_pipe(25);
 
     one_packet_to_server(&mut pipe, b"a");
     assert!(server_frames(&mut pipe).is_empty());
@@ -15154,7 +15158,7 @@ fn delayed_ack_waits_for_a_second_packet() {
 #[test]
 /// EdgeRush: an ACK that waits goes with the next frames sent.
 fn delayed_ack_goes_with_what_is_sent() {
-    let mut pipe = delayed_ack_pipe(25);
+    let (mut pipe, _clock) = delayed_ack_pipe(25);
 
     one_packet_to_server(&mut pipe, b"a");
     assert!(server_frames(&mut pipe).is_empty());
@@ -15172,11 +15176,8 @@ fn delayed_ack_goes_with_what_is_sent() {
 #[test]
 /// EdgeRush: an ACK alone is sent once its delay is up.
 fn delayed_ack_is_sent_when_its_delay_is_up() {
-    // 25 ms advertised: the ACK waits 20 ms, as in the tests above. Whether it
-    // has gone out is a matter of the clock when the server is asked, so the
-    // wait is room for the thread to be held up on a busy machine between the
-    // packet and the look: 1 ms was not. When it is due is exact.
-    let mut pipe = delayed_ack_pipe(25);
+    // 25 ms advertised: the ACK waits 20 ms, as in the tests above.
+    let (mut pipe, clock) = delayed_ack_pipe(25);
 
     one_packet_to_server(&mut pipe, b"a");
     assert!(server_frames(&mut pipe).is_empty());
@@ -15186,7 +15187,15 @@ fn delayed_ack_is_sent_when_its_delay_is_up() {
     let due = pipe.server.timeout_instant().unwrap();
     assert_eq!(due, first + Duration::from_millis(20));
     assert_eq!(Some(due), pipe.server.delayed_ack_timer());
-    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+
+    // Short of it by a nanosecond, it still waits.
+    clock.advance(Duration::from_millis(20) - Duration::from_nanos(1));
+    assert_eq!(pipe.server.timeout(), Some(Duration::from_nanos(1)));
+    pipe.server.on_timeout();
+    assert!(server_frames(&mut pipe).is_empty());
+
+    clock.advance(Duration::from_nanos(1));
+    assert_eq!(pipe.server.timeout(), Some(Duration::ZERO));
     pipe.server.on_timeout();
 
     let packets = server_frames(&mut pipe);
@@ -15198,7 +15207,7 @@ fn delayed_ack_is_sent_when_its_delay_is_up() {
 /// EdgeRush: a packet past a gap, or below the largest received, is
 /// acknowledged at once (RFC 9000 §13.2.1).
 fn delayed_ack_does_not_wait_for_packets_out_of_order() {
-    let mut pipe = delayed_ack_pipe(25);
+    let (mut pipe, _clock) = delayed_ack_pipe(25);
 
     assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
     let earlier = test_utils::emit_flight(&mut pipe.client).unwrap();
