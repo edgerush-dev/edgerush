@@ -10,7 +10,6 @@ design is in the docs (04 §4 and §6, 06 §2); this is how an operator meets it
 |---|---|
 | [manifests/](manifests/) | What the teams apply, one file each |
 | [mistakes.yaml](mistakes.yaml) | Seven mistakes, applied on top |
-| [validate/](validate/) | What `edgerush validate` needs besides: the data plane's settings, and the Gateway and classes the operator makes |
 
 One data plane, `edge/public`, serves everyone: Gateway API routes through the Gateway
 `edge/public` the operator makes of it, and Ingresses through its IngressClass
@@ -102,7 +101,7 @@ can't use up checkout's room, and checkout can't use up browsing's.
 3. **A host the Gateway's listeners cover is the Gateway's.** Ingress shares ports 80
    and 443 with the Gateway's listeners there. Had billing stayed on
    `billing.example.com`, its Ingress would take that host from the listeners'
-   `*.example.com`, and `validate` would say so and exit 1:
+   `*.example.com`, and the control plane would say so in its log:
    `Ingress legacy/billing claims billing.example.com, taking it from Gateway edge/public listener https's *.example.com, which does not fall through`.
 4. **`ignore: ["*"]` on `/healthz` is for good.** If the platform adds a limit next
    month, health checks are still exempt. That's intended here; on a real endpoint it
@@ -110,45 +109,6 @@ can't use up checkout's room, and checkout can't use up browsing's.
 5. **`Local` mode counts per pod.** With `mode: Local`, each data-plane pod counts on its
    own, so a client spread over 3 pods gets up to 3 times every number in these files.
 6. **A misspelt `ignore` removes nothing, silently.** See mistake 5 below.
-
-## Before applying: `validate`
-
-`edgerush validate` translates the manifests as the control plane would and compiles each
-policy as it does, with no cluster. It reads no DataPlane, so it is given what the
-operator makes of one besides:
-
-```
-$ edgerush validate --from-manifests manifests \
-    --from-manifests validate/made-by-the-operator.yaml --data-plane validate/data-plane.yaml
-11 routes and 8 upstreams translated; 0 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 0 Ingresses of other classes or none passed over
-TLS Secrets were taken as they will be in the cluster, not checked: --check-secrets checks them
-```
-
-and it exits 0. With the mistakes:
-
-```
-$ edgerush validate --from-manifests manifests --from-manifests mistakes.yaml \
-    --from-manifests validate/made-by-the-operator.yaml --data-plane validate/data-plane.yaml
-RateLimitPolicy search/search-bad-rate: the data plane would refuse it: limit `search-suggest-per-ip`: `model.bucket.rate`: `100/sec` is not a rate: a number of at least 1, `/`, and `s`, `min`, `h` or `d`
-RateLimitPolicy shop/shop-products: refused: its limit `search-per-ip` has the name of RateLimitPolicy search/search's, which holds it
-note: RateLimitPolicy edge/platform-redirects: applies nothing to HTTPRoute edge/to-https section redirect, which forwards nothing: a rule that redirects is under no limits
-note: RateLimitPolicy legacy/legacy-billing-backend: applies nothing to Service legacy/billing: it is not there
-RateLimitPolicy legacy/legacy-billing-backend: none of its targets is there, so it applies nothing and has no status
-note: RateLimitPolicy shop/shop-checkout-typo: applies nothing to HTTPRoute shop/storefront section checkuot: it has no rule `checkuot`
-11 routes and 8 upstreams translated; 3 left out; 0 paths without their backend; 0 TLS hosts or entries not served as listed; 0 paths shadowed; 0 Ingresses of other classes or none passed over; 3 notes
-TLS Secrets were taken as they will be in the cluster, not checked: --check-secrets checks them
-```
-
-and it exits 1. Notes fail nothing: a target not there yet, or a rule that redirects, is
-what files applied in any order look like. Two mistakes it does not show:
-
-- **Mistake 3**, targets at two levels, is refused only by the CRD's rules, which
-  `validate` leaves to the API server: `kubectl apply --dry-run=server` checks them.
-- **Mistake 5**, an `ignore` of a name not there, is no fault anywhere.
-
-Of two policies with a limit of one name, the older keeps it. Manifests in a repository
-carry no creation time, so `validate` takes them by namespace and name instead, as the
-control plane does for two policies of one age.
 
 ## What the operator sees
 

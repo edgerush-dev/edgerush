@@ -2,8 +2,8 @@
 //! plane runs ([04 §2](../../../docs/04-control-plane.md)).
 //!
 //! A pure crate: no I/O, no clocks. [`translate`] is a function of the objects and of the
-//! data plane's own settings, so that its tests need no cluster, and the control plane, its
-//! admission webhook and `validate --from-manifests` all translate alike.
+//! data plane's own settings, so that its tests need no cluster, and the control plane and
+//! its admission webhook translate alike.
 //!
 //! **It never fails as a whole.** What it cannot translate is left out, object by object,
 //! and said in its report. So far it translates Ingresses whose rules route paths, of any
@@ -354,9 +354,8 @@ pub struct Cluster {
     /// Every Secret seen: those Ingresses' `tls` names hold their certificates.
     pub secrets: Vec<Secret>,
     /// Whether the Secrets Ingresses' `tls` names are taken as they will be in the
-    /// cluster, securing their hosts as named and not looked at: `edgerush validate` unless
-    /// asked to check them, as repositories seldom hold them (04 §3). The control plane
-    /// always looks.
+    /// cluster, securing their hosts as named and not looked at: the admission webhook's,
+    /// which judges an Ingress alone (04 §3). The control plane's translation always looks.
     pub secrets_assumed: bool,
     /// Every GatewayClass seen, where the data plane is a Gateway: the Gateway API's kinds
     /// are followed only then (04 §1), and those its install does not serve are none.
@@ -390,13 +389,13 @@ pub struct Cluster {
     pub namespaces: Vec<Namespace>,
     /// The namespaces the control plane watches, where it watches some and not all: no
     /// object of another is seen, so a reference into one is said as such (04 §9). None for
-    /// every namespace, as `edgerush validate` reads them.
+    /// every namespace.
     pub watched: Option<Vec<String>>,
     /// The labels the data plane's GatewayClass carries where a ControlPlane's control
     /// plane translates it: those the operator makes its class with, so that a class of its
     /// name it did not make is not taken, as the operator refuses it
     /// ([05 §3](../../../docs/05-operator.md)). None where classes are written by hand, as
-    /// for the development harness and `edgerush validate`.
+    /// for the development harness.
     pub gateway_class_labels: Option<BTreeMap<String, String>>,
 }
 
@@ -461,7 +460,7 @@ pub struct Translation {
 
 impl Problem {
     /// Whether this is a note on what is served as the spec has it, not a fault: said, but
-    /// no reason for `validate` to fail (04 §3). A retry's attempts taken as the data
+    /// no reason to refuse anything (04 §2). A retry's attempts taken as the data
     /// plane's most are one, and a host an Ingress serves over plain HTTP alone served over
     /// HTTPS by a Gateway listener another; so is a rule past half the most limits, and a
     /// RateLimitPolicy's target not there or forwarding nothing, which it applies to once

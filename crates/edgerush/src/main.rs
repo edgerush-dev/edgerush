@@ -4,9 +4,8 @@
 //! subcommands: `operator`, which turns ControlPlanes and DataPlanes into what runs them,
 //! `proxy`, a data plane run from a config file — the development harness —
 //! `controller`, a control plane for one data plane, `explain`, which says where
-//! a request would go and why, `test`, which checks a file of such requests and what is
-//! expected of them, and `validate`, which translates Kubernetes manifests as the control
-//! plane would.
+//! a request would go and why, and `test`, which checks a file of such requests and what
+//! is expected of them.
 
 mod bind;
 mod config_file;
@@ -21,7 +20,6 @@ mod resolver;
 mod stream;
 mod system_authorities;
 mod testing;
-mod validate;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -38,7 +36,6 @@ Commands:
   controller  Run a control plane for one data plane, in a cluster
   explain     Say where a request to a listener goes, and why no other match took it
   test        Check where requests go against a file of tests, without running a data plane
-  validate    Translate Kubernetes manifests as the control plane would, and say what was left out
 
 Options:
   -V, --version  Print version
@@ -71,7 +68,6 @@ fn run(
         Some("controller") => return controller::command(args, stdout, stderr),
         Some("explain") => return explain::command(args, stdout, stderr),
         Some("test") => return testing::command(args, stdout, stderr),
-        Some("validate") => return validate::command(args, stdout, stderr),
         Some(other) => {
             write!(stderr, "error: unexpected argument '{other}'\n\n{USAGE}").map(|()| EXIT_USAGE)
         }

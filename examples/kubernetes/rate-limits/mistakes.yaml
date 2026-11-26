@@ -1,12 +1,9 @@
 # Seven mistakes, one per object, and what each one does. Apply them on top of
-# manifests/ to see them in a cluster, or validate them with the rest (README.md shows
-# both).
+# manifests/ to see them in a cluster; README.md shows what each one looks like.
 #
 # Refused at `kubectl apply` (nothing is stored): 3, 4, 6.
 # Stored, but not applied, with the reason in status: 1, 2, 7.
 # Stored and applied, silently doing less than meant: 5.
-# `edgerush validate` says all but 3 and 5: it takes the manifests as the API server
-# accepted them, and 3 is refused only by the CRD's rules; 5 is no fault anywhere.
 
 # 1. A name taken. The shop team starts a policy for its products API from the search
 #    team's file and keeps `search-per-ip`, which the search team's policy holds. Names

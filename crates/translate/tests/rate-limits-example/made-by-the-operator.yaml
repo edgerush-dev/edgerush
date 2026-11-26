@@ -1,7 +1,7 @@
-# What the operator makes of manifests/10-platform.yaml, for `edgerush validate`, which
-# reads no DataPlane: the GatewayClass named after the ControlPlane, the IngressClass
-# `<control plane>.<data plane>` and the Gateway written from the DataPlane's `gateway`.
-# Never apply these: the operator owns them.
+# What the operator makes of examples/kubernetes/rate-limits/manifests/10-platform.yaml,
+# which translation reads no DataPlane to make: the GatewayClass named after the
+# ControlPlane, the IngressClass `<control plane>.<data plane>` and the Gateway written from
+# the DataPlane's `gateway`.
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: edge }
