@@ -804,10 +804,12 @@ fn subscriber(
     (running, told, subscribing)
 }
 
-async fn within<T>(receiver: &mut mpsc::UnboundedReceiver<T>) -> T {
+/// What `receiver` sends next, within a few seconds; `what` says what was waited for, if
+/// nothing came.
+async fn within<T>(receiver: &mut mpsc::UnboundedReceiver<T>, what: &str) -> T {
     tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
-        .expect("nothing came")
+        .unwrap_or_else(|_| panic!("{what}: nothing came"))
         .unwrap()
 }
 
@@ -850,7 +852,7 @@ async fn a_data_plane_dials_again_after_its_stream_ends_and_holds_what_it_was_se
         subscriber(&address.to_string(), files, presented, backoff);
     // Each dial fails, and the bound the waits are drawn below grows to 64 times the first.
     for _ in 0..7 {
-        let Following::Ended { ended, .. } = within(&mut told).await else {
+        let Following::Ended { ended, .. } = within(&mut told, "a dial dropped").await else {
             panic!("not ended")
         };
         assert!(matches!(ended, Ended::Unreachable(_)), "{ended:?}");
@@ -860,7 +862,7 @@ async fn a_data_plane_dials_again_after_its_stream_ends_and_holds_what_it_was_se
     let again = listener.try_clone().unwrap();
     let server = credentials(&authority, &["127.0.0.1"]);
     let mut plane = Plane::start_on(listener, &server, Some(offer.clone()));
-    assert_eq!(within(&mut running).await, config(80));
+    assert_eq!(within(&mut running, "the config served").await, config(80));
     assert!(matches!(plane.next().await, Heard::Opened { .. }));
     assert!(matches!(plane.next().await, Heard::Reported(_)));
     plane.signal();
@@ -868,7 +870,7 @@ async fn a_data_plane_dials_again_after_its_stream_ends_and_holds_what_it_was_se
     // The stream carried a config, so the wait is drawn below the first bound again.
     let ending = async {
         loop {
-            match within(&mut told).await {
+            match within(&mut told, "the stream ended").await {
                 Following::Ended {
                     ended: ended @ Ended::Ended(_),
                     wait,
@@ -912,7 +914,7 @@ async fn certificate_files_replaced_are_presented_on_the_next_dial() {
     let (mut running, mut told, subscribing) =
         subscriber(&plane.address.clone(), files.clone(), credentials, quick());
     for _ in 0..2 {
-        let Following::Ended { ended, .. } = within(&mut told).await else {
+        let Following::Ended { ended, .. } = within(&mut told, "a dial refused").await else {
             panic!("not refused")
         };
         assert!(matches!(ended, Ended::Unreachable(_)), "{ended:?}");
@@ -922,7 +924,7 @@ async fn certificate_files_replaced_are_presented_on_the_next_dial() {
     std::fs::write(&files.key, "not a key").unwrap();
     let unusable = async {
         loop {
-            match within(&mut told).await {
+            match within(&mut told, "the files said unusable").await {
                 Following::Unusable(_) => break,
                 Following::Ended { .. } => {}
                 Following::Replaced => panic!("unusable files put to use"),
@@ -935,7 +937,7 @@ async fn certificate_files_replaced_are_presented_on_the_next_dial() {
     put_files(&files, &authority, &authority);
     let replaced = async {
         loop {
-            match within(&mut told).await {
+            match within(&mut told, "the files said replaced").await {
                 Following::Replaced => break,
                 Following::Ended { .. } | Following::Unusable(_) => {}
             }
@@ -944,7 +946,10 @@ async fn certificate_files_replaced_are_presented_on_the_next_dial() {
     tokio::time::timeout(Duration::from_secs(5), replaced)
         .await
         .expect("not said to be replaced");
-    assert_eq!(within(&mut running).await, config(80));
+    assert_eq!(
+        within(&mut running, "the config, the files replaced").await,
+        config(80)
+    );
     subscribing.abort();
     plane.signal();
     plane.join().await;
@@ -991,11 +996,11 @@ async fn the_stream_goes_on_while_a_config_waits_to_run() {
         )
         .await;
     });
-    within(&mut starting).await;
+    within(&mut starting, "the config to wait on").await;
     put_files(&files, &authority, &authority);
     let replaced = async {
         loop {
-            if within(&mut told).await == Following::Replaced {
+            if within(&mut told, "the files said replaced").await == Following::Replaced {
                 break;
             }
         }
@@ -1074,14 +1079,20 @@ async fn the_gateways_addresses_come_before_the_config_and_again_as_they_change(
         )
         .await
     });
-    assert_eq!(within(&mut handing).await, Handed::Gateway(first));
-    assert_eq!(within(&mut handing).await, Handed::Config);
+    assert_eq!(
+        within(&mut handing, "the first addresses").await,
+        Handed::Gateway(first)
+    );
+    assert_eq!(within(&mut handing, "the config").await, Handed::Config);
     // Once the data plane has reported, so that nothing but the change sends more.
     assert!(matches!(plane.next().await, Heard::Opened { .. }));
     assert!(matches!(plane.next().await, Heard::Reported(_)));
     let more: Vec<IpAddr> = vec!["10.244.0.5".parse().unwrap(), "fd00::6".parse().unwrap()];
     plane.gateway.send_replace(Arc::from(more.clone()));
-    assert_eq!(within(&mut handing).await, Handed::Gateway(more));
+    assert_eq!(
+        within(&mut handing, "the addresses changed").await,
+        Handed::Gateway(more)
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         handing.try_recv().is_err(),
@@ -1332,7 +1343,8 @@ async fn a_data_plane_is_served_once_its_data_plane_is_and_no_longer_once_it_is_
     let (mut running, mut told, subscribing) =
         subscriber(&plane.address, files, presented, quick());
     let not_served = format!("{WEB} is no DataPlane this control plane serves");
-    let Following::Ended { ended, .. } = within(&mut told).await else {
+    let Following::Ended { ended, .. } = within(&mut told, "a dial refused, not served").await
+    else {
         panic!("not ended")
     };
     assert_eq!(ended, Ended::Ended(not_served.clone()));
@@ -1342,7 +1354,10 @@ async fn a_data_plane_is_served_once_its_data_plane_is_and_no_longer_once_it_is_
     plane
         .offers
         .send_replace(ids(&[(WEB, Some(Arc::new(offer)))]));
-    assert_eq!(within(&mut running).await, config(80));
+    assert_eq!(
+        within(&mut running, "the config, once served").await,
+        config(80)
+    );
     // What was told of the dials before it.
     while told.try_recv().is_ok() {}
     // Another served in its place, with a config of its own.
@@ -1352,7 +1367,7 @@ async fn a_data_plane_is_served_once_its_data_plane_is_and_no_longer_once_it_is_
         .send_replace(ids(&[(API, Some(Arc::new(another)))]));
     let ending = async {
         loop {
-            if let Following::Ended { ended, .. } = within(&mut told).await
+            if let Following::Ended { ended, .. } = within(&mut told, "the stream ended").await
                 && ended == Ended::Ended(not_served.clone())
             {
                 break;
@@ -1363,7 +1378,9 @@ async fn a_data_plane_is_served_once_its_data_plane_is_and_no_longer_once_it_is_
         .await
         .expect("its stream was not ended");
     // Its next dials are refused as well, and nothing of the other's reaches it.
-    let Following::Ended { ended, .. } = within(&mut told).await else {
+    let Following::Ended { ended, .. } =
+        within(&mut told, "a dial refused, served no longer").await
+    else {
         panic!("not ended")
     };
     assert_eq!(ended, Ended::Ended(not_served));
