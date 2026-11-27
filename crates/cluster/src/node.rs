@@ -5940,7 +5940,7 @@ mod tests {
 
         proptest! {
             #[test]
-            fn kept_once_it_keeps_what_whole_copies_would(
+            fn tallied_it_counts_what_counting_afresh_would(
                 steps in proptest::collection::vec(step(), 0..80),
             ) {
                 let (mut kept, mut whole) = (Unacked::default(), Whole::default());
