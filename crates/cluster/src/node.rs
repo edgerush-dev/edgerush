@@ -253,7 +253,7 @@ pub struct Node<V> {
     /// As owner: for each replica, each copy it has not yet said it holds, by the copy's
     /// number: when it went, and its keys, what a repair sends again. Behind a whole copy going
     /// to it, what changed after the copy's number is one record, under the latest number.
-    unacked: BTreeMap<(ShardId, NodeId), BTreeMap<u64, Unanswered>>,
+    unacked: BTreeMap<(ShardId, NodeId), Unacked>,
     /// As owner: for each replica, how long its last answer that said more took, from the
     /// copy it answered.
     round_trips: BTreeMap<(ShardId, NodeId), Time>,
@@ -1487,39 +1487,18 @@ impl<V: Held> Node<V> {
                 // known at once, rather than a record a cycle that the bound below would merge
                 // and count again every cycle (#610: ~170 shards' worth a cycle, for a new
                 // member taking them whole, kept its owner's thread busy for seconds).
-                let behind_whole = whole_from
-                    .filter(|from| {
-                        unacked
-                            .last_key_value()
-                            .is_some_and(|(number, _)| number > from)
-                    })
-                    .and_then(|_| unacked.pop_last());
+                let behind_whole =
+                    whole_from.is_some_and(|from| unacked.last().is_some_and(|last| last > from));
                 // The record keeps when its oldest change was made, as two records kept as one
                 // keep the older's time.
-                if let Some((_, mut since)) = behind_whole {
-                    since.keys.extend(keys.iter().copied());
-                    over = since.keys.len() > held;
-                    unacked.insert(version, since);
+                if behind_whole {
+                    unacked.extend_last(version, &keys);
+                    over = unacked.last_keys() > held;
                 } else {
-                    unacked.insert(
-                        version,
-                        Unanswered {
-                            at: now,
-                            keys: keys.clone(),
-                        },
-                    );
+                    unacked.add(version, now, &keys);
                     if unacked.len() > UNACKED_MOST {
-                        // The two oldest kept as one, under the later number, from when the
-                        // older went: an answer covering that number covers both.
-                        if let (Some((_, older)), Some((number, newer))) =
-                            (unacked.pop_first(), unacked.pop_first())
-                        {
-                            let keys = older.keys.union(&newer.keys).copied().collect();
-                            unacked.insert(number, Unanswered { at: older.at, keys });
-                        }
-                        let kept: BTreeSet<&Key> =
-                            unacked.values().flat_map(|copy| &copy.keys).collect();
-                        over = kept.len() > held;
+                        unacked.join_oldest();
+                        over = unacked.keys() > held;
                     } else {
                         over = false;
                     }
@@ -1607,8 +1586,7 @@ impl<V: Held> Node<V> {
                         .unacked
                         .get(&copy)
                         .into_iter()
-                        .flat_map(BTreeMap::values)
-                        .flat_map(|copy| &copy.keys)
+                        .flat_map(Unacked::all)
                         .copied()
                         .collect();
                     (Some(acked), Some(keys))
@@ -1926,17 +1904,17 @@ impl<V: Held> Node<V> {
             // How many cycles' copies it has yet to answer, by their numbers, one a cycle that
             // changed the shard: behind a whole copy, those cycles' changes are one record.
             let behind = unacked
-                .and_then(BTreeMap::last_key_value)
-                .map_or(0, |(number, _)| number.saturating_sub(acked));
+                .and_then(Unacked::last)
+                .map_or(0, |number| number.saturating_sub(acked));
             // The copies on their way not held against it: its oldest copy unanswered no
             // older than its last round trip and `CAUGHT_UP` cycles, so that a taker far away
             // under a write every cycle is caught up as one close by is.
             let within_its_trip = match (
-                unacked.and_then(|unacked| unacked.values().next()),
+                unacked.and_then(Unacked::oldest),
                 self.round_trips.get(&copy),
             ) {
                 (Some(oldest), Some(trip)) => {
-                    now.saturating_sub(oldest.at)
+                    now.saturating_sub(oldest)
                         <= trip.saturating_add(self.config.cycle.saturating_mul(CAUGHT_UP as Time))
                 }
                 (None, _) => true,
@@ -1981,8 +1959,7 @@ impl<V: Held> Node<V> {
                     .unacked
                     .get(&(shard, to))
                     .into_iter()
-                    .flat_map(BTreeMap::values)
-                    .flat_map(|copy| &copy.keys)
+                    .flat_map(Unacked::all)
                     .chain(self.dirty.get(&shard).into_iter().flatten())
                     .copied()
                     .collect();
@@ -2351,11 +2328,10 @@ impl<V: Held> Node<V> {
                         *acked = version;
                         self.behind.remove(&copy);
                         if let Some(unacked) = self.unacked.get_mut(&copy) {
-                            if let Some(answered) = unacked.get(&version) {
-                                self.round_trips
-                                    .insert(copy, now.saturating_sub(answered.at));
+                            if let Some(answered) = unacked.went_at(version) {
+                                self.round_trips.insert(copy, now.saturating_sub(answered));
                             }
-                            unacked.retain(|number, _| *number > version);
+                            unacked.held(version);
                         }
                     } else if version < *acked {
                         // It says it holds less than it said: it has lost what it held — a
@@ -2906,6 +2882,175 @@ const FORGET_AFTER: Time = 2;
 struct Unanswered {
     at: Time,
     keys: BTreeSet<Key>,
+}
+
+/// The copies one replica of a shard has not yet said it holds, by number, and how many keys
+/// they have between them, each counted once: what a repair sends again. Past the bound, every
+/// copy joins the oldest, so that it holds nearly all those keys and the newer copies a cycle's
+/// changes each; a tally of the newer copies' keys keeps the count as copies come and go, so
+/// that a cycle costs what it changed and an answer what it lets go, never every key the
+/// replica has yet to say it holds (#630: counted again every cycle, and the oldest copied,
+/// they kept a pod's thread busy for as long as a replica stayed behind, and so kept it
+/// behind).
+#[derive(Clone, Debug, Default)]
+struct Unacked {
+    copies: BTreeMap<u64, Unanswered>,
+    /// For each key of a copy other than the oldest, how many of those copies have it.
+    newer: BTreeMap<Key, u32>,
+    /// The keys of every copy, each once: the oldest's, and those only newer copies have.
+    keys: usize,
+}
+
+impl Unacked {
+    /// Copies kept.
+    fn len(&self) -> usize {
+        self.copies.len()
+    }
+
+    /// Keys of every copy, each once.
+    fn keys(&self) -> usize {
+        self.keys
+    }
+
+    /// Every copy's keys, a key once a copy that has it.
+    fn all(&self) -> impl Iterator<Item = &Key> {
+        self.copies.values().flat_map(|copy| &copy.keys)
+    }
+
+    /// The latest copy's number.
+    fn last(&self) -> Option<u64> {
+        self.copies.last_key_value().map(|(number, _)| *number)
+    }
+
+    /// Keys of the latest copy.
+    fn last_keys(&self) -> usize {
+        self.copies
+            .last_key_value()
+            .map_or(0, |(_, copy)| copy.keys.len())
+    }
+
+    /// When the oldest copy went.
+    fn oldest(&self) -> Option<Time> {
+        self.copies.first_key_value().map(|(_, copy)| copy.at)
+    }
+
+    /// When copy `number` went, kept apart still.
+    fn went_at(&self, number: u64) -> Option<Time> {
+        self.copies.get(&number).map(|copy| copy.at)
+    }
+
+    /// A key of a newer copy more: counted if no other copy has it.
+    fn count_newer(&mut self, key: Key) {
+        let newer = self.newer.entry(key).or_insert(0);
+        *newer += 1;
+        let oldest = self.copies.first_key_value().map(|(_, copy)| &copy.keys);
+        if *newer == 1 && !oldest.is_some_and(|oldest| oldest.contains(&key)) {
+            self.keys += 1;
+        }
+    }
+
+    /// A key of a newer copy less, the copy joining the oldest or becoming it.
+    fn uncount_newer(&mut self, key: &Key) {
+        if let Some(newer) = self.newer.get_mut(key) {
+            *newer -= 1;
+            if *newer == 0 {
+                self.newer.remove(key);
+            }
+        }
+    }
+
+    /// Copy `number`, past every one kept, gone at `at` with `keys`.
+    fn add(&mut self, number: u64, at: Time, keys: &BTreeSet<Key>) {
+        if self.copies.is_empty() {
+            self.keys = keys.len();
+        } else {
+            for key in keys {
+                self.count_newer(*key);
+            }
+        }
+        self.copies.insert(
+            number,
+            Unanswered {
+                at,
+                keys: keys.clone(),
+            },
+        );
+    }
+
+    /// The latest copy numbered `number` instead, past it, with `keys` besides, keeping when
+    /// it went: behind a whole copy going, what changes is one record under the latest number.
+    fn extend_last(&mut self, number: u64, keys: &BTreeSet<Key>) {
+        let Some((_, mut last)) = self.copies.pop_last() else {
+            return;
+        };
+        if self.copies.is_empty() {
+            last.keys.extend(keys.iter().copied());
+            self.keys = last.keys.len();
+        } else {
+            for key in keys {
+                if last.keys.insert(*key) {
+                    self.count_newer(*key);
+                }
+            }
+        }
+        self.copies.insert(number, last);
+    }
+
+    /// The two oldest kept as one, under the later number, from when the older went: an answer
+    /// covering that number covers both. The fewer keys join the more where they are.
+    fn join_oldest(&mut self) {
+        if self.copies.len() < 2 {
+            return;
+        }
+        let (Some((_, older)), Some((number, newer))) =
+            (self.copies.pop_first(), self.copies.pop_first())
+        else {
+            return;
+        };
+        for key in &newer.keys {
+            self.uncount_newer(key);
+        }
+        let (mut more, fewer) = if older.keys.len() >= newer.keys.len() {
+            (older.keys, newer.keys)
+        } else {
+            (newer.keys, older.keys)
+        };
+        more.extend(fewer);
+        self.copies.insert(
+            number,
+            Unanswered {
+                at: older.at,
+                keys: more,
+            },
+        );
+    }
+
+    /// Every copy numbered up to `version` held, and let go, oldest first: its keys no newer
+    /// copy has leave the count, and the next copy becomes the oldest.
+    fn held(&mut self, version: u64) {
+        while let Some(entry) = self.copies.first_entry() {
+            if *entry.key() > version {
+                return;
+            }
+            let oldest = entry.remove();
+            let gone = oldest
+                .keys
+                .iter()
+                .filter(|key| !self.newer.contains_key(*key))
+                .count();
+            self.keys -= gone;
+            if let Some((_, next)) = self.copies.first_key_value() {
+                for key in &next.keys {
+                    if let Some(newer) = self.newer.get_mut(key) {
+                        *newer -= 1;
+                        if *newer == 0 {
+                            self.newer.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// How many copy cycles an owner whose taker has caught up waits for the table to move the
@@ -5625,7 +5770,7 @@ mod tests {
             owner.dirty.entry(shard).or_default().insert(*key);
             let _ = owner.tick(ms(1 + at * 10));
         }
-        let records = owner.unacked.get(&(shard, 2)).map_or(0, BTreeMap::len);
+        let records = owner.unacked.get(&(shard, 2)).map_or(0, Unacked::len);
         assert_eq!(records, 1, "records kept behind the copy");
         let held = Message::Replicated {
             shard,
@@ -5698,6 +5843,156 @@ mod tests {
         assert!(behind, "held back behind a repair");
     }
 
+    /// A cycle costs its owner what changed in it, however far behind a replica is (#630: past
+    /// `UNACKED_MOST` copies, every cycle counted again every key the replica had yet to say
+    /// it holds, for each shard changed: ~65% of a pod's thread after a replace, which so
+    /// answered its peers later still and never caught up). Timed, as nothing else shows the
+    /// cost: a cycle's median with tens of thousands of keys unanswered against its median
+    /// with a few thousand, each the same few keys' changes, both on one machine and load.
+    #[test]
+    fn a_cycle_costs_what_changed_however_far_behind_a_replica_is() {
+        let (mut owner, shard, assignment, version) = owner_copying_to_2();
+        let held = Message::Replicated {
+            shard,
+            term: 1,
+            assignment,
+            version,
+        };
+        let _ = owner.receive(2, held, ms(2));
+        // A shard of more keys than ever go unanswered, so that it is never sent whole again.
+        let keys: Vec<Key> = (0..)
+            .filter(|key| shard_of(*key, 4) == shard)
+            .take(50_000)
+            .collect();
+        for key in &keys {
+            owner.data.insert(shard, *key, Kept::new(Counts::of(1)));
+        }
+        let mut changing = keys.iter().cycle();
+        let mut took = Vec::new();
+        for cycle in 1..=2_000 {
+            for key in changing.by_ref().take(20) {
+                owner.data.insert(shard, *key, Kept::new(Counts::of(2)));
+                owner.dirty.entry(shard).or_default().insert(*key);
+            }
+            let began = std::time::Instant::now();
+            let _ = owner.tick(ms(2 + cycle * 10));
+            took.push(began.elapsed());
+        }
+        let median = |cycles: &[std::time::Duration]| {
+            let mut cycles = cycles.to_vec();
+            cycles.sort_unstable();
+            cycles[cycles.len() / 2]
+        };
+        let early = median(&took[100..200]);
+        let late = median(&took[1_900..]);
+        let unanswered = owner.unacked.get(&(shard, 2)).map_or(0, Unacked::keys);
+        assert!(unanswered > 30_000, "{unanswered} keys unanswered");
+        assert!(
+            late < early * 4,
+            "{late:?} a cycle far behind, {early:?} a few behind"
+        );
+    }
+
+    /// What a replica leaves unanswered, its keys counted by a tally as copies come and go, is
+    /// what counting every copy's keys afresh would find (#630): the same keys, as many, the
+    /// latest copy's number and keys, and when each copy went, whatever copies went, were kept
+    /// as one or were answered.
+    mod unanswered {
+        use super::super::{Key, Time, Unacked};
+        use proptest::prelude::*;
+        use std::collections::BTreeSet;
+
+        #[derive(Clone, Debug)]
+        enum Step {
+            /// A copy of these keys.
+            Add(BTreeSet<Key>),
+            /// These keys changed behind a whole copy going.
+            Behind(BTreeSet<Key>),
+            /// Past the bound: the two oldest as one.
+            Join,
+            /// Every copy up to this number held.
+            Held(u64),
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            let keys = proptest::collection::btree_set(0..40_u128, 0..8);
+            prop_oneof![
+                3 => keys.clone().prop_map(Step::Add),
+                1 => keys.prop_map(Step::Behind),
+                1 => Just(Step::Join),
+                1 => (0..60_u64).prop_map(Step::Held),
+            ]
+        }
+
+        /// Every copy's keys, counted afresh, as the owner counted them before #630.
+        #[derive(Default)]
+        struct Whole(Vec<(u64, Time, BTreeSet<Key>)>);
+
+        impl Whole {
+            fn all(&self) -> BTreeSet<Key> {
+                self.0
+                    .iter()
+                    .flat_map(|(_, _, keys)| keys)
+                    .copied()
+                    .collect()
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn tallied_it_counts_what_counting_afresh_would(
+                steps in proptest::collection::vec(step(), 0..80),
+            ) {
+                let (mut kept, mut whole) = (Unacked::default(), Whole::default());
+                let mut number = 0;
+                for step in steps {
+                    match step {
+                        Step::Add(keys) => {
+                            number += 1;
+                            kept.add(number, number * 10, &keys);
+                            whole.0.push((number, number * 10, keys));
+                        }
+                        Step::Behind(keys) => {
+                            let Some(last) = whole.0.last_mut() else {
+                                continue;
+                            };
+                            number += 1;
+                            kept.extend_last(number, &keys);
+                            last.0 = number;
+                            last.2.extend(keys);
+                        }
+                        Step::Join => {
+                            kept.join_oldest();
+                            if whole.0.len() >= 2 {
+                                let (_, at, mut older) = whole.0.remove(0);
+                                let (later, _, newer) = whole.0.remove(0);
+                                older.extend(newer);
+                                whole.0.insert(0, (later, at, older));
+                            }
+                        }
+                        Step::Held(version) => {
+                            kept.held(version);
+                            whole.0.retain(|(number, _, _)| *number > version);
+                        }
+                    }
+                    let all = whole.all();
+                    prop_assert_eq!(kept.keys(), all.len());
+                    prop_assert_eq!(kept.all().copied().collect::<BTreeSet<_>>(), all);
+                    prop_assert_eq!(kept.len(), whole.0.len());
+                    prop_assert_eq!(kept.last(), whole.0.last().map(|(number, _, _)| *number));
+                    prop_assert_eq!(
+                        kept.last_keys(),
+                        whole.0.last().map_or(0, |(_, _, keys)| keys.len())
+                    );
+                    prop_assert_eq!(kept.oldest(), whole.0.first().map(|(_, at, _)| *at));
+                    for (number, at, _) in &whole.0 {
+                        prop_assert_eq!(kept.went_at(*number), Some(*at));
+                    }
+                }
+            }
+        }
+    }
+
     /// A replica that never answers costs its owner a bounded record of what to send it
     /// again, however many copies go unanswered.
     #[test]
@@ -5726,7 +6021,7 @@ mod tests {
             });
             let _ = owner.tick(now);
         }
-        let kept = owner.unacked.get(&(shard, 2)).map_or(0, BTreeMap::len);
+        let kept = owner.unacked.get(&(shard, 2)).map_or(0, Unacked::len);
         assert!(
             owner.count(key).is_some_and(|count| count > 300),
             "{:?}",
@@ -5837,8 +6132,7 @@ mod tests {
                 .unacked
                 .get(&(shard, 2))
                 .into_iter()
-                .flat_map(BTreeMap::values)
-                .flat_map(|copy| &copy.keys)
+                .flat_map(Unacked::all)
                 .copied()
                 .collect();
             most = most.max(kept.len());
