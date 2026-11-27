@@ -635,8 +635,10 @@ pub struct Local<S> {
     capacity: AtomicU64,
     evicted: AtomicU64,
     /// Each limit's terms, which its keys point to: read when a key is made, and let go of
-    /// by the sweep once no key holds them.
-    terms: RwLock<HashMap<Limit, Arc<Terms>>>,
+    /// by the sweep once no key holds them. Hashed with the keys' hasher, not the standard
+    /// library's SipHash, which took nearly a fifth of making a key: a limit is configured,
+    /// not chosen by a client, so SipHash's guard against chosen collisions buys nothing.
+    terms: RwLock<HashMap<Limit, Arc<Terms>, S>>,
 }
 
 /// The keys a [`Local`] has let go of that handles may still hold.
@@ -681,6 +683,7 @@ impl<S: BuildHasher + Clone> Local<S> {
             shards: (0..SHARDS)
                 .map(|_| RwLock::new(KeySet::with_hasher(hasher.clone())))
                 .collect(),
+            terms: RwLock::new(HashMap::with_hasher(hasher.clone())),
             hasher,
             holding: AtomicU64::new(0),
             gone: RwLock::new(Gone {
@@ -693,7 +696,6 @@ impl<S: BuildHasher + Clone> Local<S> {
             tables: Arc::new(AtomicU64::new(0)),
             capacity: AtomicU64::new(u64::MAX),
             evicted: AtomicU64::new(0),
-            terms: RwLock::new(HashMap::new()),
         }
     }
 
