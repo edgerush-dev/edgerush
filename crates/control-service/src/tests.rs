@@ -177,10 +177,12 @@ fn follower(
     (running, following)
 }
 
-async fn ended(following: JoinHandle<Ended>) -> Ended {
+/// How the stream `following` follows ended, within a few seconds; `what` says which
+/// stream it was, if one did not.
+async fn ended(following: JoinHandle<Ended>, what: &str) -> Ended {
     tokio::time::timeout(Duration::from_secs(5), following)
         .await
-        .expect("the stream did not end")
+        .unwrap_or_else(|_| panic!("{what}: the stream did not end"))
         .unwrap()
 }
 
@@ -264,7 +266,10 @@ async fn a_data_plane_runs_each_offer_and_says_so() {
     // Stopping ends the stream, and says so to the data plane.
     plane.signal();
     let stopping = "the control plane is stopping".to_owned();
-    assert_eq!(ended(following).await, Ended::Ended(stopping.clone()));
+    assert_eq!(
+        ended(following, "the stream stopped").await,
+        Ended::Ended(stopping.clone())
+    );
     assert_eq!(plane.next().await, Heard::Closed(Some(stopping)));
     plane.join().await;
 }
@@ -295,7 +300,7 @@ async fn a_data_plane_the_authorities_do_not_vouch_for_is_refused() {
     ] {
         let (_, following) = follower(&plane.address, "control.test", tls, |_| false);
         assert!(
-            matches!(ended(following).await, Ended::Unreachable(_)),
+            matches!(ended(following, what).await, Ended::Unreachable(_)),
             "{what}"
         );
         assert!(matches!(plane.next().await, Heard::Refused(_)), "{what}");
@@ -369,7 +374,10 @@ async fn a_provided_authority_is_trusted_alone_and_not_its_siblings() {
     // Of the other ControlPlane's, of the same root: refused.
     let tls = connector(&signed(&theirs, &["data-plane"])).unwrap();
     let (_, following) = follower(&plane.address, "control.test", tls, |_| false);
-    assert!(matches!(ended(following).await, Ended::Unreachable(_)));
+    assert!(matches!(
+        ended(following, "the other ControlPlane's").await,
+        Ended::Unreachable(_)
+    ));
     plane.signal();
     plane.join().await;
 }
@@ -391,7 +399,7 @@ async fn a_control_plane_the_authorities_do_not_vouch_for_or_of_another_name_is_
     ] {
         let mut plane = Plane::start(&credentials, Some(offer.clone())).await;
         let (_, following) = follower(&plane.address, "control.test", tls.clone(), |_| false);
-        let Ended::Unreachable(why) = ended(following).await else {
+        let Ended::Unreachable(why) = ended(following, what).await else {
             panic!("{what}: not refused")
         };
         assert!(why.contains("CERTIFICATE_VERIFY_FAILED"), "{what}: {why}");
@@ -416,14 +424,17 @@ async fn certificates_replaced_serve_the_next_connection() {
         acceptor(&credentials(&authority, &["renamed.test"])).unwrap(),
     ));
     let (_, refused) = follower(&plane.address, "control.test", tls.clone(), |_| false);
-    assert!(matches!(ended(refused).await, Ended::Unreachable(_)));
+    assert!(matches!(
+        ended(refused, "the old name").await,
+        Ended::Unreachable(_)
+    ));
     let (mut running, second) = follower(&plane.address, "renamed.test", tls, |_| false);
     assert_eq!(ran(&mut running).await, config(80));
     // The stream opened before goes on.
     assert!(!first.is_finished());
     plane.signal();
-    ended(first).await;
-    ended(second).await;
+    ended(first, "the first").await;
+    ended(second, "the second").await;
     plane.join().await;
 }
 
@@ -1021,7 +1032,7 @@ async fn a_stream_goes_on_once_the_gateways_addresses_can_no_longer_change() {
     assert_eq!(ran(&mut running).await, config(81));
     assert!(!following.is_finished());
     plane.signal();
-    ended(following).await;
+    ended(following, "the stream stopped").await;
     plane.join().await;
 }
 
@@ -1077,7 +1088,7 @@ async fn the_gateways_addresses_come_before_the_config_and_again_as_they_change(
         "more was sent than the addresses"
     );
     plane.signal();
-    ended(following).await;
+    ended(following, "the stream stopped").await;
     plane.join().await;
 }
 
@@ -1205,7 +1216,7 @@ async fn two_data_planes_each_run_their_own_config() {
         |_| false,
     );
     assert_eq!(
-        ended(refused).await,
+        ended(refused, other).await,
         Ended::Ended(format!("{other} is no DataPlane this control plane serves"))
     );
     // Another config for one reaches it alone.
@@ -1233,8 +1244,8 @@ async fn two_data_planes_each_run_their_own_config() {
         .count();
     assert_eq!(opened, 2, "{heard:?}");
     plane.signal();
-    ended(web).await;
-    ended(api).await;
+    ended(web, "web").await;
+    ended(api, "api").await;
     plane.join().await;
 }
 
@@ -1281,7 +1292,7 @@ async fn each_data_plane_is_known_by_the_id_its_certificate_carries() {
         let (mut refused_running, refusing) =
             follower(&plane.address, "control.test", carrying(&names), |_| false);
         assert_eq!(
-            ended(refusing).await,
+            ended(refusing, &format!("{names:?}")).await,
             Ended::Ended(why.clone()),
             "{names:?}"
         );
@@ -1297,7 +1308,7 @@ async fn each_data_plane_is_known_by_the_id_its_certificate_carries() {
     // The one served is served on.
     assert!(!following.is_finished());
     plane.signal();
-    ended(following).await;
+    ended(following, "the stream stopped").await;
     plane.join().await;
 }
 
