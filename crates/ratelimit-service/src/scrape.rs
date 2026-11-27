@@ -165,6 +165,16 @@ pub fn render_store(observed: Observed) -> String {
     ] {
         scrape.sample(name, &[("why", why)], count);
     }
+    let name = "edgerush_rate_limit_pod_store_busy_seconds_total";
+    let help = "Seconds the pod's store spent taking messages, requests and ticks rather than \
+                waiting for them: a rate near 1 says the store's thread is what limits the pod.";
+    scrape.family(name, Kind::Counter, help);
+    scrape.sample(name, &[], observed.store_busy.as_secs_f64());
+    let name = "edgerush_rate_limit_pod_commands_waiting_most";
+    let help = "The most messages and requests waiting for the pod's store, behind one it took, \
+                since the last scrape: at 64 its streams wait to read on.";
+    scrape.family(name, Kind::Gauge, help);
+    scrape.sample(name, &[], observed.commands_waiting_most);
     let name = "edgerush_rate_limit_leader";
     scrape.family(
         name,
@@ -193,7 +203,10 @@ pub async fn serve_store(listener: TcpListener, pod: StorePod) {
         async move {
             match (asked, pod.observed().await) {
                 (_, None) => Said::Stopped,
-                (Asked::Metrics, Some(observed)) => Said::Scrape(render_store(observed)),
+                (Asked::Metrics, Some(observed)) => Said::Scrape(render_store(Observed {
+                    commands_waiting_most: pod.take_commands_waiting_most(),
+                    ..observed
+                })),
                 (Asked::Ready, Some(observed)) => Said::Ready(observed.ready),
             }
         }
@@ -315,6 +328,8 @@ mod tests {
                 decided_from_copy: 6,
                 ..BothCounted::default()
             },
+            store_busy: Duration::from_millis(1_500),
+            commands_waiting_most: 64,
         };
         let scrape = render_store(observed);
         for line in [
@@ -330,6 +345,10 @@ mod tests {
             "edgerush_rate_limit_messages_dropped_total{why=\"full\"} 3\n",
             "edgerush_rate_limit_messages_dropped_total{why=\"lost\"} 2\n",
             "edgerush_rate_limit_messages_dropped_total{why=\"too_long\"} 1\n",
+            "edgerush_rate_limit_pod_store_busy_seconds_total 1.5\n",
+            "# TYPE edgerush_rate_limit_pod_store_busy_seconds_total counter\n",
+            "edgerush_rate_limit_pod_commands_waiting_most 64\n",
+            "# TYPE edgerush_rate_limit_pod_commands_waiting_most gauge\n",
             "edgerush_rate_limit_leader 0\n",
             "edgerush_rate_limit_table_term 4294967297\n",
             "edgerush_rate_limit_table_version 12\n",
