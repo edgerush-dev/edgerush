@@ -2982,26 +2982,39 @@ fn an_idle_hq_connection_is_closed_at_its_keep_alive_deadline() {
     });
 }
 
-/// How long an HTTP/3 WebSocket's tunnel may carry nothing either way, in these tests.
-const TUNNEL_IDLE: Duration = Duration::from_millis(200);
+/// How long apart the busy side of a tunnel sends its frames, in these tests.
+const GAP: Duration = Duration::from_millis(100);
+
+/// How long an HTTP/3 WebSocket's tunnel may carry nothing either way, in these tests:
+/// longer than [`GAP`] by more than [`SLACK`], so that a frame a loaded machine sends late
+/// still comes within the bound.
+const TUNNEL_IDLE: Duration = Duration::from_secs(1);
 
 /// How a WebSocket's tunnel ended, and when.
 type Ending = Rc<Cell<Option<(crate::tunnel::Carried, std::time::Instant)>>>;
 
+/// When a WebSocket's request was switched to its tunnel: no later than the tunnel's
+/// clock starts, and after the connection's handshake, which a loaded machine may slow.
+type Switching = Rc<Cell<Option<std::time::Instant>>>;
+
 /// Serves a listener whose every request is taken for a WebSocket carried to the backend
 /// at `backend`, held to [`TUNNEL_IDLE`], and opens one from a client: the server, the
-/// client, the stream, and how its tunnel ends.
-async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Ending) {
+/// client, the stream, when it was switched to its tunnel, and how that tunnel ends.
+async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Switching, Ending) {
     use crate::tunnel::{Backend, Bounds, Switched};
     use crate::upstream::h1::blocks::{Blocks, Sizes};
+    let switching: Switching = Rc::new(Cell::new(None));
     let ended: Ending = Rc::new(Cell::new(None));
+    let switched = Rc::clone(&switching);
     let told = Rc::clone(&ended);
     let server = serving(Settings::default(), move |_, interim| {
+        let switched = Rc::clone(&switched);
         let told = Rc::clone(&told);
         async move {
             let socket = tokio::net::TcpStream::connect(backend).await.unwrap();
             let timers = Timers::new();
             tokio::task::spawn_local(Rc::clone(&timers).run());
+            switched.set(Some(std::time::Instant::now()));
             interim.switch(Switched {
                 backend: Backend::Socket(crate::upstream::secure::Socket::Plain(
                     crate::upstream::dial::Counted::uncounted(socket),
@@ -3047,20 +3060,20 @@ async fn websocket_to(backend: SocketAddr) -> (Server, Client, u64, Ending) {
                 .is_some_and(|answer| answer.final_status().is_some())
         })
         .await;
-    (server, client, id, ended)
+    (server, client, id, switching, ended)
 }
 
 /// A WebSocket frame of one byte, as a server sends it.
 const FROM_SERVER: &[u8] = b"\x81\x01x";
 /// The same as a client sends it, masked.
 const FROM_CLIENT: &[u8] = b"\x81\x81\0\0\0\0x";
-/// How many frames the busy side of a tunnel sends, one every 40 ms: three idle bounds'
+/// How many frames the busy side of a tunnel sends, one every [`GAP`]: three idle bounds'
 /// worth.
-const FRAMES: usize = 15;
+const FRAMES: usize = 30;
 
 /// An HTTP/3 WebSocket is idle only when nothing moves either way (19 §5). One whose
-/// backend sends every 40 ms is not closed while it does, however quiet its client, and is
-/// closed as idle one bound after the backend stops.
+/// backend sends every [`GAP`] is not closed while it does, however quiet its client, and
+/// is closed as idle one bound after the backend stops.
 #[test]
 fn an_h3_websocket_the_backend_talks_on_is_not_idle() {
     locally(async {
@@ -3071,7 +3084,7 @@ fn an_h3_websocket_the_backend_talks_on_is_not_idle() {
             let (mut peer, _) = socket.accept().await.unwrap();
             for _ in 0..FRAMES {
                 peer.write_all(FROM_SERVER).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(40)).await;
+                tokio::time::sleep(GAP).await;
             }
             let stopped = std::time::Instant::now();
             // Held open, so that the tunnel's end is its own idle bound.
@@ -3079,7 +3092,7 @@ fn an_h3_websocket_the_backend_talks_on_is_not_idle() {
             let _read = tokio::time::timeout(PATIENCE, peer.read_to_end(&mut rest)).await;
             stopped
         });
-        let (_server, mut client, id, ended) = websocket_to(address).await;
+        let (_server, mut client, id, _, ended) = websocket_to(address).await;
         client.until(|_| ended.get().is_some()).await;
         let (carried, at) = ended.get().unwrap();
         let stopped = backend.await.unwrap();
@@ -3094,7 +3107,7 @@ fn an_h3_websocket_the_backend_talks_on_is_not_idle() {
     });
 }
 
-/// The same the other way: one whose client sends every 40 ms, to a backend that says
+/// The same the other way: one whose client sends every [`GAP`], to a backend that says
 /// nothing, is closed as idle one bound after the client stops.
 #[test]
 fn an_h3_websocket_the_client_talks_on_is_not_idle() {
@@ -3108,10 +3121,10 @@ fn an_h3_websocket_the_client_talks_on_is_not_idle() {
             let _read = tokio::time::timeout(PATIENCE, peer.read_to_end(&mut heard)).await;
             heard.len()
         });
-        let (_server, mut client, id, ended) = websocket_to(address).await;
+        let (_server, mut client, id, _, ended) = websocket_to(address).await;
         for _ in 0..FRAMES {
             client.body(id, FROM_CLIENT, false).await;
-            client.for_a_while(Duration::from_millis(40)).await;
+            client.for_a_while(GAP).await;
         }
         let stopped = std::time::Instant::now();
         client.until(|_| ended.get().is_some()).await;
@@ -3140,10 +3153,10 @@ fn a_quiet_h3_websocket_is_closed_as_idle() {
             let mut heard = Vec::new();
             let _read = tokio::time::timeout(PATIENCE, peer.read_to_end(&mut heard)).await;
         });
-        let began = std::time::Instant::now();
-        let (_server, mut client, _, ended) = websocket_to(address).await;
+        let (_server, mut client, _, switching, ended) = websocket_to(address).await;
         client.until(|_| ended.get().is_some()).await;
         let (carried, at) = ended.get().unwrap();
+        let began = switching.get().unwrap();
         assert_eq!(carried, crate::tunnel::Carried::Idle);
         assert!(at - began >= TUNNEL_IDLE, "{:?}", at - began);
         assert!(at - began < TUNNEL_IDLE + SLACK, "{:?}", at - began);
