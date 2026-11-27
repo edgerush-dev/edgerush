@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -98,8 +98,63 @@ const RECEIVED_WAITING: usize = 64;
 /// rate at three keys a request (#253).
 const TELLING_WAITING: usize = 64;
 
+/// How many commands the pod's task takes, while more wait, before it hands over what it made
+/// meanwhile (decided): one queue's worth, [`RECEIVED_WAITING`]. It hands over sooner once
+/// none wait, and after every tick. Held, a run of commands' answers reach their writer
+/// together and go out in one write, on whichever thread the writer runs (#616); handed over
+/// one by one, a writer woken at the first takes them a few at a time (#253).
+const HAND_OVER_AFTER: usize = RECEIVED_WAITING;
+
 /// Something run on a pod's mode, its store within, in its task.
 type Run = Box<dyn FnOnce(&mut Pod, Time) + Send>;
+
+/// How busy a pod's task is, as its scrape shows it: published as the task ticks.
+#[derive(Debug, Default)]
+pub(crate) struct Load {
+    /// Nanoseconds spent taking commands and ticks, since it started.
+    busy: AtomicU64,
+    /// The most commands waiting behind one it took, since a scrape last took it.
+    waiting_most: AtomicUsize,
+}
+
+impl Load {
+    fn publish(&self, busy: Duration, waiting_most: usize) {
+        let busy = u64::try_from(busy.as_nanos()).unwrap_or(u64::MAX);
+        self.busy.fetch_add(busy, Ordering::Relaxed);
+        self.waiting_most.fetch_max(waiting_most, Ordering::Relaxed);
+    }
+
+    /// The time spent taking commands and ticks, since it started.
+    pub(crate) fn busy(&self) -> Duration {
+        Duration::from_nanos(self.busy.load(Ordering::Relaxed))
+    }
+
+    /// The most commands waiting behind one taken since this was last asked: none after.
+    pub(crate) fn take_waiting_most(&self) -> usize {
+        self.waiting_most.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// What the pod's task took: a tick, or a command.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "made and taken once a turn, never kept: a box would cost an allocation a command"
+)]
+enum Taken {
+    Tick,
+    Command(Command),
+}
+
+/// What a turn of the pod's task leaves it to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Turned {
+    /// Take the next.
+    On,
+    /// Stop, as a pod gone.
+    Stopped,
+    /// Stop, drained, once its streams have sent what they hold.
+    Drained,
+}
 
 enum Command {
     Receive(NodeId, PodMessage),
@@ -147,6 +202,11 @@ pub struct Observed {
     pub dropped: Dropped,
     /// What its pod counts of itself, each mode's own.
     pub mode: BothCounted,
+    /// The time its task has spent taking commands and ticks, since it started.
+    pub store_busy: Duration,
+    /// The most commands waiting for its task behind one it took, since the last scrape:
+    /// filled in by the scrape that takes it ([`StorePod::take_commands_waiting_most`]).
+    pub commands_waiting_most: usize,
 }
 
 /// A handle on a pod of the store, running both modes. Cheap to clone.
@@ -156,6 +216,7 @@ pub struct StorePod {
     hello: Arc<Hello>,
     counts: Arc<Counts>,
     skewed: Arc<AtomicUsize>,
+    load: Arc<Load>,
 }
 
 impl Clone for StorePod {
@@ -166,6 +227,7 @@ impl Clone for StorePod {
             hello: Arc::clone(&self.hello),
             counts: Arc::clone(&self.counts),
             skewed: Arc::clone(&self.skewed),
+            load: Arc::clone(&self.load),
         }
     }
 }
@@ -221,12 +283,14 @@ impl StorePod {
         let (commands, received) = mpsc::channel(RECEIVED_WAITING);
         let counts = Arc::new(Counts::default());
         let skewed = Arc::new(AtomicUsize::new(0));
+        let load = Arc::new(Load::default());
         let pod = Self {
             commands: commands.clone(),
             id,
             hello: Arc::clone(&hello),
             counts: Arc::clone(&counts),
             skewed: Arc::clone(&skewed),
+            load: Arc::clone(&load),
         };
         let running = Running {
             node,
@@ -246,6 +310,11 @@ impl StorePod {
             clients: BTreeMap::new(),
             next_client: CLIENTS,
             told: (0, 0),
+            held: BTreeMap::new(),
+            taken: 0,
+            load,
+            busy: Duration::ZERO,
+            waiting_most: 0,
         };
         tokio::spawn(running.run(received));
         pod
@@ -270,9 +339,17 @@ impl StorePod {
         self.skewed.load(Ordering::Relaxed)
     }
 
-    /// What its scrape shows of it, read at once between messages: `None` once it has stopped.
+    /// The most commands waiting for its task behind one it took since this was last asked,
+    /// by its scrape: none after.
+    #[must_use]
+    pub fn take_commands_waiting_most(&self) -> usize {
+        self.load.take_waiting_most()
+    }
+
+    /// What its scrape shows of it, read at once between messages, all but the most commands
+    /// waiting, which only a scrape takes: `None` once it has stopped.
     pub async fn observed(&self) -> Option<Observed> {
-        let (skewed, dropped) = (self.skewed(), self.dropped());
+        let (skewed, dropped, store_busy) = (self.skewed(), self.dropped(), self.load.busy());
         self.with_pod(move |pod, now| {
             let node = pod.store();
             Observed {
@@ -288,6 +365,8 @@ impl StorePod {
                 skewed,
                 dropped,
                 mode: counted(pod),
+                store_busy,
+                commands_waiting_most: 0,
             }
         })
         .await
@@ -480,6 +559,15 @@ struct Running {
     next_client: NodeId,
     /// The table last told its clients, by its number.
     told: Stamp,
+    /// What it made for each client and peer, not yet handed over, in order.
+    held: BTreeMap<NodeId, Vec<PodMessage>>,
+    /// Commands taken since it last handed over.
+    taken: usize,
+    /// How busy it is, as its scrape shows.
+    load: Arc<Load>,
+    /// Time busy, and the most commands waiting, not yet published to `load`.
+    busy: Duration,
+    waiting_most: usize,
 }
 
 /// When each peer whose wall clock is off past `skew_warning` was last told of in the log.
@@ -532,9 +620,10 @@ impl LapseWarnings {
 }
 
 impl Running {
-    /// Its time, as its store reads it, with its wall clock set from the system's.
-    fn now(&mut self) -> Time {
-        let now = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(Time::MAX);
+    /// Its time at `at`, as its store reads it, with its wall clock set from the system's.
+    fn now(&mut self, at: Instant) -> Time {
+        let since = at.saturating_duration_since(self.started);
+        let now = u64::try_from(since.as_nanos()).unwrap_or(Time::MAX);
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| {
@@ -551,70 +640,115 @@ impl Running {
         let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
-                _ = ticks.tick() => {
-                    let now = self.now();
-                    let out = self.node.tick(now);
-                    self.send(out);
-                    self.follow();
-                    self.ask_seeds();
-                    self.warn_skews();
-                    self.warn_lapses();
-                }
+            let taken = tokio::select! {
+                _ = ticks.tick() => Taken::Tick,
                 command = received.recv() => match command {
-                    None | Some(Command::Stop) => return,
-                    Some(Command::Receive(from, message)) => {
-                        let now = self.now();
-                        let out = self.node.receive(from, message, now);
-                        self.send(out);
-                    }
-                    Some(Command::Greeted(hello)) => self.greeted(hello),
-                    Some(Command::Control(message, answer)) => {
-                        if let Message::Form { voters, .. } = &message {
-                            for (voter, address) in voters {
-                                self.learn(*voter, address, false);
-                            }
-                        }
-                        let now = self.now();
-                        let mut out = self.node.receive(CONTROL_PLANE, PodMessage::Store(message), now);
-                        let to_control = out.iter().position(|(to, _)| *to == CONTROL_PLANE);
-                        let answered =
-                            to_control.and_then(|at| match out.remove(at).1 {
-                                PodMessage::Store(message) => Some(message),
-                                _ => None,
-                            });
-                        let _gone = answer.send(answered);
-                        self.send(out);
-                    }
-                    Some(Command::With(with)) => {
-                        let now = self.now();
-                        with(&mut self.node, now);
-                    }
-                    Some(Command::Client(given)) => self.client(given),
-                    Some(Command::Ask(client, message)) => {
-                        if asks_as(&message, client) {
-                            let now = self.now();
-                            let out = self.node.receive(client, message, now);
-                            self.send(out);
-                        }
-                    }
-                    Some(Command::Check(answered)) => {
-                        let _gone = answered.send(());
-                    }
-                    Some(Command::Drain(stopped)) => {
-                        self.node.store_mut().drain();
-                        self.drains.push(stopped);
-                    }
+                    Some(command) => Taken::Command(command),
+                    None => return,
                 },
-            }
-            self.tell_tables();
-            if self.node.store().drained() {
-                break;
+            };
+            match self.turn(taken, received.len()) {
+                Turned::On => {}
+                Turned::Stopped => return,
+                Turned::Drained => break,
             }
         }
         // Its store stopped, nothing more reaches it; what it sent still goes.
         drop(received);
         self.stop_drained().await;
+    }
+
+    /// Takes `taken`, `waiting` more commands behind it, and hands over what it has made once
+    /// none wait, after a tick, or after [`HAND_OVER_AFTER`] commands: what to do next.
+    fn turn(&mut self, taken: Taken, waiting: usize) -> Turned {
+        let began = Instant::now();
+        let ticked = matches!(taken, Taken::Tick);
+        match taken {
+            Taken::Tick => {
+                let now = self.now(began);
+                let out = self.node.tick(now);
+                self.hold(out);
+                self.follow();
+                self.ask_seeds();
+                self.warn_skews();
+                self.warn_lapses();
+            }
+            Taken::Command(command) => {
+                self.taken += 1;
+                self.waiting_most = self.waiting_most.max(waiting);
+                if self.take(command, began) == Turned::Stopped {
+                    return Turned::Stopped;
+                }
+            }
+        }
+        if ticked || waiting == 0 || self.taken >= HAND_OVER_AFTER {
+            self.hand_over();
+        }
+        self.tell_tables();
+        let drained = self.node.store().drained();
+        if drained {
+            self.hand_over();
+        }
+        self.busy += began.elapsed();
+        if ticked {
+            self.load.publish(self.busy, self.waiting_most);
+            self.busy = Duration::ZERO;
+            self.waiting_most = 0;
+        }
+        if drained { Turned::Drained } else { Turned::On }
+    }
+
+    /// Takes `command`, taken at `at`: stopped by [`Command::Stop`], else on.
+    fn take(&mut self, command: Command, at: Instant) -> Turned {
+        match command {
+            Command::Stop => return Turned::Stopped,
+            Command::Receive(from, message) => {
+                let now = self.now(at);
+                let out = self.node.receive(from, message, now);
+                self.hold(out);
+            }
+            Command::Greeted(hello) => self.greeted(hello),
+            Command::Control(message, answer) => {
+                if let Message::Form { voters, .. } = &message {
+                    for (voter, address) in voters {
+                        self.learn(*voter, address, false);
+                    }
+                }
+                let now = self.now(at);
+                let mut out = self
+                    .node
+                    .receive(CONTROL_PLANE, PodMessage::Store(message), now);
+                let to_control = out.iter().position(|(to, _)| *to == CONTROL_PLANE);
+                let answered = to_control.and_then(|at| match out.remove(at).1 {
+                    PodMessage::Store(message) => Some(message),
+                    _ => None,
+                });
+                let _gone = answer.send(answered);
+                self.hold(out);
+            }
+            Command::With(with) => {
+                let now = self.now(at);
+                with(&mut self.node, now);
+            }
+            Command::Client(given) => self.client(given),
+            Command::Ask(client, message) => {
+                if asks_as(&message, client) {
+                    let now = self.now(at);
+                    let out = self.node.receive(client, message, now);
+                    self.hold(out);
+                }
+            }
+            Command::Check(answered) => {
+                // Behind what was asked before it, on its way.
+                self.hand_over();
+                let _gone = answered.send(());
+            }
+            Command::Drain(stopped) => {
+                self.node.store_mut().drain();
+                self.drains.push(stopped);
+            }
+        }
+        Turned::On
     }
 
     /// Stops it, drained, once its links have sent what they hold, or after
@@ -634,36 +768,60 @@ impl Running {
         drop(self);
     }
 
-    /// Sends `out`, each message to its client, or to its peer's link, made if it has none:
-    /// dropped if no address is known for the peer.
-    fn send(&mut self, out: Vec<(NodeId, PodMessage)>) {
+    /// Holds `out`, each message for its client or peer, until it hands over.
+    fn hold(&mut self, out: Vec<(NodeId, PodMessage)>) {
         for (to, message) in out {
-            if (CLIENTS..CONTROL_PLANE).contains(&to) {
-                self.answer(to, message);
-                continue;
+            self.held.entry(to).or_default().push(message);
+        }
+    }
+
+    /// Hands over what it holds, each client's and each peer's together, in order: its
+    /// writer then finds them all waiting.
+    fn hand_over(&mut self) {
+        self.taken = 0;
+        if self.held.values().all(Vec::is_empty) {
+            return;
+        }
+        let mut held = std::mem::take(&mut self.held);
+        for (to, messages) in &mut held {
+            for message in messages.drain(..) {
+                self.send(*to, message);
             }
-            if !self.links.contains_key(&to) {
-                let made = self.addresses.get(&to).and_then(|address| {
-                    Link::new(address, &self.hello, &self.dial, &self.counts).ok()
-                });
-                match made {
-                    Some(link) => {
-                        self.links.insert(to, link);
-                    }
-                    None => {
-                        self.counts
-                            .lost
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
+        }
+        // Kept, emptied, for those still there, so that holding again costs no allocation.
+        held.retain(|to, _| self.clients.contains_key(to) || self.links.contains_key(to));
+        self.held = held;
+    }
+
+    /// Sends `message` to its client `to`, or to its peer's link, made if it has none:
+    /// dropped if no address is known for the peer.
+    fn send(&mut self, to: NodeId, message: PodMessage) {
+        if (CLIENTS..CONTROL_PLANE).contains(&to) {
+            self.answer(to, message);
+            return;
+        }
+        if !self.links.contains_key(&to) {
+            let made = self
+                .addresses
+                .get(&to)
+                .and_then(|address| Link::new(address, &self.hello, &self.dial, &self.counts).ok());
+            match made {
+                Some(link) => {
+                    self.links.insert(to, link);
+                }
+                None => {
+                    self.counts
+                        .lost
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
                 }
             }
-            if let (Some(link), Some(outgoing)) = (
-                self.links.get(&to),
-                both::mode_wire(self.hello.from, message),
-            ) {
-                link.send(&outgoing);
-            }
+        }
+        if let (Some(link), Some(outgoing)) = (
+            self.links.get(&to),
+            both::mode_wire(self.hello.from, message),
+        ) {
+            link.send(&outgoing);
         }
     }
 
@@ -721,8 +879,7 @@ impl Running {
         }
     }
 
-    /// Tells every client the table it has committed, as it commits one: in place of an older
-    /// one the client has not yet been told.
+    /// Tells every client the table it has committed, as it commits one ([`Self::tell`]).
     fn tell_tables(&mut self) {
         let Some(table) = self.node.store().committed() else {
             return;
@@ -732,6 +889,13 @@ impl Running {
         }
         self.told = table.stamp();
         let table = table.clone();
+        self.tell(&table);
+    }
+
+    /// Tells every client `table`: in place of an older one the client has not yet been told,
+    /// and after the answers made before it, handed over first.
+    fn tell(&mut self, table: &Table) {
+        self.hand_over();
         let clients: Vec<NodeId> = self.clients.keys().copied().collect();
         for client in clients {
             let told = Message::TableReply {
@@ -1330,6 +1494,11 @@ mod tests {
             clients: BTreeMap::new(),
             next_client: CLIENTS,
             told: (0, 0),
+            held: BTreeMap::new(),
+            taken: 0,
+            load: Arc::default(),
+            busy: Duration::ZERO,
+            waiting_most: 0,
         }
     }
 
@@ -1511,6 +1680,149 @@ mod tests {
             "{} of {TELLING_WAITING} answers handed to the writer",
             written.len()
         );
+    }
+
+    /// A client of `running`'s, and where it is told what it asked.
+    async fn asking_client(running: &mut Running) -> (NodeId, Told) {
+        let (given, giving) = oneshot::channel();
+        running.client(given);
+        giving.await.unwrap()
+    }
+
+    /// Client `client`'s request `id`, as a data plane asks it.
+    fn request(client: NodeId, id: u64) -> Command {
+        Command::Ask(
+            client,
+            PodMessage::Synchronous(ModeMessage::Request {
+                client,
+                id,
+                key: 7,
+                stamp: (0, 0),
+                hops: 0,
+                via: None,
+                give_back: false,
+                rule: None,
+                receipt: 0,
+            }),
+        )
+    }
+
+    /// The ids of the answers `told` holds now, in order.
+    fn answered(told: &mut Told) -> Vec<u64> {
+        let mut ids = Vec::new();
+        while let Ok(answer) = told.answers.try_recv() {
+            if let PodMessage::Synchronous(ModeMessage::Reply { id, .. }) = answer {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// What the pod's task makes while commands wait behind the one it takes is held, and
+    /// handed over, in order, once none wait: the answers of a run of commands go to a
+    /// writer together, whichever thread it runs on.
+    #[tokio::test]
+    async fn answers_are_held_while_commands_wait_and_handed_over_once_none_do() {
+        let mut running = running();
+        let (id, mut told) = asking_client(&mut running).await;
+        for asked in 1..=3 {
+            assert_eq!(
+                running.turn(Taken::Command(request(id, asked)), 1),
+                Turned::On
+            );
+            assert_eq!(answered(&mut told), Vec::<u64>::new(), "after {asked}");
+        }
+        assert_eq!(running.turn(Taken::Command(request(id, 4)), 0), Turned::On);
+        assert_eq!(answered(&mut told), vec![1, 2, 3, 4]);
+    }
+
+    /// However many commands wait, what the task made is handed over after every
+    /// [`HAND_OVER_AFTER`] of them, so that a task kept busy still answers.
+    #[tokio::test]
+    async fn a_task_kept_busy_hands_over_after_so_many_commands() {
+        let mut running = running();
+        let (id, mut told) = asking_client(&mut running).await;
+        let after = u64::try_from(HAND_OVER_AFTER).unwrap();
+        for asked in 1..after {
+            running.turn(Taken::Command(request(id, asked)), 100);
+        }
+        assert_eq!(answered(&mut told), Vec::<u64>::new());
+        running.turn(Taken::Command(request(id, after)), 100);
+        assert_eq!(answered(&mut told), (1..=after).collect::<Vec<_>>());
+        running.turn(Taken::Command(request(id, after + 1)), 100);
+        assert_eq!(
+            answered(&mut told),
+            Vec::<u64>::new(),
+            "the count starts again"
+        );
+    }
+
+    /// A tick hands over what waits, its own and what came before it.
+    #[tokio::test]
+    async fn a_tick_hands_over_what_is_held() {
+        let mut running = running();
+        let (id, mut told) = asking_client(&mut running).await;
+        running.turn(Taken::Command(request(id, 1)), 5);
+        running.turn(Taken::Command(request(id, 2)), 5);
+        assert_eq!(answered(&mut told), Vec::<u64>::new());
+        running.turn(Taken::Tick, 5);
+        assert_eq!(answered(&mut told), vec![1, 2]);
+    }
+
+    /// A check is answered only once what was asked before it is handed over, so that a
+    /// client checked has its earlier answers on their way.
+    #[tokio::test]
+    async fn a_check_hands_over_what_is_held_before_it_is_answered() {
+        let mut running = running();
+        let (id, mut told) = asking_client(&mut running).await;
+        running.turn(Taken::Command(request(id, 1)), 5);
+        let (checked, mut checking) = oneshot::channel();
+        running.turn(Taken::Command(Command::Check(checked)), 5);
+        assert_eq!(answered(&mut told), vec![1]);
+        assert_eq!(checking.try_recv(), Ok(()));
+    }
+
+    /// A table committed while commands wait is told a client only once the answers made
+    /// before it are handed over, so that the client finds them before the table.
+    #[tokio::test]
+    async fn a_table_is_told_after_the_answers_made_before_it() {
+        let mut running = running();
+        let (id, mut told) = asking_client(&mut running).await;
+        running.turn(Taken::Command(request(id, 1)), 5);
+        running.tell(&table(4));
+        assert!(told.table.has_changed().unwrap(), "no table told");
+        assert_eq!(answered(&mut told), vec![1]);
+    }
+
+    /// A stop drops what is held, as a pod gone would.
+    #[tokio::test]
+    async fn a_stop_ends_the_task() {
+        let mut running = running();
+        assert_eq!(
+            running.turn(Taken::Command(Command::Stop), 0),
+            Turned::Stopped
+        );
+    }
+
+    /// The time the task spends taking commands and ticks, and the most commands waiting
+    /// behind one it takes, are published as it ticks; the most is taken by a scrape and
+    /// starts again from nothing.
+    #[tokio::test]
+    async fn the_tasks_busy_time_and_most_waiting_are_published_as_it_ticks() {
+        let mut running = running();
+        let load = Arc::clone(&running.load);
+        let (id, _told) = asking_client(&mut running).await;
+        running.turn(Taken::Command(request(id, 1)), 7);
+        running.turn(Taken::Command(request(id, 2)), 3);
+        assert_eq!(load.busy(), Duration::ZERO, "published before a tick");
+        assert_eq!(load.take_waiting_most(), 0);
+        running.turn(Taken::Tick, 2);
+        let busy = load.busy();
+        assert!(busy > Duration::ZERO);
+        assert_eq!(load.take_waiting_most(), 7);
+        assert_eq!(load.take_waiting_most(), 0, "taken");
+        running.turn(Taken::Tick, 0);
+        assert!(load.busy() > busy, "it only adds");
     }
 
     #[test]
