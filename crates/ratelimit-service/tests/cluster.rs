@@ -20,7 +20,7 @@ use edgerush_cluster::{
     Authority, Changed, Config, Kept, Key, Message as StoreMessage, Node, NodeId, Stamp, Table,
     Time, generation_of, ms,
 };
-use edgerush_cluster_modes::{Message as BothMessage, Value};
+use edgerush_cluster_modes::{Message as BothMessage, Pod, Value};
 use edgerush_cluster_synchronous::{Answer, Message as ModeMessage, Rule, Value as SyncValue};
 use edgerush_ratelimit_service::cluster::forming::{self, Forming};
 use edgerush_ratelimit_service::cluster::link::Dial;
@@ -183,6 +183,9 @@ struct Cluster {
     /// What the API shows running, each pod with its address.
     running: Arc<Mutex<BTreeMap<NodeId, String>>>,
     control: JoinHandle<()>,
+    /// Whether each pod's store runs on a thread of its own, as a pod of two CPUs or more
+    /// runs it, rather than beside its streams.
+    apart: bool,
 }
 
 impl Drop for Cluster {
@@ -204,6 +207,18 @@ impl Cluster {
             cut: watch::channel(BTreeSet::new()).0,
             running,
             control,
+            apart: false,
+        }
+    }
+
+    /// Pod `id`, reached at `address`, started with `config` asking `seeds`: its store on a
+    /// thread of its own if the cluster's pods are run apart.
+    fn started(&self, id: NodeId, address: String, config: Config, seeds: Vec<String>) -> StorePod {
+        if self.apart {
+            let node = Pod::new(id, address.clone(), config, []);
+            StorePod::start_apart(node, address, Dial::Plain, seeds).unwrap()
+        } else {
+            StorePod::spawn(id, address, config, Dial::Plain, seeds)
         }
     }
 
@@ -225,7 +240,7 @@ impl Cluster {
         let listener = TcpListener::bind((ip, 0)).await.unwrap();
         let relay = Relay::to(ip, listener.local_addr().unwrap(), self.cut.subscribe()).await;
         let address = relay.address.to_string();
-        let pod = StorePod::spawn(id, address.clone(), config, Dial::Plain, seeds);
+        let pod = self.started(id, address.clone(), config, seeds);
         let server = StoreServer::new(pod.clone());
         let server = tokio::spawn(async move {
             let _ended = tonic::transport::Server::builder()
@@ -248,7 +263,7 @@ impl Cluster {
             .target
             .send_replace(listener.local_addr().unwrap());
         let address = old.relay.address.to_string();
-        let pod = StorePod::spawn(new, address, config(), Dial::Plain, Vec::new());
+        let pod = self.started(new, address, config(), Vec::new());
         let server = StoreServer::new(pod.clone());
         let server = tokio::spawn(async move {
             let _ended = tonic::transport::Server::builder()
@@ -271,7 +286,19 @@ impl Cluster {
     /// Starts pods 1 to `count`, shown running together, and waits for the control plane to
     /// form them into one table.
     async fn formed(count: NodeId) -> Self {
+        Self::form(Self::new(), count).await
+    }
+
+    /// As [`formed`](Self::formed), each pod's store on a thread of its own.
+    async fn formed_apart(count: NodeId) -> Self {
         let mut cluster = Self::new();
+        cluster.apart = true;
+        Self::form(cluster, count).await
+    }
+
+    /// Starts pods 1 to `count` in `cluster`, shown running together, and waits for the
+    /// control plane to form them into one table.
+    async fn form(mut cluster: Self, count: NodeId) -> Self {
         let mut addresses = Vec::new();
         for id in 1..=count {
             addresses.push((id, cluster.launch(id, config(), Vec::new()).await));
@@ -980,6 +1007,55 @@ async fn a_request_at_a_pod_not_its_keys_owner_is_forwarded_and_counted_once() {
     let answer = answered(&mut client, 1, ANSWERED).await;
     assert_eq!(answer, Some(Answer::Counted(1)));
     assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
+}
+
+/// Pods whose stores run on threads of their own, as pods of two CPUs or more run them, are
+/// formed, forward to each other, answer a data plane's stream and take in a pod given a seed:
+/// what each starts for its links, its seeds and its streams runs beside its streams, as its
+/// store's thread has no sockets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pods_whose_stores_run_apart_form_and_answer_through_each_other() {
+    let _shared = ALONE.read().await;
+    let mut cluster = Cluster::formed_apart(3).await;
+    let ids: BTreeSet<NodeId> = (1..=3).collect();
+    let ready = within(FORMED, || all_ready(&cluster, &ids)).await;
+    assert!(ready.is_some(), "pods not ready within {FORMED:?}");
+    let table = committed(cluster.pod(1)).await.unwrap();
+    let key = key_owned_by(&table, 2);
+    cluster.pod(1).set_forwarding(true).await;
+    let mut client = cluster.pod(1).client().await.unwrap();
+    assert!(
+        client
+            .ask(BothMessage::Synchronous(request(
+                client.id(),
+                1,
+                key,
+                table.stamp(),
+                None
+            )))
+            .await
+    );
+    assert_eq!(
+        answered(&mut client, 1, ANSWERED).await,
+        Some(Answer::Counted(1))
+    );
+    assert_eq!(held_at(cluster.pod(2), key).await, Some(1));
+    let seed = cluster.pods[&1].relay.address.to_string();
+    let mut plane = DataPlane::from_seed(&seed).await;
+    let key = plane.key_of(3);
+    let id = plane.ask(3, |plane, id| plane.request(id, key, None)).await;
+    assert_eq!(plane.answer(3, id).await, Some(Answer::Counted(1)));
+    cluster.start(4, config(), vec![seed]).await;
+    let ids = (1..=4).collect();
+    let taken = within(FORMED, || async {
+        cluster.one_table(&ids).await?;
+        all_ready(&cluster, &ids).await
+    })
+    .await;
+    assert!(
+        taken.is_some(),
+        "pod 4 not taken in and ready within {FORMED:?}"
+    );
 }
 
 /// Forwarding off, a request reaching a pod not its key's owner is told the key is elsewhere,
