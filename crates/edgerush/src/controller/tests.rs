@@ -1584,6 +1584,41 @@ fn the_leader_lease_is_a_namespace_and_a_name() {
     );
 }
 
+/// A replica that elects a leader knows its Pod's name and UID, or does not start: its
+/// report is named for that Pod and owned by it, and one owned by none would outlive it,
+/// saying what its pods ran long after they moved to another replica (04 §6).
+#[test]
+fn a_replica_electing_a_leader_needs_its_pods_name_and_uid() {
+    let of = |hostname: Option<&str>, uid: Option<&str>| {
+        OwnPod::of(|name| match name {
+            "HOSTNAME" => hostname.map(str::to_owned),
+            "EDGERUSH_POD_UID" => uid.map(str::to_owned),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        of(Some("edgerush-control-7c9-x2"), Some("0b6c")),
+        Ok(OwnPod {
+            name: "edgerush-control-7c9-x2".to_owned(),
+            uid: "0b6c".to_owned(),
+        })
+    );
+    for hostname in [None, Some("")] {
+        assert_eq!(
+            of(hostname, Some("0b6c")),
+            Err(UsageError::NoPodName),
+            "{hostname:?}"
+        );
+    }
+    for uid in [None, Some("")] {
+        assert_eq!(
+            of(Some("edgerush-control-7c9-x2"), uid),
+            Err(UsageError::NoPodUid),
+            "{uid:?}"
+        );
+    }
+}
+
 #[test]
 fn the_addresses_statuses_say_are_never_given_on_the_command_line() {
     // The data plane's Service the control plane writes gives them (05 §2).

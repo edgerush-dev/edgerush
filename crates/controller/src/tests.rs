@@ -2915,7 +2915,7 @@ fn the_leader_merges_every_replicas_report_and_counts_the_ready_pods() {
             namespace: "edge".to_owned(),
             lease: lease.to_owned(),
             pod: pod_name.to_owned(),
-            uid: None,
+            uid: format!("{pod_name}-uid"),
         }
         .report(&pods)
         .unwrap()

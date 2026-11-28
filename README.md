@@ -262,7 +262,7 @@ The rest is chosen by flags:
 | `--namespace-selector 'team=payments'` | Instead, follow the namespaces whose labels the selector matches, as they come to match and stop: each that comes to match is taken in once all of it has been listed. |
 | `--write-config config.yaml` | Write each config as a file `edgerush proxy --config` reads, without the certificates it names. |
 | `--listen [::]:9443 --certificate tls.crt --key tls.key --authorities ca.crt` | Serve the config stream, gRPC over mutual TLS: each config goes to the data plane that dials with a certificate those authorities signed carrying the settings' `id`, or to any they signed where the settings state none, and what each says of it is reported; another is refused, with why. |
-| `--leader-lease edge/edgerush-control` | Replicas elect the one that writes status by this Lease. |
+| `--leader-lease edge/edgerush-control` | Replicas elect the one that writes status by this Lease. Each needs its Pod's name as `HOSTNAME` and its UID as `EDGERUSH_POD_UID` (the downward API's `metadata.uid`), or does not start. |
 | `--webhook-listen [::]:8443 --webhook-certificate tls.crt --webhook-key tls.key` | Serve the admission webhook, HTTPS, reviews `POST`ed to `/validate`: an Ingress of the class that would not translate alone is refused, with why. |
 | `--metrics [::]:9090` | Serve the controller's own metrics, plain HTTP at `/metrics`: when each certificate handed to the data plane expires, `edgerush_certificate_expiry_timestamp_seconds`. Every replica serves them. |
 
