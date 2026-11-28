@@ -116,9 +116,30 @@ fn read(path: &Path, own: Option<IpAddr>) -> Result<PodSettings, String> {
     parsed(&yaml, directory, own).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// A pod answers on one thread, both modes': a stream's answers and its connection's writes
-/// share it, so that what one read brings in is answered in one write, where a connection on
-/// another thread would take the answers a few at a time as they are made.
+/// How a pod lays out its work over its threads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// Its store's task and its streams on one thread.
+    One,
+    /// Its store's task on a thread of its own, and its streams on another.
+    Apart,
+}
+
+/// The layout for a pod given `cpus`, as `available_parallelism` reads its container's
+/// limit (decided, #616): its store's task on a thread of its own once it has two, and its
+/// streams on one beside it however many more it has, which kept up with a catch-up
+/// measured; one thread for everything with one CPU or less, which is what it has anyway.
+const fn layout(cpus: usize) -> Layout {
+    if cpus >= 2 {
+        Layout::Apart
+    } else {
+        Layout::One
+    }
+}
+
+/// The runtime a pod's streams run on, one thread whatever its layout. A stream's answers
+/// still go out together, a write for many, beside a store's task on a thread of its own:
+/// the task hands them over together (`edgerush_ratelimit_service::cluster::pod`, #253).
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -153,6 +174,8 @@ fn run(args: impl Iterator<Item = String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let layout = layout(cpus);
     let runtime = match runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -160,7 +183,7 @@ fn run(args: impl Iterator<Item = String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(serve(args)) {
+    match runtime.block_on(serve(args, layout)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("edgerush-ratelimit-service: {error}");
@@ -169,7 +192,7 @@ fn run(args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-async fn serve(args: PodSettings) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(args: PodSettings, layout: Layout) -> Result<(), Box<dyn std::error::Error>> {
     let tls = match &args.tls {
         Some(files) => Some(secured(files.clone()).await?),
         None => None,
@@ -195,9 +218,18 @@ async fn serve(args: PodSettings) -> Result<(), Box<dyn std::error::Error>> {
     // pod.
     node.set_forwarding(true);
     node.set_forwarder_decides(store.forwarder_decides);
-    let pod = StorePod::start(node, store.address, dial, store.seeds);
+    let (pod, threads) = match layout {
+        Layout::One => (
+            StorePod::start(node, store.address, dial, store.seeds),
+            "one thread".to_owned(),
+        ),
+        Layout::Apart => (
+            StorePod::start_apart(node, store.address, dial, store.seeds)?,
+            "its store's thread and one for its streams".to_owned(),
+        ),
+    };
     eprintln!(
-        "edgerush-ratelimit-service: pod, member {id}, on {}, reached at {address}",
+        "edgerush-ratelimit-service: pod, member {id}, on {}, reached at {address}, on {threads}",
         args.listen
     );
     stop.run(pod).await
@@ -438,8 +470,18 @@ mod tests {
         );
     }
 
+    /// Its store's task gets a thread of its own once the pod has two CPUs, however many it
+    /// has; with one CPU or less, everything shares one thread.
     #[test]
-    fn a_pod_runs_on_one_thread() {
+    fn a_pods_store_gets_a_thread_of_its_own_from_two_cpus() {
+        assert_eq!(layout(0), Layout::One);
+        assert_eq!(layout(1), Layout::One);
+        assert_eq!(layout(2), Layout::Apart);
+        assert_eq!(layout(64), Layout::Apart);
+    }
+
+    #[test]
+    fn a_pods_streams_run_on_one_thread() {
         use tokio::runtime::RuntimeFlavor;
         assert_eq!(
             runtime().unwrap().handle().runtime_flavor(),

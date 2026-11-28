@@ -3,6 +3,11 @@
 //! time, with what it sends going to its peers through a link each ([`link`]), and what they
 //! send it coming in on the streams they dial to it, served by a [`StoreServer`].
 //!
+//! That task runs among the pod's streams ([`StorePod::start`]), or on a thread of its own
+//! with the streams on others ([`StorePod::start_apart`], #616). Either way it holds what it
+//! makes for each client and peer while commands wait, and hands it over together, so that a
+//! run of commands' answers reach their writer at once and go out in one write.
+//!
 //! The store names pods by member id; the pod keeps where each is reached, from four places:
 //! the members of its table, the voters of a `Form`, the hellos it is greeted with, and its
 //! seeds — addresses only, asked who answers there until it is a member. A pod whose cluster
@@ -52,6 +57,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::server::NamedService;
 use tonic::{Request, Response, Status, Streaming};
@@ -271,9 +277,49 @@ impl StorePod {
     }
 
     /// Runs `node`, new, reached at `address`, dialling its peers as `dial` says and
-    /// asking `seeds` who answers there until it is a member.
+    /// asking `seeds` who answers there until it is a member: its store's task on the runtime
+    /// it is started on, beside its streams, as a pod of one CPU runs.
     #[must_use]
     pub fn start(node: Pod, address: String, dial: Dial, seeds: Vec<String>) -> Self {
+        let (pod, running, received) = Self::new(node, address, dial, seeds, Handle::current());
+        tokio::spawn(running.run(received));
+        pod
+    }
+
+    /// Runs `node` as [`start`](Self::start) does, but its store's task on a thread of its
+    /// own, so that the thread does the store's work alone (#616): its streams, its links and
+    /// whatever else it starts run on the runtime it is started on. The store's runtime keeps
+    /// time and has no sockets, so that one opened there by mistake fails rather than shares
+    /// its thread.
+    ///
+    /// # Errors
+    ///
+    /// Outside a Tokio runtime, or when the thread or its runtime cannot be made.
+    pub fn start_apart(
+        node: Pod,
+        address: String,
+        dial: Dial,
+        seeds: Vec<String>,
+    ) -> std::io::Result<Self> {
+        let wire = Handle::try_current().map_err(std::io::Error::other)?;
+        let store = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        let (pod, running, received) = Self::new(node, address, dial, seeds, wire);
+        std::thread::Builder::new()
+            .name("store".to_owned())
+            .spawn(move || store.block_on(running.run(received)))?;
+        Ok(pod)
+    }
+
+    /// A handle on `node`, and its task, to be run, starting what else it runs on `wire`.
+    fn new(
+        node: Pod,
+        address: String,
+        dial: Dial,
+        seeds: Vec<String>,
+        wire: Handle,
+    ) -> (Self, Running, mpsc::Receiver<Command>) {
         let id = node.store().id();
         let hello = Arc::new(Hello {
             from: id,
@@ -315,9 +361,9 @@ impl StorePod {
             load,
             busy: Duration::ZERO,
             waiting_most: 0,
+            wire,
         };
-        tokio::spawn(running.run(received));
-        pod
+        (pod, running, received)
     }
 
     /// Its member id.
@@ -568,6 +614,9 @@ struct Running {
     /// Time busy, and the most commands waiting, not yet published to `load`.
     busy: Duration,
     waiting_most: usize,
+    /// The runtime its streams run on, where each task it starts goes: on a thread of its
+    /// own, it leaves that thread to its store.
+    wire: Handle,
 }
 
 /// When each peer whose wall clock is off past `skew_warning` was last told of in the log.
@@ -801,6 +850,8 @@ impl Running {
             return;
         }
         if !self.links.contains_key(&to) {
+            // Its streams' tasks, and tonic's for their connections, beside its streams.
+            let _wire = self.wire.enter();
             let made = self
                 .addresses
                 .get(&to)
@@ -1012,6 +1063,8 @@ impl Running {
             return;
         }
         self.asked_at = Some(Instant::now());
+        // Each ask, and tonic's tasks for its connection, beside its streams.
+        let _wire = self.wire.enter();
         for seed in &self.seeds {
             let client = match &self.dial {
                 Dial::Plain => Client::new(seed),
@@ -1499,6 +1552,7 @@ mod tests {
             load: Arc::default(),
             busy: Duration::ZERO,
             waiting_most: 0,
+            wire: Handle::current(),
         }
     }
 
@@ -1804,6 +1858,54 @@ mod tests {
         );
     }
 
+    /// Started apart, its store's task runs on a thread of its own, where what is asked of its
+    /// store is done; stopped, it takes nothing more.
+    #[tokio::test]
+    async fn a_pod_started_apart_runs_its_store_on_a_thread_of_its_own() {
+        let node = Pod::new(1, "pod-1:7000".to_owned(), Config::defaults(), []);
+        let pod =
+            StorePod::start_apart(node, "pod-1:7000".to_owned(), Dial::Plain, Vec::new()).unwrap();
+        let on = pod
+            .with(|_, _| std::thread::current().name().map(str::to_owned))
+            .await;
+        assert_eq!(on, Some(Some("store".to_owned())));
+        pod.stop().await;
+        let after = tokio::time::timeout(Duration::from_secs(5), pod.with(|_, _| ())).await;
+        assert_eq!(after, Ok(None));
+    }
+
+    /// Outside a runtime there is nowhere for its streams to run, and it says so rather than
+    /// start.
+    #[test]
+    fn a_pod_started_apart_needs_a_runtime_for_its_streams() {
+        let node = Pod::new(1, "pod-1:7000".to_owned(), Config::defaults(), []);
+        let started = StorePod::start_apart(node, "pod-1:7000".to_owned(), Dial::Plain, Vec::new());
+        assert!(started.is_err());
+    }
+
+    /// Started apart, it still asks its seeds who answers there: the ask, and the connection
+    /// it is made on, run beside its streams, as its store's thread has no sockets. Its
+    /// connection speaks HTTP/2: one dialled from the store's thread is begun, then dropped
+    /// with nothing sent.
+    #[tokio::test]
+    async fn a_pod_started_apart_asks_its_seeds() {
+        use tokio::io::AsyncReadExt;
+        let within = Duration::from_secs(5);
+        let seed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = seed.local_addr().unwrap().to_string();
+        let node = Pod::new(1, "pod-1:7000".to_owned(), Config::defaults(), []);
+        let _pod = StorePod::start_apart(node, "pod-1:7000".to_owned(), Dial::Plain, vec![address])
+            .unwrap();
+        let (mut asked, _) = tokio::time::timeout(within, seed.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut preface = [0; 24];
+        let read = tokio::time::timeout(within, asked.read_exact(&mut preface)).await;
+        assert!(matches!(read, Ok(Ok(_))), "{read:?}");
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    }
+
     /// The time the task spends taking commands and ticks, and the most commands waiting
     /// behind one it takes, are published as it ticks; the most is taken by a scrape and
     /// starts again from nothing.
@@ -1825,8 +1927,8 @@ mod tests {
         assert!(load.busy() > busy, "it only adds");
     }
 
-    #[test]
-    fn the_peers_its_store_finds_skewed_are_counted_and_none_once_back() {
+    #[tokio::test]
+    async fn the_peers_its_store_finds_skewed_are_counted_and_none_once_back() {
         let mut running = running();
         // Its own heartbeat sent at 950 ms echoed at 1 s, and at 1.1 s.
         let beat = |sent, wall| Message::Heartbeat {
@@ -1886,8 +1988,8 @@ mod tests {
         assert_eq!(warnings.due(10, at(300)), Some(1));
     }
 
-    #[test]
-    fn a_pod_heard_at_another_ids_address_takes_it_and_a_table_does_not() {
+    #[tokio::test]
+    async fn a_pod_heard_at_another_ids_address_takes_it_and_a_table_does_not() {
         let mut running = running();
         running.learn(2, "pod-2:7000", false);
         // A table still naming a pod gone takes nothing from one heard there since.
