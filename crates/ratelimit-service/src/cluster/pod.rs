@@ -477,6 +477,12 @@ impl StorePod {
         let _stopped = self.commands.send(Command::Stop).await;
     }
 
+    /// Resolves once its store's task has ended, for whatever reason: drained, stopped, or
+    /// gone with a panic.
+    pub async fn ended(&self) {
+        self.commands.closed().await;
+    }
+
     /// Whether `hello` is from a pod of its cluster's shard count, which another pod's is not
     /// (6a); if so, its sender's address is kept.
     async fn greet(&self, hello: &Hello) -> Result<(), Status> {
