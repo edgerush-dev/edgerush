@@ -114,20 +114,24 @@ const HAND_OVER_AFTER: usize = RECEIVED_WAITING;
 /// Something run on a pod's mode, its store within, in its task.
 type Run = Box<dyn FnOnce(&mut Pod, Time) + Send>;
 
-/// How busy a pod's task is, as its scrape shows it: published as the task ticks.
+/// How busy a pod's task is, as its scrape shows it: its own time published as it ticks, and
+/// the time its streams waited for room in its queue as they wait.
 #[derive(Debug, Default)]
 pub(crate) struct Load {
     /// Nanoseconds spent taking commands and ticks, since it started.
     busy: AtomicU64,
-    /// The most commands waiting behind one it took, since a scrape last took it.
-    waiting_most: AtomicUsize,
+    /// Nanoseconds its streams spent waiting for room in its queue, since it started.
+    streams_waiting: AtomicU64,
 }
 
 impl Load {
-    fn publish(&self, busy: Duration, waiting_most: usize) {
-        let busy = u64::try_from(busy.as_nanos()).unwrap_or(u64::MAX);
-        self.busy.fetch_add(busy, Ordering::Relaxed);
-        self.waiting_most.fetch_max(waiting_most, Ordering::Relaxed);
+    fn publish(&self, busy: Duration) {
+        self.busy.fetch_add(nanos(busy), Ordering::Relaxed);
+    }
+
+    fn waited(&self, waited: Duration) {
+        self.streams_waiting
+            .fetch_add(nanos(waited), Ordering::Relaxed);
     }
 
     /// The time spent taking commands and ticks, since it started.
@@ -135,9 +139,31 @@ impl Load {
         Duration::from_nanos(self.busy.load(Ordering::Relaxed))
     }
 
-    /// The most commands waiting behind one taken since this was last asked: none after.
-    pub(crate) fn take_waiting_most(&self) -> usize {
-        self.waiting_most.swap(0, Ordering::Relaxed)
+    /// The time its streams spent waiting for room in its queue, since it started.
+    pub(crate) fn streams_waiting(&self) -> Duration {
+        Duration::from_nanos(self.streams_waiting.load(Ordering::Relaxed))
+    }
+}
+
+/// `duration` in nanoseconds, as long as a `u64` holds them.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Sends `command` to the pod's task from one of its streams, waiting while its queue is full,
+/// the time waited counted in `load`: nothing while there is room, so that bursts the task
+/// keeps up with count little, and a task falling behind shows. False once the pod has
+/// stopped.
+async fn send_from_stream(commands: &mpsc::Sender<Command>, command: Command, load: &Load) -> bool {
+    match commands.try_send(command) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            let waiting = Instant::now();
+            let sent = commands.send(command).await.is_ok();
+            load.waited(waiting.elapsed());
+            sent
+        }
     }
 }
 
@@ -210,9 +236,8 @@ pub struct Observed {
     pub mode: BothCounted,
     /// The time its task has spent taking commands and ticks, since it started.
     pub store_busy: Duration,
-    /// The most commands waiting for its task behind one it took, since the last scrape:
-    /// filled in by the scrape that takes it ([`StorePod::take_commands_waiting_most`]).
-    pub commands_waiting_most: usize,
+    /// The time its streams have spent waiting for room in its task's queue, since it started.
+    pub streams_waiting: Duration,
 }
 
 /// A handle on a pod of the store, running both modes. Cheap to clone.
@@ -360,7 +385,6 @@ impl StorePod {
             taken: 0,
             load,
             busy: Duration::ZERO,
-            waiting_most: 0,
             wire,
         };
         (pod, running, received)
@@ -385,17 +409,10 @@ impl StorePod {
         self.skewed.load(Ordering::Relaxed)
     }
 
-    /// The most commands waiting for its task behind one it took since this was last asked,
-    /// by its scrape: none after.
-    #[must_use]
-    pub fn take_commands_waiting_most(&self) -> usize {
-        self.load.take_waiting_most()
-    }
-
-    /// What its scrape shows of it, read at once between messages, all but the most commands
-    /// waiting, which only a scrape takes: `None` once it has stopped.
+    /// What its scrape shows of it, read at once between messages: `None` once it has stopped.
     pub async fn observed(&self) -> Option<Observed> {
-        let (skewed, dropped, store_busy) = (self.skewed(), self.dropped(), self.load.busy());
+        let (skewed, dropped) = (self.skewed(), self.dropped());
+        let (store_busy, streams_waiting) = (self.load.busy(), self.load.streams_waiting());
         self.with_pod(move |pod, now| {
             let node = pod.store();
             Observed {
@@ -412,7 +429,7 @@ impl StorePod {
                 dropped,
                 mode: counted(pod),
                 store_busy,
-                commands_waiting_most: 0,
+                streams_waiting,
             }
         })
         .await
@@ -451,6 +468,7 @@ impl StorePod {
             id,
             commands: self.commands.clone(),
             told,
+            load: Arc::clone(&self.load),
         })
     }
 
@@ -493,10 +511,7 @@ impl StorePod {
 
     /// Hands it a message from `from`, waiting while too many wait.
     async fn receive(&self, from: NodeId, message: PodMessage) -> bool {
-        self.commands
-            .send(Command::Receive(from, message))
-            .await
-            .is_ok()
+        send_from_stream(&self.commands, Command::Receive(from, message), &self.load).await
     }
 
     /// Hands it the control plane's message: its answer, if it has one.
@@ -516,6 +531,8 @@ pub struct StoreClient {
     id: NodeId,
     commands: mpsc::Sender<Command>,
     told: Told,
+    /// Where the time it waits for room in the pod's queue is counted.
+    load: Arc<Load>,
 }
 
 /// Where a pod's task sends what it tells one client: its answers, in order, and beside them
@@ -544,10 +561,7 @@ impl StoreClient {
     /// to gather, of the synchronous mode; a batch, of the asynchronous); anything else is
     /// dropped. False once the pod has stopped.
     pub async fn ask(&self, message: PodMessage) -> bool {
-        self.commands
-            .send(Command::Ask(self.id, message))
-            .await
-            .is_ok()
+        send_from_stream(&self.commands, Command::Ask(self.id, message), &self.load).await
     }
 
     /// Checks the pod: true once its task has taken the check, in turn behind what was sent it
@@ -555,7 +569,7 @@ impl StoreClient {
     /// stopped.
     pub async fn check(&self) -> bool {
         let (answered, answering) = oneshot::channel();
-        if self.commands.send(Command::Check(answered)).await.is_err() {
+        if !send_from_stream(&self.commands, Command::Check(answered), &self.load).await {
             return false;
         }
         answering.await.is_ok()
@@ -617,9 +631,8 @@ struct Running {
     taken: usize,
     /// How busy it is, as its scrape shows.
     load: Arc<Load>,
-    /// Time busy, and the most commands waiting, not yet published to `load`.
+    /// Time busy, not yet published to `load`.
     busy: Duration,
-    waiting_most: usize,
     /// The runtime its streams run on, where each task it starts goes: on a thread of its
     /// own, it leaves that thread to its store.
     wire: Handle,
@@ -730,7 +743,6 @@ impl Running {
             }
             Taken::Command(command) => {
                 self.taken += 1;
-                self.waiting_most = self.waiting_most.max(waiting);
                 if self.take(command, began) == Turned::Stopped {
                     return Turned::Stopped;
                 }
@@ -746,9 +758,8 @@ impl Running {
         }
         self.busy += began.elapsed();
         if ticked {
-            self.load.publish(self.busy, self.waiting_most);
+            self.load.publish(self.busy);
             self.busy = Duration::ZERO;
-            self.waiting_most = 0;
         }
         if drained { Turned::Drained } else { Turned::On }
     }
@@ -1557,7 +1568,6 @@ mod tests {
             taken: 0,
             load: Arc::default(),
             busy: Duration::ZERO,
-            waiting_most: 0,
             wire: Handle::current(),
         }
     }
@@ -1599,7 +1609,12 @@ mod tests {
         running.client(given);
         let (id, told) = giving.await.unwrap();
         let (commands, _) = mpsc::channel(1);
-        let mut client = StoreClient { id, commands, told };
+        let mut client = StoreClient {
+            id,
+            commands,
+            told,
+            load: Arc::default(),
+        };
         let next = Duration::from_millis(50);
         for version in [2, 3, 1] {
             running.answer(id, told_table(version));
@@ -1658,7 +1673,12 @@ mod tests {
         running.client(given);
         let (id, told) = giving.await.unwrap();
         let (commands, mut received) = mpsc::channel(8);
-        let client = StoreClient { id, commands, told };
+        let client = StoreClient {
+            id,
+            commands,
+            told,
+            load: Arc::default(),
+        };
         let gather = wire::asking(ModeMessage::Gather {
             client: 0,
             id: 1,
@@ -1703,6 +1723,7 @@ mod tests {
             id,
             commands: commands.clone(),
             told,
+            load: Arc::default(),
         };
         let wait = Duration::from_secs(1);
         let checked = tokio::time::timeout(wait, client.check()).await;
@@ -1723,7 +1744,12 @@ mod tests {
         running.client(given);
         let (id, told) = giving.await.unwrap();
         let (commands, _commands) = mpsc::channel(1);
-        let client = StoreClient { id, commands, told };
+        let client = StoreClient {
+            id,
+            commands,
+            told,
+            load: Arc::default(),
+        };
         let waiting = u64::try_from(TELLING_WAITING).unwrap();
         for answer in 0..waiting {
             running.answer(id, reply(answer));
@@ -1912,25 +1938,48 @@ mod tests {
         assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     }
 
-    /// The time the task spends taking commands and ticks, and the most commands waiting
-    /// behind one it takes, are published as it ticks; the most is taken by a scrape and
-    /// starts again from nothing.
+    /// The time the task spends taking commands and ticks is published as it ticks.
     #[tokio::test]
-    async fn the_tasks_busy_time_and_most_waiting_are_published_as_it_ticks() {
+    async fn the_tasks_busy_time_is_published_as_it_ticks() {
         let mut running = running();
         let load = Arc::clone(&running.load);
         let (id, _told) = asking_client(&mut running).await;
         running.turn(Taken::Command(request(id, 1)), 7);
         running.turn(Taken::Command(request(id, 2)), 3);
         assert_eq!(load.busy(), Duration::ZERO, "published before a tick");
-        assert_eq!(load.take_waiting_most(), 0);
         running.turn(Taken::Tick, 2);
         let busy = load.busy();
         assert!(busy > Duration::ZERO);
-        assert_eq!(load.take_waiting_most(), 7);
-        assert_eq!(load.take_waiting_most(), 0, "taken");
         running.turn(Taken::Tick, 0);
         assert!(load.busy() > busy, "it only adds");
+    }
+
+    /// A stream that finds room in the task's queue counts nothing; one that finds it full
+    /// counts the time it waits for room, however briefly the queue was full before.
+    #[tokio::test]
+    async fn the_time_a_stream_waits_for_room_is_counted() {
+        let load = Load::default();
+        let (commands, mut received) = mpsc::channel(1);
+        assert!(send_from_stream(&commands, Command::Stop, &load).await);
+        assert_eq!(load.streams_waiting(), Duration::ZERO, "it found room");
+        let held = Duration::from_millis(50);
+        let taken = async {
+            tokio::time::sleep(held).await;
+            received.recv().await
+        };
+        let (sent, taken) = tokio::join!(send_from_stream(&commands, Command::Stop, &load), taken);
+        assert!(sent);
+        assert!(taken.is_some());
+        assert!(
+            load.streams_waiting() >= held,
+            "{:?}",
+            load.streams_waiting()
+        );
+        drop(received);
+        assert!(
+            !send_from_stream(&commands, Command::Stop, &load).await,
+            "the pod stopped"
+        );
     }
 
     #[tokio::test]
