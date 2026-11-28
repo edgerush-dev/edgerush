@@ -42,7 +42,8 @@
 //! port, as Kubernetes gives each pod its own while every pod reads one file.
 //! A pod takes a member id of its own each time it starts, shows its store's `/metrics` and what
 //! each mode counts, says at `/ready` whether it is ready, and, told to stop, hands its shards on
-//! before it does. `keys.max_bytes` is what its keys of both modes may hold, past which those
+//! before it does. Should its store's task end untold, which only a panic does, the pod ends
+//! too, failed, for Kubernetes to restart it. `keys.max_bytes` is what its keys of both modes may hold, past which those
 //! that may be forgotten soonest are evicted, whatever their mode.
 //!
 //! The asynchronous mode applies each data plane's batch to the keys it owns, by the data
@@ -79,7 +80,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tonic::server::NamedService;
 
 /// How often the certificate files are read again, to take in a Secret replaced.
@@ -244,21 +245,47 @@ struct Running {
 
 impl Running {
     /// Serves `pod`, its metrics and readiness too if said, until told to stop: it then hands
-    /// its shards on while it still serves, and stops once drained.
+    /// its shards on while it still serves, and stops once drained. A store's task that ends
+    /// untold ends it too, failed ([`until_ended`]).
     async fn run(self, pod: StorePod) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(at) = self.metrics {
             let listener = tokio::net::TcpListener::bind(at).await?;
             eprintln!("edgerush-ratelimit-service: metrics and readiness on {at}");
             tokio::spawn(scrape::serve_store(listener, pod.clone()));
         }
-        let draining = pod.clone();
-        let drained = async move {
-            stopped().await;
-            eprintln!("edgerush-ratelimit-service: draining");
-            draining.drain().await;
+        let (said, ended) = oneshot::channel();
+        let ending = pod.clone();
+        let stop = async move {
+            let _gone = said.send(until_ended(&ending, stopped()).await);
         };
-        serve_on(self.listener, self.serving, StoreServer::new(pod), drained).await?;
+        serve_on(self.listener, self.serving, StoreServer::new(pod), stop).await?;
+        if ended.await == Ok(Ended::StoreGone) {
+            return Err("its store's task ended without being told to stop".into());
+        }
         Ok(())
+    }
+}
+
+/// How a pod's serving came to its end.
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    /// Told to stop, and drained.
+    Drained,
+    /// Its store's task ended untold.
+    StoreGone,
+}
+
+/// Waits until `pod` is to stop serving: told to stop, by `told`, and then drained; or its
+/// store's task ended untold, which only a panic does, so that the process ends failed, for
+/// Kubernetes to restart it, rather than serve with no store, never ready again (#616).
+async fn until_ended(pod: &StorePod, told: impl Future<Output = ()>) -> Ended {
+    tokio::select! {
+        () = told => {
+            eprintln!("edgerush-ratelimit-service: draining");
+            pod.drain().await;
+            Ended::Drained
+        }
+        () = pod.ended() => Ended::StoreGone,
     }
 }
 
@@ -468,6 +495,68 @@ mod tests {
             said.starts_with(&format!("{}: ", path.display())) && said.contains("shards"),
             "{said}"
         );
+    }
+
+    /// A lone pod on its store, beside its streams or apart.
+    fn lone(apart: bool) -> StorePod {
+        let address = "127.0.0.1:7000".to_owned();
+        let node = Pod::new(1, address.clone(), edgerush_cluster::Config::defaults(), []);
+        if apart {
+            StorePod::start_apart(node, address, Dial::Plain, Vec::new()).unwrap()
+        } else {
+            StorePod::start(node, address, Dial::Plain, Vec::new())
+        }
+    }
+
+    /// A pod whose store's task panics, beside its streams or on a thread of its own, ends
+    /// its serving as a store gone, never told to stop.
+    #[tokio::test]
+    async fn a_pod_whose_store_panics_stops_serving() {
+        for apart in [false, true] {
+            let pod = lone(apart);
+            let gone = pod.with::<()>(|_, _| panic!("a store gone")).await;
+            assert_eq!(gone, None);
+            let ended = tokio::time::timeout(
+                Duration::from_secs(5),
+                until_ended(&pod, std::future::pending()),
+            )
+            .await;
+            assert_eq!(ended, Ok(Ended::StoreGone), "apart: {apart}");
+        }
+    }
+
+    /// Told to stop, a pod drains, and its store's task ending then is no failure.
+    #[tokio::test]
+    async fn a_pod_told_to_stop_drains_and_ends() {
+        for apart in [false, true] {
+            let pod = lone(apart);
+            let ended =
+                tokio::time::timeout(Duration::from_secs(5), until_ended(&pod, async {})).await;
+            assert_eq!(ended, Ok(Ended::Drained), "apart: {apart}");
+            assert!(!pod.ready().await, "apart: {apart}: still serving");
+        }
+    }
+
+    /// Serving, a pod whose store's task panics stops serving and ends failed, for its
+    /// process to exit so and be restarted.
+    #[tokio::test]
+    async fn a_serving_pod_whose_store_panics_ends_failed() {
+        let pod = lone(true);
+        let running = Running {
+            listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            serving: None,
+            metrics: None,
+        };
+        let (ended, gone) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), running.run(pod.clone())),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                pod.with::<()>(|_, _| panic!("a store gone")).await
+            },
+        );
+        assert_eq!(gone, None);
+        let said = ended.unwrap().unwrap_err().to_string();
+        assert!(said.contains("store's task ended"), "{said}");
     }
 
     /// Its store's task gets a thread of its own once the pod has two CPUs, however many it
