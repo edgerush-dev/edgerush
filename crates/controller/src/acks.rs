@@ -177,8 +177,8 @@ pub struct Reporter {
     pub lease: String,
     /// Its Pod's name.
     pub pod: String,
-    /// Its Pod's UID, where it is told it: without it, the report is owned by none.
-    pub uid: Option<String>,
+    /// Its Pod's UID, which the report is owned by.
+    pub uid: String,
 }
 
 impl Reporter {
@@ -202,15 +202,13 @@ impl Reporter {
                     REPORT_LABEL.to_owned(),
                     self.lease.clone(),
                 )])),
-                owner_references: self.uid.as_ref().map(|uid| {
-                    vec![OwnerReference {
-                        api_version: "v1".to_owned(),
-                        kind: "Pod".to_owned(),
-                        name: self.pod.clone(),
-                        uid: uid.clone(),
-                        ..OwnerReference::default()
-                    }]
-                }),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: "v1".to_owned(),
+                    kind: "Pod".to_owned(),
+                    name: self.pod.clone(),
+                    uid: self.uid.clone(),
+                    ..OwnerReference::default()
+                }]),
                 ..ObjectMeta::default()
             },
             data: Some(BTreeMap::from([(
@@ -391,7 +389,7 @@ mod tests {
             namespace: "edge".to_owned(),
             lease: "control".to_owned(),
             pod: "one".to_owned(),
-            uid: None,
+            uid: "5e1f".to_owned(),
         };
         assert_eq!(read(&reporter.report(&pods).unwrap()), Some(pods));
         let older: Pods = serde_json::from_str(r#"{"10.0.0.1":{"runs":3}}"#).unwrap();
@@ -425,7 +423,7 @@ mod tests {
             namespace: "edge".to_owned(),
             lease: "edgerush-control".to_owned(),
             pod: "edgerush-control-7c9-x2".to_owned(),
-            uid: Some("0b6c".to_owned()),
+            uid: "0b6c".to_owned(),
         };
         let pods: Pods = [
             (
@@ -462,13 +460,6 @@ mod tests {
             "edgerush-control"
         );
         assert_eq!(read(&report), Some(pods));
-        let unowned = Reporter {
-            uid: None,
-            ..reporter
-        }
-        .report(&Pods::new())
-        .unwrap();
-        assert_eq!(unowned.metadata.owner_references, None);
         assert_eq!(
             read(&k8s_openapi::api::core::v1::ConfigMap::default()),
             None
@@ -483,7 +474,7 @@ mod tests {
             namespace: "edge".to_owned(),
             lease: "control".to_owned(),
             pod: "one".to_owned(),
-            uid: None,
+            uid: "5e1f".to_owned(),
         };
         let path = "/api/v1/namespaces/edge/configmaps/control-acks-one";
         let saying = |runs: i64, version: &str| {

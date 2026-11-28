@@ -90,8 +90,9 @@ DataPlane of that name naming the ControlPlane may still serve says none too, it
 followed while no DataPlane is served. With --data-plane there is no such Service, and no
 status says an address. With --leader-lease, the replicas elect one by that Lease, which
 alone writes the Service and status; every one serves, and reports what its data planes run in a ConfigMap of the
-Lease's namespace, <LEASE>-acks-<HOSTNAME>, owned by its Pod where EDGERUSH_POD_UID gives
-the Pod's UID, for the leader to merge.
+Lease's namespace, <LEASE>-acks-<HOSTNAME>, for the leader to merge, owned by its Pod,
+whose UID EDGERUSH_POD_UID gives (the downward API's metadata.uid), so that it goes with
+the Pod: without HOSTNAME or EDGERUSH_POD_UID, a replica does not start.
 With --webhook-listen, it serves the admission webhook there, HTTPS, reviews POSTed to
 /validate: an Ingress of a data plane's class is refused where, alone, it does not
 translate into something the data plane accepts. Its certificate and key are files read
@@ -198,6 +199,16 @@ pub(crate) fn command(
             return write!(stderr, "error: {error}\n\n{USAGE}").map_or(1, |()| crate::EXIT_USAGE);
         }
     };
+    // Before anything is reached: without its Pod, a replica's report would outlive it (04 §6).
+    let own_pod = match options.leader {
+        Some(_) => match OwnPod::of(|name| std::env::var(name).ok()) {
+            Ok(pod) => Some(pod),
+            Err(error) => {
+                return writeln!(stderr, "error: {error}").map_or(1, |()| crate::EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
     // Before a file is opened, its runtime's own among them, as the data plane does: under
     // containerd 2.x the soft limit is 1,024, for every data plane's stream, the webhook,
     // the probes and the API server's watches. Said only where it could not be raised, as
@@ -291,13 +302,14 @@ pub(crate) fn command(
         }
     };
     // The election's own client, so that its writes never wait behind the follows'.
-    let elector = match &options.leader {
-        Some(_) => match ApiServer::in_cluster() {
+    let elector = match own_pod {
+        Some(pod) => match ApiServer::in_cluster() {
             Ok(api) => match ApiServer::in_cluster() {
                 Ok(reports) => Some(Elector {
                     api,
                     reports,
-                    identity: identity(),
+                    identity: identity_of(&pod.name),
+                    pod,
                     timing: lease::Timing::default(),
                 }),
                 Err(error) => {
@@ -649,6 +661,12 @@ enum UsageError {
         "'--webhook-listen' is given with '--webhook-certificate' and '--webhook-key', or alone with '--authority'"
     )]
     WebhookTogether,
+    #[error("'--leader-lease' needs HOSTNAME, its Pod's name, as Kubernetes sets it")]
+    NoPodName,
+    #[error(
+        "'--leader-lease' needs EDGERUSH_POD_UID, its Pod's UID, from the downward API's metadata.uid"
+    )]
+    NoPodUid,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Parsed, UsageError> {
@@ -902,12 +920,36 @@ fn named(value: &str) -> Option<(String, String)> {
         .map(|(namespace, name)| (namespace.to_owned(), name.to_owned()))
 }
 
+/// This replica's Pod, where the replicas elect a leader: what its report of what its
+/// data planes run is named for and owned by, so that the report goes with the Pod (04 §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnPod {
+    name: String,
+    uid: String,
+}
+
+impl OwnPod {
+    /// As `var` reads the environment: `HOSTNAME` and `EDGERUSH_POD_UID`, each there and
+    /// not empty.
+    fn of(var: impl Fn(&str) -> Option<String>) -> Result<Self, UsageError> {
+        let given = |name: &str, missing: UsageError| {
+            var(name).filter(|value| !value.is_empty()).ok_or(missing)
+        };
+        Ok(Self {
+            name: given("HOSTNAME", UsageError::NoPodName)?,
+            uid: given("EDGERUSH_POD_UID", UsageError::NoPodUid)?,
+        })
+    }
+}
+
 /// The election, ready to be run.
 struct Elector {
     /// A client of its own, so that its writes never wait behind the follows'.
     api: ApiServer,
     /// Another, for the report of what this replica's data planes run (04 §6).
     reports: ApiServer,
+    /// This replica's Pod.
+    pod: OwnPod,
     /// This replica, as the Lease names its holder.
     identity: String,
     timing: lease::Timing,
@@ -916,7 +958,12 @@ struct Elector {
 /// This replica, as a Lease names its holder: its pod's name, and when it started, so that
 /// a pod started again is another.
 pub(crate) fn identity() -> String {
-    format!("{}_{}", pod_name(), started_at())
+    identity_of(&pod_name())
+}
+
+/// [`identity`], of the pod named `pod`.
+fn identity_of(pod: &str) -> String {
+    format!("{pod}_{}", started_at())
 }
 
 /// The pod's name, which the environment gives as its host name, as the Events it writes
@@ -1033,8 +1080,8 @@ async fn control_until(
             let reporter = Reporter {
                 namespace: namespace.clone(),
                 lease: name.clone(),
-                pod: std::env::var("HOSTNAME").unwrap_or_else(|_| "edgerush".to_owned()),
-                uid: std::env::var("EDGERUSH_POD_UID").ok(),
+                pod: elector.pod.name.clone(),
+                uid: elector.pod.uid.clone(),
             };
             reports = Some(Reports {
                 namespace: namespace.clone(),
@@ -1059,7 +1106,7 @@ async fn control_until(
             let elected_out = if sharing {
                 holder = Some(held);
                 let (elected_out, elected) = watch::channel(false);
-                taking = Some((leads, elected));
+                taking = Some((leads, elected, elector.pod.name.clone()));
                 elected_out
             } else {
                 leads
@@ -1351,10 +1398,10 @@ async fn control_until(
                                 },
                             )),
                         ));
-                        if let Some((leads, elected)) = taking.take() {
+                        if let Some((leads, elected, pod)) = taking.take() {
                             tasks.push(tokio::task::spawn_local(peers::take_over(
                                 peers.clone(),
-                                std::env::var("HOSTNAME").unwrap_or_default(),
+                                pod,
                                 peers::GATHER,
                                 elected.clone(),
                                 replicas.clone(),
